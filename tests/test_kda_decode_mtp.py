@@ -43,7 +43,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling test import
 
-from cula.kda import kda_decode
+from cula.kda import kda_decode, kda_decode_mtp
 
 # Trusted single-token reference from the existing decode test. We cross-check
 # our MTP reference against it (pure torch, no kernel) so the MTP oracle is
@@ -189,6 +189,38 @@ def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scal
     return o_all, state_source
 
 
+def run_kda_decode_mtp_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
+    """
+    Run the fused MTP kernel (kda_decode_mtp) in dense layout.
+
+    Args use the MTP-shaped tensors:
+        q, k: (N, T, H, K)   v: (N, T, HV, V)
+        a: (N, T, HV, K)     b: (N, T, HV)     state: (N, HV, V, K)
+
+    Returns:
+        o:            (N, T, HV, V) bfloat16
+        state_source: (N, HV, V, K) float32   (updated in-place by the kernel)
+    """
+    N = q.shape[0]
+    state_source = state.clone().contiguous()  # (N, HV, V, K)
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+
+    o = kda_decode_mtp(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_source,  # updated in-place after all T tokens
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+    )
+    return o, state_source  # (N, T, HV, V), (N, HV, V, K)
+
+
 def _assert_close(name, ref, actual, atol=3e-2, rtol=2e-2):
     """
     Assert tensors are close, always reporting the observed margins.
@@ -276,6 +308,80 @@ def test_kda_mtp_ref_matches_looped_kernel_dense(N, T, H, HV):
 
     _assert_close("mtp output", o_ref, o_loop.float())
     _assert_close("mtp final state", state_ref, state_loop)
+
+
+# ---------------------------------------------------------------------------
+# Tests: fused MTP kernel (kda_decode_mtp) vs torch reference (dense layout).
+# This is the load-bearing P1 test for the new kernel.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("N", [1, 4, 16, 64])
+@pytest.mark.parametrize("T", [2, 4, 8])
+@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
+def test_kda_decode_mtp_kernel_dense(N, T, H, HV):
+    K, V = 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close("mtp kernel output", o_ref, o_kernel.float())
+    _assert_close("mtp kernel final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("T", [2, 4, 8])
+def test_kda_decode_mtp_kernel_zero_state(T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, _ = make_inputs_mtp(N, T, H, HV, K, V)
+    state = torch.zeros(N, HV, V, K, device="cuda", dtype=torch.float32)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close("mtp kernel zero-state output", o_ref, o_kernel.float())
+    _assert_close("mtp kernel zero-state final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("T", [2, 4])
+def test_kda_decode_mtp_kernel_kv_layout(T):
+    """Fused kernel with the 'kv' state layout (pool, HV, K, V)."""
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state_vk = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref_vk = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state_vk.clone(), scale
+    )
+
+    # kv layout state: (N, HV, K, V)
+    state_kv = state_vk.permute(0, 1, 3, 2).contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o_kernel = kda_decode_mtp(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_kv,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        state_layout="kv",
+    )
+
+    _assert_close("mtp kv output", o_ref, o_kernel.float())
+    _assert_close("mtp kv final state", state_ref_vk, state_kv.permute(0, 1, 3, 2).contiguous())
 
 
 # ---------------------------------------------------------------------------
