@@ -41,8 +41,14 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling test import
 
 from cula.kda import kda_decode
+
+# Trusted single-token reference from the existing decode test. We cross-check
+# our MTP reference against it (pure torch, no kernel) so the MTP oracle is
+# provably the same recurrence as test_kda_decode.py, just threaded over T.
+from test_kda_decode import torch_kda_decode_ref
 
 
 # ---------------------------------------------------------------------------
@@ -183,19 +189,60 @@ def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scal
     return o_all, state_source
 
 
-def _assert_close(name, ref, actual, atol=4e-2, rtol=3e-2):
+def _assert_close(name, ref, actual, atol=3e-2, rtol=2e-2):
     """
-    Assert tensors are close with an informative error message.
+    Assert tensors are close, always reporting the observed margins.
 
-    Tolerances are slightly looser than the single-token test (atol 3e-2 /
-    rtol 2e-2) because the recurrence compounds bf16 quantization error over
-    the T tokens; the final-state error in particular accumulates.
+    Tolerances match test_kda_decode.py (atol 3e-2 / rtol 2e-2) so this stays
+    aligned with the single-token baseline. The margin is printed on every call
+    (run pytest with -s to see it) so we can observe how bf16 error accumulates
+    across the T tokens instead of hiding it behind a looser bound.
     """
     diff = (ref.float() - actual.float()).abs()
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
+    print(f"    [{name}] max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f} (atol={atol}, rtol={rtol})")
     ok = torch.allclose(ref.float(), actual.float(), atol=atol, rtol=rtol)
     assert ok, f"{name}: max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f}, atol={atol}, rtol={rtol}"
+
+
+# ---------------------------------------------------------------------------
+# Test: MTP reference IS the single-token reference threaded over T tokens.
+# Pure torch (no kernel) — this is the alignment guarantee with
+# test_kda_decode.py: it proves torch_kda_mtp_ref reproduces the trusted
+# torch_kda_decode_ref step-by-step. Must match to fp32 epsilon.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("T", [1, 2, 4, 8])
+def test_mtp_ref_equals_threaded_single_token_ref(T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    # Our MTP reference (loops over T internally)
+    o_mtp, state_mtp = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+
+    # Trusted single-token reference, threaded manually over T (identical inputs)
+    state_cur = state.clone()
+    o_manual = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
+    for t in range(T):
+        o_t, state_cur = torch_kda_decode_ref(
+            q[:, t].float(),
+            k[:, t].float(),
+            v[:, t].float(),
+            a[:, t],
+            b[:, t].float(),
+            A_log,
+            dt_bias,
+            state_cur,
+            scale,
+        )
+        o_manual[:, t] = o_t
+
+    # Both are pure fp32 torch with identical arithmetic -> tight match.
+    torch.testing.assert_close(o_mtp, o_manual, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(state_mtp, state_cur, atol=1e-5, rtol=1e-5)
 
 
 # ---------------------------------------------------------------------------
