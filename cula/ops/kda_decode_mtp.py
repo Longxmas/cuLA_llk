@@ -5,18 +5,21 @@ This extends the single-token small-batch KDA decode kernel
 (batch, value-head) in one launch, threading the recurrent state across the T
 tokens. It is the "verify" primitive for speculative / multi-token decoding.
 
-Scope (P1, correctness-first):
+Scope (P1+P2, correctness-first):
 - Dense layout only:  q/k (N, T, H, K), v/a (N, T, HV, V/K), b (N, T, HV).
-- Small-batch CTA organization (one CTA per (token, q-head), loops its V-heads).
+- Single parameterized CTA organization (one CTA per (token, q-head), loops its
+  V-heads and V-tiles). Covers small AND mid/large batch via a configurable
+  tile_v and a work_units=N*HV heuristic (flashinfer-style), instead of a
+  separate small/large kernel split.
 - State kept in shared memory across the T tokens (register-resident state is a
   later optimization). State written back once after all T tokens.
 - VK and KV state layouts. Optional Q/K L2 norm. Softplus gate + sigmoid beta.
 
 Deferred (see ISSUE_17_PLAN.md):
-- P2: varlen, large-batch, work-unit dispatch heuristics.
 - P3: precompute per-token q/k/gate once (instead of per V-tile), register
-  state, ILP rows, smem-v, warp specialization, SM100 packed-FMA.
-- P4: intermediate-state snapshots for rollback.
+  state, ILP rows, smem-v, inline-vs-warp-specialized variants, SM100
+  packed-FMA, full get_mtp_config (ilp/smem_v) tuning.
+- P4: varlen, intermediate-state snapshots for rollback, disable_state_update.
 
 The math per token t mirrors kda_decode exactly (channel-wise decay):
     gate  = exp(-exp(A_log) * softplus(a_t + dt_bias))
@@ -36,10 +39,7 @@ from cutlass.cute.runtime import from_dlpack
 from cula.ops.kda_decode import (
     NUM_STAGES,
     NUM_THREADS,
-    SMALL_BATCH_THRESHOLD,
     TILE_K,
-    TILE_V_SMALL,
-    TILE_V_SMALL_PADDED,
     _canonicalize_state_layout,
     _get_cached_stream,
     _normalize_A_log,
@@ -55,13 +55,31 @@ logger = logging.getLogger(__name__)
 _compiled_mtp_kernels: dict[tuple, object] = {}
 
 
-def _define_mtp_kernels():
-    """Define the CuTe DSL MTP decode kernel (small-batch dense)."""
+def _define_mtp_kernels(tile_v: int):
+    """Define the CuTe DSL MTP decode kernel specialized for a given V tile size.
+
+    tile_v is a P2 config parameter: the kernel is specialized per tile_v and
+    cached. The thread/iteration geometry below assumes 4 warps (128 threads)
+    and TILE_K=128, matching the single-token small-batch kernel. With those
+    fixed, NUM_K_ITERS_SMALL == tile_v and the state load/store covers exactly
+    TILE_K * tile_v elements, so the only tile_v-dependent control flow is the
+    butterfly reduction width.
+    """
 
     NUM_WARPS_SMALL = 4
-    V_PER_WARP_SMALL = TILE_V_SMALL // NUM_WARPS_SMALL
+    TILE_V = tile_v
+    TILE_V_PADDED = tile_v + 4
+    V_PER_WARP_SMALL = TILE_V // NUM_WARPS_SMALL
     ROWS_PER_ITER_SMALL = 32 // V_PER_WARP_SMALL
     NUM_K_ITERS_SMALL = TILE_K // ROWS_PER_ITER_SMALL
+    # Butterfly all-reduce offsets (in k_local units) to sum the K partials over
+    # the ROWS_PER_ITER lanes that share a v_local. Generalizes the hardcoded
+    # [4, 2, 1] (ROWS_PER_ITER=8 for tile_v=16) to any power-of-two ROWS_PER_ITER.
+    K_REDUCE_OFFSETS = []
+    _red = ROWS_PER_ITER_SMALL // 2
+    while _red >= 1:
+        K_REDUCE_OFFSETS.append(_red)
+        _red //= 2
 
     @cute.kernel
     def kda_kernel_small_batch_mtp(
@@ -122,7 +140,7 @@ def _define_mtp_kernels():
 
             smem = cutlass.utils.SmemAllocator()
             sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
-            smem_o_layout = cute.make_layout((TILE_V_SMALL,), stride=(1,))
+            smem_o_layout = cute.make_layout((TILE_V,), stride=(1,))
             smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
             smem_k_layout = cute.make_layout((TILE_K,), stride=(1,))
             smem_q_layout = cute.make_layout((TILE_K,), stride=(1,))
@@ -141,9 +159,9 @@ def _define_mtp_kernels():
             vk_v_load_base = 0
             vk_v_load_step = 0
             if state_layout_is_kv:
-                kv_v_load = tidx % TILE_V_SMALL
-                kv_k_load_base = tidx // TILE_V_SMALL
-                kv_k_load_step = NUM_THREADS // TILE_V_SMALL
+                kv_v_load = tidx % TILE_V
+                kv_k_load_base = tidx // TILE_V
+                kv_k_load_step = NUM_THREADS // TILE_V
             else:
                 vk_k_load = tidx % TILE_K
                 vk_v_load_base = tidx // TILE_K
@@ -155,8 +173,8 @@ def _define_mtp_kernels():
                 for v_tile_offset in range(num_v_tiles_per_block):
                     stage = v_tile_offset % NUM_STAGES
                     v_tile = start_v_tile + v_tile_offset
-                    v_global_base = v_tile * TILE_V_SMALL
-                    v_global = v_tile * TILE_V_SMALL + v_idx
+                    v_global_base = v_tile * TILE_V
+                    v_global = v_tile * TILE_V + v_idx
 
                     # --- Load recurrent state for this V tile (once) ---
                     for k_iter in range(NUM_K_ITERS_SMALL):
@@ -257,7 +275,7 @@ def _define_mtp_kernels():
                             k_base = k_iter * ROWS_PER_ITER_SMALL
                             k_idx = k_base + k_local
                             sum_hk += sData[(k_idx, v_idx, stage)] * sGK[k_idx]
-                        for offset in [4, 2, 1]:
+                        for offset in K_REDUCE_OFFSETS:
                             sum_hk += cute.arch.shuffle_sync_bfly(
                                 sum_hk, offset=offset * V_PER_WARP_SMALL, mask=-1, mask_and_clamp=31
                             )
@@ -275,7 +293,7 @@ def _define_mtp_kernels():
                             h_new = h_old + sK[k_idx] * v_new
                             sData[(k_idx, v_idx, stage)] = h_new
                             sum_hq += h_new * sQ[k_idx]
-                        for offset in [4, 2, 1]:
+                        for offset in K_REDUCE_OFFSETS:
                             sum_hq += cute.arch.shuffle_sync_bfly(
                                 sum_hq, offset=offset * V_PER_WARP_SMALL, mask=-1, mask_and_clamp=31
                             )
@@ -308,10 +326,12 @@ def _define_mtp_kernels():
     return kda_kernel_small_batch_mtp
 
 
-def _create_mtp_jit_functions():
-    """Create the JIT launcher for the MTP small-batch dense kernel."""
+def _create_mtp_jit_functions(tile_v: int):
+    """Create the JIT launcher for the MTP dense kernel at a given tile_v."""
 
-    kda_small_mtp = _define_mtp_kernels()
+    kda_small_mtp = _define_mtp_kernels(tile_v)
+    TILE_V = tile_v
+    TILE_V_PADDED = tile_v + 4
 
     @cute.jit
     def run_small_batch_mtp(
@@ -342,12 +362,12 @@ def _create_mtp_jit_functions():
         n_indices = h0_indices.layout.shape[0]
         batch_size = n_indices * H
 
-        num_v_tiles_small = cute.ceil_div(V, TILE_V_SMALL)
+        num_v_tiles_small = cute.ceil_div(V, TILE_V)
         smem_layout_small = cute.make_layout(
-            (TILE_K, TILE_V_SMALL, NUM_STAGES),
-            stride=(TILE_V_SMALL_PADDED, 1, TILE_K * TILE_V_SMALL_PADDED),
+            (TILE_K, TILE_V, NUM_STAGES),
+            stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
         )
-        smem_bytes_small = 4 * TILE_K * TILE_V_SMALL_PADDED * NUM_STAGES + 4 * TILE_V_SMALL + 4 * TILE_K * 4 + 64
+        smem_bytes_small = 4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 4 + 64
 
         kda_small_mtp(
             h0_source,
@@ -381,14 +401,13 @@ def _create_mtp_jit_functions():
     return run_small_batch_mtp
 
 
-_mtp_jit_function = None
+_mtp_jit_functions: dict[int, object] = {}
 
 
-def _get_mtp_jit_function():
-    global _mtp_jit_function
-    if _mtp_jit_function is None:
-        _mtp_jit_function = _create_mtp_jit_functions()
-    return _mtp_jit_function
+def _get_mtp_jit_function(tile_v: int):
+    if tile_v not in _mtp_jit_functions:
+        _mtp_jit_functions[tile_v] = _create_mtp_jit_functions(tile_v)
+    return _mtp_jit_functions[tile_v]
 
 
 def _get_compiled_mtp_kernel(
@@ -405,8 +424,9 @@ def _get_compiled_mtp_kernel(
     num_blocks_per_state_small,
     softplus_beta,
     softplus_threshold,
+    tile_v,
 ):
-    """Get or lazily compile the MTP decode kernel for one shape/config (incl. T)."""
+    """Get or lazily compile the MTP decode kernel for one shape/config (incl. T, tile_v)."""
     key = (
         N,
         T,
@@ -421,6 +441,7 @@ def _get_compiled_mtp_kernel(
         num_blocks_per_state_small,
         softplus_beta,
         softplus_threshold,
+        tile_v,
     )
     if key in _compiled_mtp_kernels:
         return _compiled_mtp_kernels[key]
@@ -452,7 +473,7 @@ def _get_compiled_mtp_kernel(
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    run_small_mtp = _get_mtp_jit_function()
+    run_small_mtp = _get_mtp_jit_function(tile_v)
     compiled_kernel = cute.compile(
         run_small_mtp,
         q_tensor,
@@ -483,7 +504,7 @@ def _get_compiled_mtp_kernel(
     _compiled_mtp_kernels[key] = compiled_kernel
     logger.info(
         "CuTe DSL KDA MTP kernel compiled: "
-        f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}"
+        f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, tile_v={tile_v}"
     )
     return compiled_kernel
 
@@ -495,6 +516,39 @@ def _normalize_mtp_a(a: torch.Tensor, *, N: int, T: int, HV: int, K: int) -> tor
     if a.dim() == 3 and tuple(a.shape) == (N, T, HV * K):
         return a.view(N, T, HV, K)
     raise ValueError(f"Unexpected a shape for MTP dense: {tuple(a.shape)}; expected {(N, T, HV, K)}")
+
+
+# Valid V-tile sizes: each must be a multiple of NUM_WARPS (4) so V_PER_WARP is
+# integral, and the heuristic picks from these. (flashinfer's get_mtp_config uses
+# {8,16,32,64}; we mirror the tile_v axis. ilp_rows/use_smem_v are P3.)
+_MTP_TILE_V_CHOICES = (8, 16, 32, 64)
+
+
+def _select_mtp_tile_v(N: int, HV: int, V: int, T: int) -> int:
+    """Pick tile_v from work_units = N*HV (simplified flashinfer get_mtp_config).
+
+    Small work_units -> small tile_v -> more V-tiles -> more CTAs to fill the GPU;
+    large work_units -> large tile_v -> fewer CTAs, better per-CTA efficiency.
+    Only the tile_v axis is selected here; ilp_rows / use_smem_v are deferred to P3.
+    """
+    work_units = N * HV
+    if work_units <= 64:
+        tile_v = 8
+    elif work_units <= 128:
+        tile_v = 16
+    elif work_units <= 448:
+        tile_v = 16 if T <= 2 else 32
+    elif work_units <= 1024:
+        tile_v = 32
+    else:
+        tile_v = 64
+
+    # Clamp to V and back off to a divisor of V (V is a multiple of 16 in
+    # practice, so this is a no-op for the common case).
+    tile_v = min(tile_v, V)
+    while tile_v > _MTP_TILE_V_CHOICES[0] and V % tile_v != 0:
+        tile_v //= 2
+    return tile_v
 
 
 def kda_decode_mtp(
@@ -513,6 +567,7 @@ def kda_decode_mtp(
     softplus_threshold: float = 20.0,
     out: torch.Tensor | None = None,
     state_layout: str = "vk",
+    tile_v: int | None = None,
 ) -> torch.Tensor:
     """CuTe DSL KDA multi-token-prediction (MTP) decode.
 
@@ -531,7 +586,9 @@ def kda_decode_mtp(
         b:   (N, T, HV)
         out: (N, T, HV, V)
 
-    P1 supports dense + small-batch only; varlen / large-batch are deferred.
+    P2 covers small AND mid/large batch through a single parameterized kernel:
+    `tile_v` defaults to a work_units=N*HV heuristic, or can be overridden.
+    Dense layout only; varlen is deferred to P4.
     """
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -543,12 +600,11 @@ def kda_decode_mtp(
         assert scale > 0, f"scale must be positive, got {scale}"
 
     assert K == TILE_K, f"KDA MTP kernel requires K={TILE_K}, got {K}"
-    assert V % TILE_V_SMALL == 0, f"KDA MTP kernel requires V % {TILE_V_SMALL} == 0, got V={V}"
-    if N >= SMALL_BATCH_THRESHOLD:
-        raise NotImplementedError(
-            f"kda_decode_mtp (P1) only supports small batch N < {SMALL_BATCH_THRESHOLD}; "
-            f"got N={N}. Large-batch MTP is planned for P2."
-        )
+
+    if tile_v is None:
+        tile_v = _select_mtp_tile_v(N, HV, V, T)
+    assert tile_v % 4 == 0, f"KDA MTP kernel requires tile_v % 4 == 0, got tile_v={tile_v}"
+    assert V % tile_v == 0, f"KDA MTP kernel requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
 
     state_layout = _canonicalize_state_layout(state_layout)
 
@@ -599,6 +655,7 @@ def kda_decode_mtp(
         num_blocks_per_state_small=num_blocks_per_state_small,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
+        tile_v=tile_v,
     )
 
     compiled_kernel(

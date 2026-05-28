@@ -189,13 +189,15 @@ def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scal
     return o_all, state_source
 
 
-def run_kda_decode_mtp_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
+def run_kda_decode_mtp_dense(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None):
     """
     Run the fused MTP kernel (kda_decode_mtp) in dense layout.
 
     Args use the MTP-shaped tensors:
         q, k: (N, T, H, K)   v: (N, T, HV, V)
         a: (N, T, HV, K)     b: (N, T, HV)     state: (N, HV, V, K)
+
+    tile_v: optional V-tile override; None uses the work_units=N*HV heuristic.
 
     Returns:
         o:            (N, T, HV, V) bfloat16
@@ -217,6 +219,7 @@ def run_kda_decode_mtp_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
         initial_state_indices=indices,
         scale=scale,
         use_qk_l2norm_in_kernel=True,
+        tile_v=tile_v,
     )
     return o, state_source  # (N, T, HV, V), (N, HV, V, K)
 
@@ -382,6 +385,53 @@ def test_kda_decode_mtp_kernel_kv_layout(T):
 
     _assert_close("mtp kv output", o_ref, o_kernel.float())
     _assert_close("mtp kv final state", state_ref_vk, state_kv.permute(0, 1, 3, 2).contiguous())
+
+
+# ---------------------------------------------------------------------------
+# Tests (P2): parameterized tile_v. Each tile_v ∈ {8,16,32,64} must reproduce
+# the same recurrence; only the CTA V-tiling / warp reduction width changes.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("tile_v", [8, 16, 32, 64])
+@pytest.mark.parametrize("T", [2, 4])
+def test_kda_decode_mtp_kernel_tile_v(tile_v, T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v
+    )
+
+    _assert_close(f"mtp tile_v={tile_v} output", o_ref, o_kernel.float())
+    _assert_close(f"mtp tile_v={tile_v} final state", state_ref, state_kernel)
+
+
+# ---------------------------------------------------------------------------
+# Test (P2): mid/large batch. N >= 1024 used to raise NotImplementedError;
+# the single parameterized kernel + work_units heuristic now covers it. We
+# validate against the established single-token kernel looped over T (fast,
+# GPU-only) rather than the O(N*HV*T) python oracle.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("N", [1024, 2048])
+def test_kda_decode_mtp_kernel_large_n(N):
+    T, H, HV, K, V = 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    # Reference: T sequential single-token kernel calls (state carried over).
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+    # Fused MTP kernel with heuristic tile_v (work_units = N*HV -> tile_v=64 here).
+    o_kernel, state_kernel = run_kda_decode_mtp_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close(f"mtp large N={N} output", o_loop.float(), o_kernel.float())
+    _assert_close(f"mtp large N={N} final state", state_loop, state_kernel)
 
 
 # ---------------------------------------------------------------------------
