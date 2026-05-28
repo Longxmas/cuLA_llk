@@ -367,7 +367,11 @@ def _create_mtp_jit_functions(tile_v: int):
             (TILE_K, TILE_V, NUM_STAGES),
             stride=(TILE_V_PADDED, 1, TILE_K * TILE_V_PADDED),
         )
-        smem_bytes_small = 4 * TILE_K * TILE_V_PADDED * NUM_STAGES + 4 * TILE_V + 4 * TILE_K * 4 + 64
+        # Each SmemAllocator tensor is 128-byte aligned, so smem_o (4*TILE_V
+        # bytes, < 128 for small tile_v) actually consumes a full 128-byte slot.
+        # Round it up so the declared launch smem is never below real usage.
+        smem_o_bytes = ((4 * TILE_V + 127) // 128) * 128
+        smem_bytes_small = 4 * TILE_K * TILE_V_PADDED * NUM_STAGES + smem_o_bytes + 4 * TILE_K * 4 + 128
 
         kda_small_mtp(
             h0_source,
