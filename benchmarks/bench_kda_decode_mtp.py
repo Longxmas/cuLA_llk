@@ -23,11 +23,14 @@ Compares routes that compute the SAME T-token recurrence:
   4. ws4    : the same warp-spec kernel, ilp=4 (explicit; fused steps 1+2 & 4+5,
               double accumulators, packed F32x2 FMA on SM100). Skipped (n/a) when
               the selected tile_v gives (tile_v//4) not divisible by 4.
-  5. ws_auto: the warp-spec kernel with ilp_rows=None — the PRODUCTION DEFAULT,
+  5. ws4_smemv: ws4 plus Stage-C use_smem_v=True (v preloaded into SMEM + merged
+              coalesced output writeback). Head-to-head vs ws4 isolates the
+              use_smem_v win; same (tile_v//4)%4 gate as ws4.
+  6. ws_auto: the warp-spec kernel with ilp_rows=None — the PRODUCTION DEFAULT,
               where the work_units=N*HV heuristic (_select_mtp_config) picks
-              (tile_v, ilp_rows). Shows what callers get with no explicit knobs;
-              it dispatches to the same kernel config as ws or ws4 per the picked
-              ilp (the "sel ilp" column reports which).
+              (tile_v, ilp_rows, use_smem_v). Shows what callers get with no
+              explicit knobs; it dispatches to the same kernel config as ws or
+              ws4 per the picked ilp (the "sel ilp" column reports which).
 
 ws and ws4 pin ilp explicitly so the ws-vs-ws4 head-to-head is NOT muddied by the
 new ilp_rows=None default.
@@ -38,11 +41,16 @@ speedups vs looped, the **ws-vs-fused** head-to-head (Route1-vs-Route2 judge) AN
 the **ws4-vs-ws** head-to-head (the ilp=4-vs-ilp=2 win). Also cross-checks each
 route's output/state against the looped route (rel error) as a sanity gate.
 
-Pass --routes to restrict which of {loop,fused,ws,ws4,ws_auto} run (default: all).
+Pass --routes to restrict which of {loop,fused,ws,ws4,ws4_smemv,ws_auto} run
+(default: all).
 
 A bit-for-bit determinism check (--determinism) re-runs the fused kernel many
 times from the same initial state and compares output + final state exactly, to
 surface state-writeback races before any P3 kernel change lands.
+
+--bench-intermediate measures the Stage-D snapshot overhead: the ilp=4 ws kernel
+with vs without the [N,T,HV,V,K] intermediate-state buffer (fire-and-forget GMEM
+stores; expect ~1.0x). Opt-in so the large buffer isn't allocated in normal runs.
 
 Fairness notes:
   - Both routes reset their state buffer before each timed iteration; the reset
@@ -57,6 +65,7 @@ Usage:
     python benchmarks/bench_kda_decode_mtp.py --H 16 --HV 64
     python benchmarks/bench_kda_decode_mtp.py --tile-v 32          # override heuristic
     python benchmarks/bench_kda_decode_mtp.py --determinism --det-iters 10000
+    python benchmarks/bench_kda_decode_mtp.py --bench-intermediate --batch-sizes 64 256
     python benchmarks/bench_kda_decode_mtp.py --output
 
 Note:
@@ -181,6 +190,34 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
     def setup_ws4():
         state_ws4.copy_(state_init)
 
+    # --- ws4_smemv route (Route 1, ilp=4 + Stage-C use_smem_v): same ilp=4 path,
+    # but v is preloaded into SMEM and outputs are accumulated in SMEM for a
+    # coalesced merged writeback. Head-to-head vs ws4 isolates the use_smem_v
+    # win (write bandwidth), which is expected to show up at large batch /
+    # tile_v=64. Gated on ws4_ok in run_config (same tile_v//4 %4 constraint). ---
+    state_ws4_smemv = state_init.clone()
+
+    def call_ws4_smemv():
+        return kda_decode_mtp_ws(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=state_ws4_smemv,
+            initial_state_indices=indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            tile_v=tile_v,
+            ilp_rows=4,
+            use_smem_v=True,
+        )
+
+    def setup_ws4_smemv():
+        state_ws4_smemv.copy_(state_init)
+
     # --- ws_auto route (Route 1, PRODUCTION DEFAULT): ilp_rows=None lets the
     # work_units heuristic (_select_mtp_config) pick (tile_v, ilp_rows). Shows
     # what callers get with no explicit knobs. A tile_v override (if any) still
@@ -247,6 +284,8 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
         "setup_ws": setup_ws,
         "call_ws4": call_ws4,
         "setup_ws4": setup_ws4,
+        "call_ws4_smemv": call_ws4_smemv,
+        "setup_ws4_smemv": setup_ws4_smemv,
         "call_ws_auto": call_ws_auto,
         "setup_ws_auto": setup_ws_auto,
         "call_loop": call_loop,
@@ -254,6 +293,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
         "state_fused": state_fused,
         "state_ws": state_ws,
         "state_ws4": state_ws4,
+        "state_ws4_smemv": state_ws4_smemv,
         "state_ws_auto": state_ws_auto,
         "state_loop": state_loop,
         "state_init": state_init,
@@ -281,11 +321,12 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
     # multiple of 4; skip it (n/a) on small tile_v rather than asserting. ws_auto
     # is always valid (ilp_rows=None lets the heuristic back off to ilp=2).
     ws4_ok = (tile_v // 4) % 4 == 0
-    # Routes actually run this config, in display order. Drop ws4 when invalid.
+    # Routes actually run this config, in display order. Drop ws4 / ws4_smemv
+    # when ilp=4 is invalid for this tile_v.
     active = [
         r
-        for r in ("loop", "fused", "ws", "ws_auto", "ws4")
-        if r in route_set and (r != "ws4" or ws4_ok)
+        for r in ("loop", "fused", "ws", "ws_auto", "ws4", "ws4_smemv")
+        if r in route_set and (r not in ("ws4", "ws4_smemv") or ws4_ok)
     ]
     corr_routes = [r for r in active if r != "loop"]
 
@@ -329,6 +370,7 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
 
     t_fused, t_ws, t_ws4 = times.get("fused"), times.get("ws"), times.get("ws4")
     t_ws_auto = times.get("ws_auto")
+    t_ws4_smemv = times.get("ws4_smemv")
     return {
         "N": N,
         "T": T,
@@ -344,27 +386,35 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
         "t_fused_ms": t_fused,
         "t_ws_ms": t_ws,
         "t_ws4_ms": t_ws4,
+        "t_ws4_smemv_ms": t_ws4_smemv,
         "t_ws_auto_ms": t_ws_auto,
         "loop_mtok_s": mtok(times.get("loop")),
         "fused_mtok_s": mtok(t_fused),
         "ws_mtok_s": mtok(t_ws),
         "ws4_mtok_s": mtok(t_ws4),
+        "ws4_smemv_mtok_s": mtok(t_ws4_smemv),
         "ws_auto_mtok_s": mtok(t_ws_auto),
         "fused_speedup": speedup_vs_loop(t_fused),  # vs looped
         "ws_speedup": speedup_vs_loop(t_ws),  # vs looped
         "ws4_speedup": speedup_vs_loop(t_ws4),  # vs looped
+        "ws4_smemv_speedup": speedup_vs_loop(t_ws4_smemv),  # vs looped
         "ws_auto_speedup": speedup_vs_loop(t_ws_auto),  # vs looped
         # Head-to-head Route1-vs-Route2: >1 means ws (Route 1) beats fused (Route 2).
         "ws_vs_fused": ratio(t_fused, t_ws),
         # ilp=4 vs ilp=2 (the TaskList #6 "biggest win" measure): >1 -> ilp=4 faster.
         "ws4_vs_ws": ratio(t_ws, t_ws4),
         "ws4_vs_fused": ratio(t_fused, t_ws4),
+        # Stage C: use_smem_v win over plain ilp=4. >1 -> smem_v faster (expected
+        # at large batch / tile_v=64 from the coalesced merged writeback).
+        "ws4_smemv_vs_ws4": ratio(t_ws4, t_ws4_smemv),
         "fused_out_rel_max": corr.get("fused", nan2)[0],
         "fused_state_rel_max": corr.get("fused", nan2)[1],
         "ws_out_rel_max": corr.get("ws", nan2)[0],
         "ws_state_rel_max": corr.get("ws", nan2)[1],
         "ws4_out_rel_max": corr.get("ws4", nan2)[0],
         "ws4_state_rel_max": corr.get("ws4", nan2)[1],
+        "ws4_smemv_out_rel_max": corr.get("ws4_smemv", nan2)[0],
+        "ws4_smemv_state_rel_max": corr.get("ws4_smemv", nan2)[1],
         "ws_auto_out_rel_max": corr.get("ws_auto", nan2)[0],
         "ws_auto_state_rel_max": corr.get("ws_auto", nan2)[1],
     }
@@ -380,8 +430,8 @@ def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route):
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V, device)
     tile_v = tile_v_override if tile_v_override is not None else _select_mtp_tile_v(N, HV, V, T)
 
-    # ws4 (ilp=4) requires (tile_v//4)%4==0; skip (not fail) where it doesn't hold.
-    if route == "ws4" and (tile_v // 4) % 4 != 0:
+    # ws4 / ws4_smemv (ilp=4) require (tile_v//4)%4==0; skip (not fail) otherwise.
+    if route in ("ws4", "ws4_smemv") and (tile_v // 4) % 4 != 0:
         return {"N": N, "T": T, "tile_v": tile_v, "iters": 0, "route": route,
                 "passed": True, "first_bad": -1, "skipped": True}
 
@@ -418,6 +468,56 @@ def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Stage D: intermediate-snapshot overhead (fire-and-forget; expected small)
+# ──────────────────────────────────────────────────────────────────────
+def run_intermediate_overhead(N, T, H, HV, K, V, tile_v_override, warmup, rep):
+    """Time the ilp=4 ws kernel with vs without the per-token intermediate-state
+    snapshot, to measure the fire-and-forget GMEM-store overhead. Opt-in (the
+    [N,T,HV,V,K] buffer is large) — only allocated here, never in the main sweep.
+    """
+    device = "cuda"
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V, device)
+    tile_v = tile_v_override if tile_v_override is not None else _select_mtp_tile_v(N, HV, V, T)
+    if (tile_v // 4) % 4 != 0:  # ilp=4 legality
+        return {"N": N, "T": T, "tile_v": tile_v, "skipped": True,
+                "t_base_ms": None, "t_inter_ms": None, "inter_overhead": float("nan")}
+
+    state_init = state.clone().contiguous()
+    indices = torch.arange(N, device=device, dtype=torch.int32)
+    state_base = state_init.clone()
+    state_inter = state_init.clone()
+    inter_buf = torch.zeros(N, T, HV, V, K, device=device, dtype=torch.float32)
+
+    def call_base():
+        return kda_decode_mtp_ws(
+            A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+            initial_state_source=state_base, initial_state_indices=indices,
+            scale=scale, use_qk_l2norm_in_kernel=True, tile_v=tile_v, ilp_rows=4,
+        )
+
+    def call_inter():
+        return kda_decode_mtp_ws(
+            A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+            initial_state_source=state_inter, initial_state_indices=indices,
+            scale=scale, use_qk_l2norm_in_kernel=True, tile_v=tile_v, ilp_rows=4,
+            intermediate_states_buffer=inter_buf,
+        )
+
+    with torch.no_grad():
+        t_base = benchmark_cuda_fn(
+            call_base, setup_fn=lambda: state_base.copy_(state_init), warmup=warmup, rep=rep
+        )
+        t_inter = benchmark_cuda_fn(
+            call_inter, setup_fn=lambda: state_inter.copy_(state_init), warmup=warmup, rep=rep
+        )
+
+    overhead = (t_inter / t_base) if (t_base and t_inter and t_base > 0) else float("nan")
+    return {"N": N, "T": T, "tile_v": tile_v, "skipped": False,
+            "t_base_ms": t_base, "t_inter_ms": t_inter, "inter_overhead": overhead}
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Markdown report
 # ──────────────────────────────────────────────────────────────────────
 def _fmt(x, spec):
@@ -450,8 +550,9 @@ def write_markdown_report(args, gpu_name, results, output_path):
         f"> Setting: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}; routes={args.routes}. "
         "fused = kda_decode_mtp (Route 2, cuLA SMEM-state); ws = kda_decode_mtp_ws ilp=2 "
         "(Route 1, FlashInfer warp-spec); ws4 = kda_decode_mtp_ws ilp=4 (fused steps + packed FMA, "
-        "n/a where tile_v//4 not %4); ws_auto = kda_decode_mtp_ws ilp_rows=None (production default, "
-        "ilp picked by the work_units heuristic — 'sel ilp' column); looped = T× single-token kda_decode."
+        "n/a where tile_v//4 not %4); ws4sv = ws4 + use_smem_v (Stage C: SMEM v preload + merged "
+        "writeback); ws_auto = kda_decode_mtp_ws ilp_rows=None (production default, ilp picked by the "
+        "work_units heuristic — 'sel ilp' column); looped = T× single-token kda_decode."
     )
     lines.append("")
     lines.append("## Summary")
@@ -462,6 +563,7 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append(f"- ws_auto-vs-looped speedup: {summary([r['ws_auto_speedup'] for r in results])}  (production default; ilp picked by heuristic — see 'sel ilp')")
     lines.append(f"- **ws-vs-fused (Route1/Route2): {summary([r['ws_vs_fused'] for r in results])}**  (>1 → Route 1 wins)")
     lines.append(f"- **ws4-vs-ws (ilp4/ilp2): {summary([r['ws4_vs_ws'] for r in results])}**  (>1 → ilp=4 wins)")
+    lines.append(f"- **ws4_smemv-vs-ws4 (Stage C use_smem_v): {summary([r['ws4_smemv_vs_ws4'] for r in results])}**  (>1 → use_smem_v wins; expect at large batch / tile_v=64)")
     lines.append(f"- Batch sizes (N): {args.batch_sizes}")
     lines.append(f"- T values: {args.Ts}")
     lines.append(f"- tile_v: {'heuristic (work_units=N*HV)' if args.tile_v is None else args.tile_v}")
@@ -469,15 +571,15 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append("")
     lines.append("## Performance")
     lines.append("")
-    lines.append("| N | T | tile_v | sel ilp | loop ms | fused ms | ws ms | ws4 ms | fused/loop | ws/loop | ws4/loop | ws/fused | ws4/ws | ws out rmax | ws4 out rmax |")
-    lines.append("|--:|--:|-------:|--------:|--------:|---------:|------:|-------:|-----------:|--------:|---------:|---------:|-------:|------------:|-------------:|")
+    lines.append("| N | T | tile_v | sel ilp | loop ms | fused ms | ws ms | ws4 ms | ws4sv ms | fused/loop | ws/loop | ws4/loop | ws/fused | ws4/ws | ws4sv/ws4 | ws out rmax | ws4 out rmax | ws4sv out rmax |")
+    lines.append("|--:|--:|-------:|--------:|--------:|---------:|------:|-------:|--------:|-----------:|--------:|---------:|---------:|-------:|----------:|------------:|-------------:|---------------:|")
     for r in results:
         lines.append(
             f"| {r['N']} | {r['T']} | {r['tile_v']} | {r['sel_ilp']} | {_fmt(r['t_loop_ms'], '.4f')} | {_fmt(r['t_fused_ms'], '.4f')} | "
-            f"{_fmt(r['t_ws_ms'], '.4f')} | {_fmt(r['t_ws4_ms'], '.4f')} | "
+            f"{_fmt(r['t_ws_ms'], '.4f')} | {_fmt(r['t_ws4_ms'], '.4f')} | {_fmt(r['t_ws4_smemv_ms'], '.4f')} | "
             f"{_fmt(r['fused_speedup'], '.2f')}x | {_fmt(r['ws_speedup'], '.2f')}x | {_fmt(r['ws4_speedup'], '.2f')}x | "
-            f"**{_fmt(r['ws_vs_fused'], '.2f')}x** | **{_fmt(r['ws4_vs_ws'], '.2f')}x** | "
-            f"{_fmt(r['ws_out_rel_max'], '.2e')} | {_fmt(r['ws4_out_rel_max'], '.2e')} |"
+            f"**{_fmt(r['ws_vs_fused'], '.2f')}x** | **{_fmt(r['ws4_vs_ws'], '.2f')}x** | **{_fmt(r['ws4_smemv_vs_ws4'], '.2f')}x** | "
+            f"{_fmt(r['ws_out_rel_max'], '.2e')} | {_fmt(r['ws4_out_rel_max'], '.2e')} | {_fmt(r['ws4_smemv_out_rel_max'], '.2e')} |"
         )
     lines.append("")
     lines.append("## Reproduce")
@@ -507,14 +609,20 @@ def build_parser():
     parser.add_argument(
         "--routes",
         nargs="+",
-        choices=["loop", "fused", "ws", "ws4", "ws_auto"],
-        default=["loop", "fused", "ws", "ws_auto", "ws4"],
+        choices=["loop", "fused", "ws", "ws4", "ws4_smemv", "ws_auto"],
+        default=["loop", "fused", "ws", "ws_auto", "ws4", "ws4_smemv"],
         help="Which routes to run/time. loop=T× single-token, fused=kda_decode_mtp (Route 2), "
         "ws=kda_decode_mtp_ws ilp=2 (Route 1), ws4=kda_decode_mtp_ws ilp=4 (skipped when tile_v//4 not %4), "
         "ws_auto=kda_decode_mtp_ws ilp_rows=None (production default; heuristic picks ilp).",
     )
     parser.add_argument("--determinism", action="store_true", help="Run bit-for-bit determinism check instead of timing")
     parser.add_argument("--det-iters", type=int, default=10000, help="Determinism check repetitions per config")
+    parser.add_argument(
+        "--bench-intermediate",
+        action="store_true",
+        help="Measure Stage-D intermediate-snapshot overhead (ilp=4 ws with vs without "
+             "the [N,T,HV,V,K] snapshot buffer) instead of the main route sweep",
+    )
     parser.add_argument(
         "--output",
         nargs="?",
@@ -540,9 +648,9 @@ def main(argv=None):
     print()
 
     if args.determinism:
-        det_routes = [r for r in args.routes if r in ("fused", "ws", "ws4", "ws_auto")]
+        det_routes = [r for r in args.routes if r in ("fused", "ws", "ws4", "ws4_smemv", "ws_auto")]
         if not det_routes:
-            print("No state-writeback route selected (--routes must include fused, ws, ws4, and/or ws_auto for --determinism).")
+            print("No state-writeback route selected (--routes must include fused, ws, ws4, ws4_smemv, and/or ws_auto for --determinism).")
             return True
         hdr = f"{'route':>6} | {'N':>5} | {'T':>3} | {'tile_v':>6} | {'iters':>8} | {'result':>8}"
         print(hdr)
@@ -564,10 +672,33 @@ def main(argv=None):
         print("ALL DETERMINISTIC" if all_ok else "NON-DETERMINISM DETECTED — investigate state writeback race")
         return all_ok
 
+    if args.bench_intermediate:
+        hdr = (
+            f"{'N':>5} | {'T':>3} | {'tile_v':>6} | {'ws4 ms':>9} | {'ws4+inter ms':>12} | "
+            f"{'inter overhead':>14}"
+        )
+        print(hdr)
+        print("-" * len(hdr))
+        for T in args.Ts:
+            for N in args.batch_sizes:
+                res = run_intermediate_overhead(
+                    N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.warmup, args.rep
+                )
+                if res["skipped"]:
+                    print(f"{res['N']:5d} | {res['T']:3d} | {res['tile_v']:6d} | "
+                          f"{'n/a (ilp=4 invalid)':>39}")
+                    continue
+                print(f"{res['N']:5d} | {res['T']:3d} | {res['tile_v']:6d} | "
+                      f"{_fmt(res['t_base_ms'], '.4f'):>9} | {_fmt(res['t_inter_ms'], '.4f'):>12} | "
+                      f"{_fmt(res['inter_overhead'], '.3f'):>13}x")
+        print()
+        print("Stage-D snapshot overhead = ws4+inter / ws4 (fire-and-forget; expect ~1.0x).")
+        return True
+
     hdr = (
         f"{'N':>5} | {'T':>3} | {'tile_v':>6} | {'sel ilp':>7} | {'loop ms':>9} | {'fused ms':>9} | {'ws ms':>9} | "
-        f"{'ws4 ms':>9} | {'wsAuto ms':>9} | "
-        f"{'ws/fused':>8} | {'ws4/ws':>7} | {'ws4/loop':>8} | {'ws4 out rmax':>12} | {'ws4 st rmax':>11}"
+        f"{'ws4 ms':>9} | {'ws4sv ms':>9} | {'wsAuto ms':>9} | "
+        f"{'ws/fused':>8} | {'ws4/ws':>7} | {'ws4sv/ws4':>9} | {'ws4/loop':>8} | {'ws4 out rmax':>12} | {'ws4 st rmax':>11}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -580,8 +711,8 @@ def main(argv=None):
             print(
                 f"{res['N']:5d} | {res['T']:3d} | {res['tile_v']:6d} | {res['sel_ilp']:7d} | "
                 f"{_fmt(res['t_loop_ms'], '.4f'):>9} | {_fmt(res['t_fused_ms'], '.4f'):>9} | "
-                f"{_fmt(res['t_ws_ms'], '.4f'):>9} | {_fmt(res['t_ws4_ms'], '.4f'):>9} | {_fmt(res['t_ws_auto_ms'], '.4f'):>9} | "
-                f"{_fmt(res['ws_vs_fused'], '.2f'):>7}x | {_fmt(res['ws4_vs_ws'], '.2f'):>6}x | {_fmt(res['ws4_speedup'], '.2f'):>7}x | "
+                f"{_fmt(res['t_ws_ms'], '.4f'):>9} | {_fmt(res['t_ws4_ms'], '.4f'):>9} | {_fmt(res['t_ws4_smemv_ms'], '.4f'):>9} | {_fmt(res['t_ws_auto_ms'], '.4f'):>9} | "
+                f"{_fmt(res['ws_vs_fused'], '.2f'):>7}x | {_fmt(res['ws4_vs_ws'], '.2f'):>6}x | {_fmt(res['ws4_smemv_vs_ws4'], '.2f'):>8}x | {_fmt(res['ws4_speedup'], '.2f'):>7}x | "
                 f"{_fmt(res['ws4_out_rel_max'], '.2e'):>12} | {_fmt(res['ws4_state_rel_max'], '.2e'):>11}"
             )
     print()
