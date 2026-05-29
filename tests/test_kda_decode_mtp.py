@@ -43,7 +43,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling test import
 
-from cula.kda import kda_decode, kda_decode_mtp
+from cula.kda import kda_decode, kda_decode_mtp, kda_decode_mtp_ws
 
 # Trusted single-token reference from the existing decode test. We cross-check
 # our MTP reference against it (pure torch, no kernel) so the MTP oracle is
@@ -473,6 +473,147 @@ def test_kda_mtp_zero_state(T):
 
     _assert_close("zero-state output", o_ref, o_loop.float())
     _assert_close("zero-state final state", state_ref, state_loop)
+
+
+# ===========================================================================
+# Route 1 (warp-specialized port): kda_decode_mtp_ws
+#
+# kda_decode_mtp_ws is the FlashInfer-style warp-specialized variant (grid =
+# N*HV*num_v_tiles, register-resident state, full-warp shuffle reduction,
+# decay-first order with per-channel g). It is a SEPARATE implementation of the
+# same contract as kda_decode_mtp, validated against the SAME fp32 torch oracle.
+# Stage 1: vk-only, ilp_rows=2. bf16 rounding differs from the Route-2 kernel
+# (different accumulation order), so we gate on the oracle, not on Route 2.
+# ===========================================================================
+def run_kda_decode_mtp_ws_dense(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None):
+    """Run the warp-specialized fused MTP kernel (kda_decode_mtp_ws), dense vk."""
+    N = q.shape[0]
+    state_source = state.clone().contiguous()  # (N, HV, V, K), updated in-place
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+
+    o = kda_decode_mtp_ws(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_source,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        tile_v=tile_v,
+    )
+    return o, state_source  # (N, T, HV, V), (N, HV, V, K)
+
+
+@pytest.mark.parametrize("N", [1, 4, 16, 64])
+@pytest.mark.parametrize("T", [2, 4, 8])
+@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
+def test_kda_decode_mtp_ws_kernel_dense(N, T, H, HV):
+    K, V = 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close("ws mtp kernel output", o_ref, o_kernel.float())
+    _assert_close("ws mtp kernel final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("tile_v", [8, 16, 32, 64])
+@pytest.mark.parametrize("T", [2, 4])
+def test_kda_decode_mtp_ws_kernel_tile_v(tile_v, T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v
+    )
+
+    _assert_close(f"ws mtp tile_v={tile_v} output", o_ref, o_kernel.float())
+    _assert_close(f"ws mtp tile_v={tile_v} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("T", [2, 4, 8])
+def test_kda_decode_mtp_ws_kernel_zero_state(T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, _ = make_inputs_mtp(N, T, H, HV, K, V)
+    state = torch.zeros(N, HV, V, K, device="cuda", dtype=torch.float32)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close("ws mtp zero-state output", o_ref, o_kernel.float())
+    _assert_close("ws mtp zero-state final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("N", [1024, 2048])
+def test_kda_decode_mtp_ws_kernel_large_n(N):
+    """Mid/large batch (work_units heuristic picks tile_v=64). Validate against
+    the established single-token kernel looped over T (GPU-only, fast)."""
+    T, H, HV, K, V = 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close(f"ws mtp large N={N} output", o_loop.float(), o_kernel.float())
+    _assert_close(f"ws mtp large N={N} final state", state_loop, state_kernel)
+
+
+def test_kda_decode_mtp_ws_disable_state_update():
+    """disable_state_update=True must leave the state pool untouched while still
+    producing correct per-token outputs."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, _ = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+
+    state_source = state.clone().contiguous()
+    state_before = state_source.clone()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o_kernel = kda_decode_mtp_ws(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_source,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        disable_state_update=True,
+    )
+
+    _assert_close("ws disable_state_update output", o_ref, o_kernel.float())
+    # State must be byte-for-byte unchanged.
+    assert torch.equal(state_source, state_before), "state pool was modified despite disable_state_update=True"
 
 
 if __name__ == "__main__":

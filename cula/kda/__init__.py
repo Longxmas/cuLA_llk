@@ -17,12 +17,14 @@ from cula.kda.chunk import chunk_kda
 from cula.kda.hopper_fused_fwd import cula_kda_prefill as kda_prefill_hopper
 from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
 from cula.ops.kda_decode_mtp import kda_decode_mtp
+from cula.ops.kda_decode_mtp_ws import kda_decode_mtp_ws
 
 __all__ = [
     "chunk_kda",
     "kda_prefill_blackwell",
     "kda_decode",
     "kda_decode_mtp",
+    "kda_decode_mtp_ws",
     "fused_sigmoid_gating_delta_rule_update",
     "kda_prefill_hopper",
 ]
