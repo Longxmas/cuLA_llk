@@ -33,9 +33,15 @@ Scope (this file):
 - ``ilp_rows in {2, 4}``. ilp=2 (Stage 1) covers every tile_v in {8,16,32,64};
   ilp=4 (Stage 2) fuses steps 1+2 and 4+5, uses double accumulators + packed
   F32x2 FMA on SM100 (scalar ``fma_pair`` fallback elsewhere), and requires
-  ``tile_v % 16 == 0`` (so {16,32,64}). ilp=8 + use_smem_v come next.
+  ``tile_v % 16 == 0`` (so {16,32,64}). ilp=8 is not ported.
 - ``vk`` state layout only (FlashInfer is vk-only; kv is a later add-back).
-- No ``use_smem_v`` / ``sOutput`` merge, no intermediate-state snapshots.
+- ``use_smem_v`` (Stage C): preload the v-tile into SMEM + merged coalesced
+  output writeback (``sOutput``); constexpr, off by default unless the heuristic
+  (large batch / tile_v=64) or an explicit arg turns it on. Works with ilp 2/4.
+- ``cache_intermediate_states`` (Stage D): when an ``intermediate_states_buffer``
+  ([N, T, HV, V, K] vk) is passed, snapshot every token's post-state to GMEM
+  (sequence-indexed) for speculative-decoding rollback. Produce-only: cuLA fills
+  the buffer; it does NOT implement the rollback. Constexpr, off by default.
 - ``disable_state_update`` supported (cheap; default False = always write back).
 
 Math per token t (decay-first, per-channel g):
@@ -98,6 +104,7 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
 @cute.kernel
 def kda_verify_kernel_mtp_ws(
     h0_source: cute.Tensor,  # [pool_size * HV, V, K] fp32, K-last (VK layout)
+    intermediate_states: cute.Tensor,  # [N*T*HV, V, K] fp32 snapshot cache (or dummy)
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
@@ -122,15 +129,22 @@ def kda_verify_kernel_mtp_ws(
     disable_state_update: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_packed_fma: cutlass.Constexpr[bool],
+    use_smem_v: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
 ):
     """Warp-specialized KDA MTP kernel. One CTA owns one (i_n, i_hv, i_v) tile.
 
     Phase 1: warp 0 computes q/k (L2-normed) + per-channel g + scalar beta for
     all T tokens and writes them to SMEM; warps 1-3 prefetch the first ILP set
-    of state rows from GMEM into registers. A barrier publishes the SMEM. Then
-    all 4 warps run the T-step recurrence with state register-resident, one CTA
-    covering ``tile_v`` V-rows (4 warps x rows_per_group), each lane owning
+    of state rows from GMEM into registers. If ``use_smem_v`` (Stage C), all warps
+    also cooperatively preload the v-tile into ``sVdata``. A barrier publishes the
+    SMEM. Then all 4 warps run the T-step recurrence with state register-resident,
+    one CTA covering ``tile_v`` V-rows (4 warps x rows_per_group), each lane owning
     ``vec_size`` K-channels of a V-row and reducing over K via full-warp shuffle.
+    Outputs go straight to ``o`` (default) or, under ``use_smem_v``, accumulate in
+    ``sOutput`` for a single coalesced merged writeback after the recurrence. If
+    ``cache_intermediate_states`` (Stage D), each token's post-state is snapshotted
+    fire-and-forget to ``intermediate_states`` (sequence-indexed) for spec-decode.
     """
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
@@ -173,6 +187,23 @@ def kda_verify_kernel_mtp_ws(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
     )
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
+
+    # use_smem_v (Stage C): preload the CTA's v-tile into SMEM (one cooperative
+    # load up front instead of a GMEM read every token) and accumulate this
+    # CTA's outputs in SMEM for a single coalesced merged writeback at the end
+    # (vs lane-0 scatter writes per token). Helps large batch / tile_v=64 write
+    # bandwidth. Allocated LAST and only when enabled, so the offsets of the
+    # unconditional broadcast buffers (sQ/sK/sG/sBeta) — and the off-path's total
+    # SMEM footprint — never shift. 16B alignment like the other ws buffers (NOT
+    # Route-2's 128B; see cdf6a89), so the launcher's flat +128 slack covers the
+    # cumulative per-tensor padding without per-tensor 128B rounding.
+    if cutlass.const_expr(use_smem_v):
+        sVdata = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
+        )
+        sOutput = smem.allocate_tensor(
+            cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
+        )
 
     # Per-lane registers. r_g holds this lane's vec_size channels of g (the KDA
     # change vs GDN's scalar). r_h holds up to 8 V-rows of state (only ilp_rows
@@ -266,6 +297,20 @@ def kda_verify_kernel_mtp_ws(
                     cutlass.Float32(1.0) + cute.exp(-r_b)
                 )
                 sBeta[i_t] = r_beta
+
+                # Cooperatively preload this CTA's v-tile into SMEM. Warp 0 covers
+                # the first 32 tile-local columns (tidx<32); warps 1-3 cover the
+                # rest below (their tidx 32..127). Guarded by tidx<tile_v so only
+                # the tile_v owners write — together all columns 0..tile_v-1 are
+                # filled exactly once (no overlap; tidx is the global thread id).
+                # Mirrors FlashInfer gdn_decode_mtp.py:405-412.
+                if cutlass.const_expr(use_smem_v):
+                    if tidx < tile_v:
+                        v_global_idx = i_v * tile_v + tidx
+                        if v_global_idx < V:
+                            sVdata[(i_t, tidx)] = cutlass.Float32(
+                                v[i_n, i_t, i_hv, v_global_idx]
+                            )
         else:
             # Warps 1-3: prefetch the first ILP set of state rows into registers,
             # overlapping the h-state DRAM latency with warp 0's Phase 1 compute.
@@ -314,7 +359,21 @@ def kda_verify_kernel_mtp_ws(
                     cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
                     cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
 
-        # Publish warp 0's SMEM writes to all warps before the recurrence reads.
+            # Warps 1-3 help preload the v-tile (their tidx 32..127 cover the
+            # tile-local columns warp 0's 32 lanes can't reach, e.g. cols 32..63
+            # at tile_v=64). Same tidx<tile_v guard as warp 0 -> every column
+            # written exactly once. Mirrors FlashInfer gdn_decode_mtp.py:471-480.
+            if cutlass.const_expr(use_smem_v):
+                for i_t in cutlass.range_constexpr(T):
+                    if tidx < tile_v:
+                        v_global_idx = i_v * tile_v + tidx
+                        if v_global_idx < V:
+                            sVdata[(i_t, tidx)] = cutlass.Float32(
+                                v[i_n, i_t, i_hv, v_global_idx]
+                            )
+
+        # Publish warp 0's SMEM writes (q/k/g/beta + preloaded v) to all warps
+        # before the recurrence reads them.
         cute.arch.barrier()
 
         # ============ Recurrence: ilp_rows == 2 (process 2 V-rows together) ===
@@ -371,9 +430,14 @@ def kda_verify_kernel_mtp_ws(
                                 sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
                             )
 
-                        # Step 3: delta rule.
-                        r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
-                        r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
+                        # Step 3: delta rule. v from SMEM (preloaded) or GMEM.
+                        if cutlass.const_expr(use_smem_v):
+                            v_local_a = v_idx_a - i_v * tile_v
+                            r_v_a = sVdata[(i_t, v_local_a)]
+                            r_v_b = sVdata[(i_t, v_local_a + 1)]
+                        else:
+                            r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
+                            r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
                         v_new_a = (r_v_a - sum_hk_a) * r_beta
                         v_new_b = (r_v_b - sum_hk_b) * r_beta
 
@@ -381,6 +445,31 @@ def kda_verify_kernel_mtp_ws(
                         for i in cutlass.range_constexpr(vec_size):
                             r_h[0, i] += r_k[i] * v_new_a
                             r_h[1, i] += r_k[i] * v_new_b
+
+                        # Stage D: snapshot the post-token state (r_h now holds the
+                        # state AFTER consuming token i_t) to the GMEM cache. Indexed
+                        # by SEQUENCE i_n (NOT the pool slot cache_idx used for the
+                        # h0_source writeback): flat_idx = i_n*T*HV + i_t*HV + i_hv,
+                        # i.e. intermediate_states[N,T,HV,V,K] flattened. Each lane
+                        # writes its own vec_size K-channels of rows v_idx_a/b; rows
+                        # and (i_n,i_t,i_hv,i_v) tiles are disjoint across the CTA,
+                        # so the stores are race-free and fire-and-forget — placed
+                        # before step 5 so they overlap the readout + reduction +
+                        # output (mirrors FlashInfer gdn_decode_mtp.py:1265-1279).
+                        if cutlass.const_expr(cache_intermediate_states):
+                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            inter_a = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_a)
+                            inter_b = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_b)
 
                         # Step 5: o = S_new @ q_scaled  (reduce over K).
                         sum_hq_a = 0.0
@@ -396,10 +485,16 @@ def kda_verify_kernel_mtp_ws(
                                 sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
                             )
 
-                        # Reduction result is identical on all lanes -> lane 0 writes.
+                        # Reduction result is identical on all lanes -> lane 0
+                        # writes. To SMEM (merged flush at kernel end) or GMEM.
                         if lane_in_group == 0:
-                            o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(sum_hq_a)
-                            o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(sum_hq_b)
+                            if cutlass.const_expr(use_smem_v):
+                                vla = v_idx_a - i_v * tile_v
+                                sOutput[(i_t, vla)] = cutlass.BFloat16(sum_hq_a)
+                                sOutput[(i_t, vla + 1)] = cutlass.BFloat16(sum_hq_b)
+                            else:
+                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(sum_hq_a)
+                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(sum_hq_b)
 
                     # Write final state for both rows back to the pool (once).
                     if cutlass.const_expr(not disable_state_update):
@@ -422,8 +517,9 @@ def kda_verify_kernel_mtp_ws(
         # the K-reduce FFMA dependency chain, and packed F32x2 FMA on SM100. KDA
         # change vs GDN: per-channel decay r_g[i]/r_g[i+1] (a vec_size register
         # loaded from sG, not a scalar). The h@k / h@q FMAs are byte-identical to
-        # GDN. use_smem_v / sOutput / intermediate-state snapshots are later stages
-        # and intentionally omitted (GMEM v read + direct o write only).
+        # GDN. Stage-C use_smem_v (SMEM v read + sOutput merged writeback) and
+        # Stage-D intermediate-state snapshots are wired in below under their
+        # respective constexpr guards.
         elif cutlass.const_expr(ilp_rows == 4):
             quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
 
@@ -548,11 +644,18 @@ def kda_verify_kernel_mtp_ws(
                                 sum_hk_d, offset=offset, mask=-1, mask_and_clamp=31
                             )
 
-                        # Step 3: delta rule for all 4 rows (GMEM v read).
-                        r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
-                        r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
-                        r_v_c = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_c])
-                        r_v_d = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_d])
+                        # Step 3: delta rule for all 4 rows. v from SMEM or GMEM.
+                        if cutlass.const_expr(use_smem_v):
+                            v_local_a = v_idx_a - i_v * tile_v
+                            r_v_a = sVdata[(i_t, v_local_a)]
+                            r_v_b = sVdata[(i_t, v_local_a + 1)]
+                            r_v_c = sVdata[(i_t, v_local_a + 2)]
+                            r_v_d = sVdata[(i_t, v_local_a + 3)]
+                        else:
+                            r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
+                            r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
+                            r_v_c = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_c])
+                            r_v_d = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_d])
                         v_new_a = (r_v_a - sum_hk_a) * r_beta
                         v_new_b = (r_v_b - sum_hk_b) * r_beta
                         v_new_c = (r_v_c - sum_hk_c) * r_beta
@@ -655,12 +758,54 @@ def kda_verify_kernel_mtp_ws(
                                 sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31
                             )
 
-                        # Reduction result is identical on all lanes -> lane 0 writes.
+                        # Reduction result is identical on all lanes -> lane 0
+                        # writes. To SMEM (merged flush at kernel end) or GMEM.
                         if lane_in_group == 0:
-                            o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(sum_hq_a)
-                            o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(sum_hq_b)
-                            o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(sum_hq_c)
-                            o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(sum_hq_d)
+                            if cutlass.const_expr(use_smem_v):
+                                vla = v_idx_a - i_v * tile_v
+                                sOutput[(i_t, vla)] = cutlass.BFloat16(sum_hq_a)
+                                sOutput[(i_t, vla + 1)] = cutlass.BFloat16(sum_hq_b)
+                                sOutput[(i_t, vla + 2)] = cutlass.BFloat16(sum_hq_c)
+                                sOutput[(i_t, vla + 3)] = cutlass.BFloat16(sum_hq_d)
+                            else:
+                                o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(sum_hq_a)
+                                o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(sum_hq_b)
+                                o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(sum_hq_c)
+                                o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(sum_hq_d)
+
+                        # Stage D: snapshot the post-token state. Steps 4+5 are
+                        # fused here, so r_h reaches its final (post-token i_t)
+                        # value only after the loop above — hence the snapshot is
+                        # LAST in the timestep (after the output write), all lanes
+                        # participating (each writes its vec_size K-channels). Same
+                        # sequence-indexed flat_idx and race-free fire-and-forget
+                        # stores as the ilp=2 path (mirrors gdn_decode_mtp.py:1135-1160).
+                        if cutlass.const_expr(cache_intermediate_states):
+                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            inter_a = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx_a, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (0, None)), inter_a)
+                            inter_b = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx_b, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_b)
+                            inter_c = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx_c, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (2, None)), inter_c)
+                            inter_d = cute.local_tile(
+                                intermediate_states,
+                                (1, 1, vec_size),
+                                (flat_idx, v_idx_d, lane_in_group),
+                            )
+                            cute.autovec_copy(cute.slice_(r_h, (3, None)), inter_d)
 
                     # Write final state for all 4 rows back to the pool (once).
                     if cutlass.const_expr(not disable_state_update):
@@ -689,10 +834,30 @@ def kda_verify_kernel_mtp_ws(
                         )
                         cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
 
+        # ============ Merged output writeback (use_smem_v only) ============
+        # Each group wrote its own disjoint tile-local columns of sOutput (lane 0
+        # only), so there is no write-write race; the barrier publishes all of
+        # those before any thread reads. Then all 128 threads cooperatively flush
+        # sOutput -> o, one tile-local column per thread (tidx<tile_v) across all
+        # T tokens — consecutive threads hit consecutive v_global, so the GMEM o
+        # writes coalesce (vs the per-token lane-0 scatter the non-smem path does).
+        # Outside the ilp branches but inside `cache_idx >= 0` (uniform across the
+        # CTA), so the barrier never deadlocks. Mirrors FlashInfer
+        # gdn_decode_mtp.py:1325-1334.
+        if cutlass.const_expr(use_smem_v):
+            cute.arch.barrier()
+            v_tile_base = i_v * tile_v
+            for t_idx in cutlass.range_constexpr(T):
+                if tidx < tile_v:
+                    v_global = v_tile_base + tidx
+                    if v_global < V:
+                        o[(i_n, t_idx, i_hv, v_global)] = sOutput[(t_idx, tidx)]
+
 
 @cute.jit
 def run_kda_verify_kernel_mtp_ws(
     h0_source: cute.Tensor,
+    intermediate_states: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
     dt_bias: cute.Tensor,
@@ -716,6 +881,8 @@ def run_kda_verify_kernel_mtp_ws(
     disable_state_update: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_packed_fma: cutlass.Constexpr[bool],
+    use_smem_v: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Host-side launcher: grid = N * HV * num_v_tiles, block = 128 (4 warps)."""
@@ -727,6 +894,11 @@ def run_kda_verify_kernel_mtp_ws(
     grid_size = n_indices * HV * num_v_tiles
 
     # sQ + sK + sG (all [T, K+8] fp32) + sBeta ([T] fp32) + alignment slack.
+    # When use_smem_v, add sVdata ([T, tile_v] fp32) + sOutput ([T, tile_v] bf16),
+    # matching the kernel's conditional allocation. All ws buffers use 16B
+    # alignment (not Route-2's 128B; see cdf6a89), so the flat +128 slack covers
+    # the cumulative per-tensor padding (every fp32 row here is a 16B multiple;
+    # only sBeta can need <16B of padding) — no per-tensor 128B rounding needed.
     smem_bytes = (
         4 * T * (k_dim + 8)  # sQ
         + 4 * T * (k_dim + 8)  # sK
@@ -734,9 +906,13 @@ def run_kda_verify_kernel_mtp_ws(
         + 4 * T  # sBeta
         + 128  # alignment slack
     )
+    if cutlass.const_expr(use_smem_v):
+        smem_bytes += 4 * T * tile_v  # sVdata (fp32)
+        smem_bytes += 2 * T * tile_v  # sOutput (bf16)
 
     kda_verify_kernel_mtp_ws(
         h0_source,
+        intermediate_states,
         vec_size,
         num_v_tiles,
         tile_v,
@@ -761,6 +937,8 @@ def run_kda_verify_kernel_mtp_ws(
         disable_state_update,
         ilp_rows,
         use_packed_fma,
+        use_smem_v,
+        cache_intermediate_states,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -785,6 +963,8 @@ def _get_compiled_mtp_ws_kernel(
     tile_v,
     ilp_rows,
     use_packed_fma,
+    use_smem_v,
+    cache_intermediate_states,
 ):
     """Get or lazily compile the warp-spec MTP kernel for one shape/config."""
     key = (
@@ -803,6 +983,8 @@ def _get_compiled_mtp_ws_kernel(
         tile_v,
         ilp_rows,
         use_packed_fma,
+        use_smem_v,
+        cache_intermediate_states,
     )
     if key in _compiled_mtp_ws_kernels:
         return _compiled_mtp_ws_kernels[key]
@@ -818,6 +1000,16 @@ def _get_compiled_mtp_ws_kernel(
     # Warp-spec kernel uses the flat 3D state view [pool*HV, V, K] (VK layout).
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+    # Stage D intermediate-state cache, indexed by SEQUENCE: flattened
+    # [N*T*HV, V, K] (= [N, T, HV, V, K] vk). When not caching, a tiny dummy
+    # (the kernel never touches it; cache_intermediate_states=False compiles the
+    # snapshot stores out). Same first-dim convention as the real runtime tensor.
+    if cache_intermediate_states:
+        intermediate_states = torch.zeros(
+            N * T * HV, V, K, dtype=torch.float32, device="cuda"
+        )
+    else:
+        intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
 
     q_tensor = from_dlpack(q, assumed_align=16)
     k_tensor = from_dlpack(k, assumed_align=16)
@@ -829,12 +1021,14 @@ def _get_compiled_mtp_ws_kernel(
     h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
     h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
     o_tensor = from_dlpack(o, assumed_align=16)
+    intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = cute.compile(
         run_kda_verify_kernel_mtp_ws,
         h0_source_tensor,
+        intermediate_states_tensor,
         A_log_tensor,
         a_tensor,
         dt_bias_tensor,
@@ -858,6 +1052,8 @@ def _get_compiled_mtp_ws_kernel(
         disable_state_update=disable_state_update,
         ilp_rows=ilp_rows,
         use_packed_fma=use_packed_fma,
+        use_smem_v=use_smem_v,
+        cache_intermediate_states=cache_intermediate_states,
         stream=stream,
         options="--enable-tvm-ffi --opt-level 1",
     )
@@ -866,7 +1062,8 @@ def _get_compiled_mtp_ws_kernel(
     logger.info(
         "CuTe DSL KDA MTP warp-spec kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, "
-        f"tile_v={tile_v}, ilp_rows={ilp_rows}, use_packed_fma={use_packed_fma}"
+        f"tile_v={tile_v}, ilp_rows={ilp_rows}, use_packed_fma={use_packed_fma}, "
+        f"use_smem_v={use_smem_v}, cache_intermediate_states={cache_intermediate_states}"
     )
     return compiled_kernel
 
@@ -891,6 +1088,8 @@ def kda_decode_mtp_ws(
     ilp_rows: int | None = None,
     disable_state_update: bool = False,
     use_packed_fma: bool | None = None,
+    use_smem_v: bool | None = None,
+    intermediate_states_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """KDA MTP decode — warp-specialized variant (Route 1).
 
@@ -914,6 +1113,24 @@ def kda_decode_mtp_ws(
     ``use_packed_fma=None`` auto-detects SM100+ (Blackwell); pass False to force
     the scalar fallback.
 
+    ``use_smem_v`` (Stage C) preloads the CTA's v-tile into SMEM (one cooperative
+    load instead of a per-token GMEM read) and accumulates outputs in SMEM for a
+    single coalesced merged writeback at kernel end (instead of the per-token
+    lane-0 scatter). ``use_smem_v=None`` (default) takes it from the
+    ``work_units=N*HV`` heuristic (:func:`_select_mtp_config`), which enables it
+    only for the large-batch (tile_v=64) bucket; an explicit bool overrides. It
+    is independent of ``ilp_rows`` and works with any ``tile_v``.
+
+    ``intermediate_states_buffer`` (Stage D, speculative-decoding support): an
+    optional fp32, contiguous tensor of shape ``[N, T, HV, V, K]`` (vk / K-last).
+    When given, the kernel snapshots the post-token state after EVERY token to
+    ``buffer[i_n, i_t, i_hv]`` (indexed by SEQUENCE position, so a serving layer
+    can roll back to the snapshot at the last accepted token); ``buffer[:, T-1]``
+    equals the final state written to the pool. When ``None`` (default) no
+    snapshots are taken. Produce-only — cuLA does NOT implement the rollback;
+    the caller owns the buffer and the rollback policy. The return value is
+    always just ``o`` (the buffer is filled in place).
+
     Constraints: ``state_layout='vk'`` only; ``ilp_rows in {2, 4}``.
     """
     N, T, H, K = q.shape
@@ -927,15 +1144,17 @@ def kda_decode_mtp_ws(
 
     assert K == TILE_K, f"KDA MTP (ws) kernel requires K={TILE_K}, got {K}"
 
-    # Resolve tile_v / ilp_rows from the work_units=N*HV heuristic where not
-    # given explicitly (mirrors kda_decode_mtp). The heuristic's use_smem_v is
-    # produced but ignored here (Stage C). An explicit tile_v can make the
-    # heuristic's ilp=4 illegal (needs tile_v % 16 == 0); in the auto path we
-    # fall back to the universally-legal ilp=2 rather than tripping the
+    # Resolve tile_v / ilp_rows / use_smem_v from the work_units=N*HV heuristic
+    # where not given explicitly (mirrors kda_decode_mtp). An explicit tile_v can
+    # make the heuristic's ilp=4 illegal (needs tile_v % 16 == 0); in the auto
+    # path we fall back to the universally-legal ilp=2 rather than tripping the
     # rows_per_group assert below. (When tile_v also came from the heuristic,
     # _select_mtp_config already applied this backstop, so the guard is a no-op.)
-    if tile_v is None or ilp_rows is None:
-        sel_tile_v, sel_ilp_rows, _sel_use_smem_v = _select_mtp_config(
+    # use_smem_v is independent of tile_v legality (preloading v works for any
+    # tile_v); the heuristic turns it on only for the large-batch (tile_v=64)
+    # bucket. An explicit use_smem_v overrides.
+    if tile_v is None or ilp_rows is None or use_smem_v is None:
+        sel_tile_v, sel_ilp_rows, sel_use_smem_v = _select_mtp_config(
             N, HV, V, T, disable_state_update=disable_state_update
         )
         if tile_v is None:
@@ -944,6 +1163,8 @@ def kda_decode_mtp_ws(
             ilp_rows = sel_ilp_rows
             if ilp_rows == 4 and tile_v % 16 != 0:
                 ilp_rows = 2
+        if use_smem_v is None:
+            use_smem_v = sel_use_smem_v
 
     if ilp_rows not in (2, 4):
         raise NotImplementedError(
@@ -1015,6 +1236,35 @@ def kda_decode_mtp_ws(
     # break the in-place contract anyway.
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
 
+    # Stage D: resolve the intermediate-state snapshot cache. A buffer turns
+    # snapshots on (constexpr); flatten [N, T, HV, V, K] -> [N*T*HV, V, K] so the
+    # kernel's flat_idx = i_n*T*HV + i_t*HV + i_hv (indexed by SEQUENCE i_n, NOT
+    # the pool slot cache_idx used for the state writeback) lands in the caller's
+    # tensor. .view() shares storage + raises loudly on a non-contiguous buffer,
+    # keeping the in-place fill contract (cf. h0_source_flat above). Unlike
+    # FlashInfer (which .to(fp32).reshape().contiguous() — silently dropping the
+    # snapshots if the buffer was not already contiguous fp32) we require fp32 +
+    # contiguous up front so the fill is always visible. None -> 1-elem dummy and
+    # the snapshot stores compile out (cache_intermediate_states=False).
+    cache_intermediate_states = intermediate_states_buffer is not None
+    if cache_intermediate_states:
+        if intermediate_states_buffer.dtype != torch.float32:
+            raise ValueError(
+                "intermediate_states_buffer must be float32, got "
+                f"{intermediate_states_buffer.dtype}"
+            )
+        expected_buf_shape = (N, T, HV, V, K)
+        if tuple(intermediate_states_buffer.shape) != expected_buf_shape:
+            raise ValueError(
+                f"intermediate_states_buffer shape {tuple(intermediate_states_buffer.shape)} "
+                f"!= expected {expected_buf_shape} ([N, T, HV, V, K] vk / K-last)"
+            )
+        intermediate_states_flat = intermediate_states_buffer.view(N * T * HV, V, K)
+    else:
+        intermediate_states_flat = torch.zeros(
+            1, 1, 1, dtype=torch.float32, device=q.device
+        )
+
     stream = _get_cached_stream(q.device)
     compiled_kernel = _get_compiled_mtp_ws_kernel(
         N,
@@ -1032,10 +1282,13 @@ def kda_decode_mtp_ws(
         tile_v=tile_v,
         ilp_rows=ilp_rows,
         use_packed_fma=use_packed_fma,
+        use_smem_v=use_smem_v,
+        cache_intermediate_states=cache_intermediate_states,
     )
 
     compiled_kernel(
         h0_source_flat,
+        intermediate_states_flat,
         A_log,
         a,
         dt_bias,

@@ -33,6 +33,7 @@ Once the fused MTP kernel lands (P1), it will be validated against
 fully on SM90 / H200.
 """
 
+import os
 import pathlib
 import sys
 
@@ -487,7 +488,8 @@ def test_kda_mtp_zero_state(T):
 # (different accumulation order), so we gate on the oracle, not on Route 2.
 # ===========================================================================
 def run_kda_decode_mtp_ws_dense(
-    q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2, use_packed_fma=None
+    q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2,
+    use_packed_fma=None, use_smem_v=None,
 ):
     """Run the warp-specialized fused MTP kernel (kda_decode_mtp_ws), dense vk."""
     N = q.shape[0]
@@ -509,6 +511,7 @@ def run_kda_decode_mtp_ws_dense(
         tile_v=tile_v,
         ilp_rows=ilp_rows,
         use_packed_fma=use_packed_fma,
+        use_smem_v=use_smem_v,
     )
     return o, state_source  # (N, T, HV, V), (N, HV, V, K)
 
@@ -833,6 +836,325 @@ def test_kda_decode_mtp_ws_auto_config(N, H, HV, T, expected_ilp):
     tag = f"ws auto (wu={N * HV}, T={T}, ilp={sel_ilp})"
     _assert_close(f"{tag} output", o_loop.float(), o_kernel.float())
     _assert_close(f"{tag} final state", state_loop, state_source)
+
+
+# ===========================================================================
+# Stage 3-C: use_smem_v + sOutput merged writeback. Preloading v into SMEM and
+# accumulating outputs in SMEM (flushed coalesced at kernel end) is a pure
+# data-movement change: the v value read (Float32 of the same bf16) and the
+# output written (BFloat16 of the same sum) are byte-identical to the GMEM path,
+# so use_smem_v=True must match use_smem_v=False BIT-FOR-BIT — the strongest
+# correctness check, and (since sOutput is a new cross-warp SMEM write) a race
+# check too. We also gate against the fp32 oracle and the looped kernel.
+# ===========================================================================
+@pytest.mark.parametrize("use_smem_v", [False, True])
+@pytest.mark.parametrize(
+    "tile_v,ilp_rows",
+    [(8, 2), (16, 2), (32, 2), (64, 2), (16, 4), (32, 4), (64, 4)],
+)
+def test_kda_decode_mtp_ws_smem_v_dense(use_smem_v, tile_v, ilp_rows):
+    """use_smem_v on/off is correct vs the fp32 oracle across tile_v (incl 64) and
+    both ilp paths. use_packed_fma=False so the fusion math is checked portably."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=use_smem_v,
+    )
+
+    tag = f"ws smem_v={use_smem_v} tile_v={tile_v} ilp={ilp_rows}"
+    _assert_close(f"{tag} output", o_ref, o_kernel.float())
+    _assert_close(f"{tag} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize(
+    "tile_v,ilp_rows",
+    [(8, 2), (16, 2), (32, 2), (64, 2), (16, 4), (32, 4), (64, 4)],
+)
+def test_kda_decode_mtp_ws_smem_v_bit_identical_to_gmem(tile_v, ilp_rows):
+    """use_smem_v only relocates v reads (SMEM vs GMEM) and o writes (SMEM-then-
+    flush vs direct); the arithmetic is untouched, so the output AND the state
+    pool must be byte-for-byte identical to the use_smem_v=False path. A mismatch
+    means either a relocation bug or a cross-warp sOutput race."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_gmem, state_gmem = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=False,
+    )
+    o_smem, state_smem = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=True,
+    )
+
+    assert torch.equal(o_smem, o_gmem), (
+        f"use_smem_v output diverged from GMEM path (tile_v={tile_v}, ilp={ilp_rows}): "
+        f"max|diff|={(o_smem.float() - o_gmem.float()).abs().max().item()}"
+    )
+    assert torch.equal(state_smem, state_gmem), (
+        f"use_smem_v state diverged from GMEM path (tile_v={tile_v}, ilp={ilp_rows})"
+    )
+
+
+@pytest.mark.parametrize("N", [1024, 2048])
+def test_kda_decode_mtp_ws_smem_v_large_n(N):
+    """Large batch is where use_smem_v earns its keep (the heuristic turns it on at
+    tile_v=64). Validate the explicit use_smem_v=True path vs the looped single-
+    token kernel (GPU-only, fast), ilp=4 (heuristic tile_v=64)."""
+    T, H, HV, K, V = 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=64, ilp_rows=4, use_packed_fma=False, use_smem_v=True,
+    )
+
+    _assert_close(f"ws smem_v large N={N} output", o_loop.float(), o_kernel.float())
+    _assert_close(f"ws smem_v large N={N} final state", state_loop, state_kernel)
+
+
+def test_kda_decode_mtp_ws_smem_v_auto_heuristic_large_n():
+    """Production default (no use_smem_v arg) auto-enables use_smem_v at the large-
+    batch (tile_v=64) bucket; the auto path stays numerically correct vs the loop.
+    work_units = N*HV = 256*16 = 4096 > 1024 -> (tile_v, ilp, smem_v)=(64,4,True)."""
+    N, T, H, HV, K, V = 256, 2, 8, 16, 128, 128
+    scale = K**-0.5
+    assert _select_mtp_config(N, HV, V, T) == (64, 4, True)
+
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    # No tile_v / ilp_rows / use_smem_v -> all three from _select_mtp_config.
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o_kernel = kda_decode_mtp_ws(
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+    )
+    _assert_close("ws auto smem_v output", o_loop.float(), o_kernel.float())
+    _assert_close("ws auto smem_v final state", state_loop, state_source)
+
+
+@pytest.mark.parametrize("ilp_rows", [2, 4])
+def test_kda_decode_mtp_ws_smem_v_determinism(ilp_rows):
+    """sOutput is a new cross-warp SMEM write; the merged flush reads it after a
+    barrier. Repeat the use_smem_v=True launch many times from the same inputs and
+    assert bit-identical output + state every iteration (surfaces any sOutput race
+    or flush ordering bug). The B200 gate runs the heavier 10K count."""
+    N, T, H, HV, K, V = 16, 4, 8, 16, 128, 128
+    tile_v = 64
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+
+    def launch():
+        st = state.clone().contiguous()
+        o = kda_decode_mtp_ws(
+            A_log=A_log, dt_bias=dt_bias,
+            q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+            a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+            initial_state_source=st, initial_state_indices=indices,
+            scale=scale, use_qk_l2norm_in_kernel=True,
+            tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=True,
+        )
+        return o.clone(), st
+
+    o_ref, st_ref = launch()
+    n_iters = int(os.environ.get("KDA_MTP_DET_ITERS", "100"))  # B200 10K gate: KDA_MTP_DET_ITERS=10000
+    for i in range(n_iters):
+        o_i, st_i = launch()
+        assert torch.equal(o_i, o_ref), f"smem_v output non-deterministic at iter {i} (ilp={ilp_rows})"
+        assert torch.equal(st_i, st_ref), f"smem_v state non-deterministic at iter {i} (ilp={ilp_rows})"
+
+
+# ===========================================================================
+# Stage 3-D: intermediate-state snapshots (speculative-decoding support). When an
+# intermediate_states_buffer [N, T, HV, V, K] is passed, the kernel snapshots the
+# post-token state after EVERY token (sequence-indexed: buffer[i_n, i_t, i_hv]).
+# Produce-only — cuLA fills the buffer, never rolls back. Checks: (1) each token's
+# snapshot matches the fp32 oracle state after that token; (2) the t=T-1 snapshot
+# equals the final state pool BIT-FOR-BIT (same r_h written by both); (3) the new
+# per-token GMEM snapshot stores are deterministic (race check).
+# ===========================================================================
+def oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state, scale):
+    """fp32 ground-truth per-token state: stack state_cur after each token via the
+    trusted single-token reference. Returns [N, T, HV, V, K]."""
+    N, T = q.shape[0], q.shape[1]
+    HV, V, K = v.shape[2], v.shape[3], q.shape[3]
+    state_cur = state.clone()
+    inter = torch.zeros(N, T, HV, V, K, dtype=torch.float32, device=q.device)
+    for t in range(T):
+        _, state_cur = torch_kda_decode_ref(
+            q[:, t].float(), k[:, t].float(), v[:, t].float(),
+            a[:, t], b[:, t].float(), A_log, dt_bias, state_cur, scale,
+        )
+        inter[:, t] = state_cur
+    return inter
+
+
+def run_kda_decode_mtp_ws_with_intermediate(
+    q, k, v, a, b, A_log, dt_bias, state, scale,
+    tile_v=None, ilp_rows=2, use_packed_fma=False, use_smem_v=None,
+):
+    """Run the ws kernel with an intermediate-state buffer; return o, final state
+    pool, and the filled buffer [N, T, HV, V, K]."""
+    N, T = q.shape[0], q.shape[1]
+    HV, V, K = v.shape[2], v.shape[3], q.shape[3]
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32)
+
+    o = kda_decode_mtp_ws(
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=use_packed_fma,
+        use_smem_v=use_smem_v, intermediate_states_buffer=inter,
+    )
+    return o, state_source, inter
+
+
+@pytest.mark.parametrize("use_smem_v", [False, True])
+@pytest.mark.parametrize("tile_v,ilp_rows", [(16, 2), (32, 4), (64, 4)])
+def test_kda_decode_mtp_ws_intermediate_vs_oracle(use_smem_v, tile_v, ilp_rows):
+    """Every per-token snapshot matches the fp32 oracle state after that token.
+    Swept over both ilp paths and use_smem_v (orthogonal constexpr) to confirm the
+    snapshot is correct regardless of the v/output path."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    inter_ref = oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state.clone(), scale)
+    o_kernel, _state, inter_kernel = run_kda_decode_mtp_ws_with_intermediate(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=use_smem_v,
+    )
+
+    tag = f"ws inter smem_v={use_smem_v} tile_v={tile_v} ilp={ilp_rows}"
+    # Each token's snapshot must equal the oracle state after consuming that token.
+    for t in range(T):
+        _assert_close(f"{tag} snapshot[t={t}]", inter_ref[:, t], inter_kernel[:, t])
+
+
+@pytest.mark.parametrize("tile_v,ilp_rows", [(16, 2), (32, 4), (64, 4)])
+def test_kda_decode_mtp_ws_intermediate_last_eq_final_state(tile_v, ilp_rows):
+    """The t=T-1 snapshot is the same r_h the kernel writes back as the final state
+    (step 5 only reads r_h), so with indices=arange(N) (cache_idx==i_n) the last
+    snapshot equals the final state pool BIT-FOR-BIT. A mismatch means the snapshot
+    fired at the wrong point or used the wrong index."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_kernel, state_final, inter_kernel = run_kda_decode_mtp_ws_with_intermediate(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
+    )
+
+    # state_final: (N, HV, V, K); inter_kernel[:, T-1]: (N, HV, V, K). Same r_h.
+    assert torch.equal(inter_kernel[:, T - 1], state_final), (
+        f"t=T-1 snapshot != final state pool (tile_v={tile_v}, ilp={ilp_rows}): "
+        f"max|diff|={(inter_kernel[:, T - 1] - state_final).abs().max().item()}"
+    )
+
+
+def test_kda_decode_mtp_ws_intermediate_disable_state_update_last_eq_oracle():
+    """With disable_state_update=True the pool is untouched, but snapshots still fire
+    every token; the t=T-1 snapshot must match the oracle final state (the cache is
+    the only place the post-token state is exposed)."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    inter_ref = oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state.clone(), scale)
+
+    state_source = state.clone().contiguous()
+    state_before = state_source.clone()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32)
+    o = kda_decode_mtp_ws(
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+        tile_v=32, ilp_rows=4, use_packed_fma=False,
+        disable_state_update=True, intermediate_states_buffer=inter,
+    )
+
+    assert torch.equal(state_source, state_before), "pool modified despite disable_state_update=True"
+    for t in range(T):
+        _assert_close(f"inter+dsu snapshot[t={t}]", inter_ref[:, t], inter[:, t])
+
+
+def test_kda_decode_mtp_ws_intermediate_buffer_validation():
+    """Bad intermediate_states_buffer shape / dtype must raise (not silently
+    mis-index or drop snapshots)."""
+    N, T, H, HV, K, V = 4, 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+
+    def _call(buf):
+        return kda_decode_mtp_ws(
+            A_log=A_log, dt_bias=dt_bias,
+            q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+            a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+            initial_state_source=state_source, initial_state_indices=indices,
+            scale=scale, use_qk_l2norm_in_kernel=True, tile_v=32, ilp_rows=4,
+            use_packed_fma=False, intermediate_states_buffer=buf,
+        )
+
+    # Wrong shape (T mismatch).
+    with pytest.raises((ValueError, AssertionError)):
+        _call(torch.zeros(N, T + 1, HV, V, K, device="cuda", dtype=torch.float32))
+    # Wrong dtype.
+    with pytest.raises((ValueError, AssertionError)):
+        _call(torch.zeros(N, T, HV, V, K, device="cuda", dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize("ilp_rows", [2, 4])
+def test_kda_decode_mtp_ws_intermediate_determinism(ilp_rows):
+    """The per-token snapshot is a new GMEM write; repeat from identical inputs and
+    assert the full buffer (+ output + final state) is bit-identical every time."""
+    N, T, H, HV, K, V = 8, 4, 8, 16, 128, 128
+    tile_v = 32
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    def launch():
+        return run_kda_decode_mtp_ws_with_intermediate(
+            q, k, v, a, b, A_log, dt_bias, state, scale,
+            tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
+        )
+
+    o_ref, st_ref, inter_ref = launch()
+    o_ref, st_ref, inter_ref = o_ref.clone(), st_ref.clone(), inter_ref.clone()
+    n_iters = int(os.environ.get("KDA_MTP_DET_ITERS", "100"))  # B200 10K gate: KDA_MTP_DET_ITERS=10000
+    for i in range(n_iters):
+        o_i, st_i, inter_i = launch()
+        assert torch.equal(inter_i, inter_ref), f"snapshot non-deterministic at iter {i} (ilp={ilp_rows})"
+        assert torch.equal(o_i, o_ref), f"output non-deterministic at iter {i} (ilp={ilp_rows})"
+        assert torch.equal(st_i, st_ref), f"final state non-deterministic at iter {i} (ilp={ilp_rows})"
 
 
 if __name__ == "__main__":
