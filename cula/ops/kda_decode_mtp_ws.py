@@ -28,10 +28,12 @@ Route 1 is a faithful port; cuLA's gk-premultiply lives in the Route-2 kernel
 (``kda_decode_mtp.py``). The two will produce slightly different bf16 rounding;
 both are validated against the fp32 torch oracle at atol 3e-2 / rtol 2e-2.
 
-Stage 1 scope (this file):
+Scope (this file):
 - Warp-specialized variant only (no inline variant — Route 1 drops it).
-- ``ilp_rows == 2`` path only (the clearest; covers every tile_v in {8,16,32,64}
-  since rows_per_group = tile_v/4 is always even). ilp 4/8 + packed-FMA come next.
+- ``ilp_rows in {2, 4}``. ilp=2 (Stage 1) covers every tile_v in {8,16,32,64};
+  ilp=4 (Stage 2) fuses steps 1+2 and 4+5, uses double accumulators + packed
+  F32x2 FMA on SM100 (scalar ``fma_pair`` fallback elsewhere), and requires
+  ``tile_v % 16 == 0`` (so {16,32,64}). ilp=8 + use_smem_v come next.
 - ``vk`` state layout only (FlashInfer is vk-only; kv is a later add-back).
 - No ``use_smem_v`` / ``sOutput`` merge, no intermediate-state snapshots.
 - ``disable_state_update`` supported (cheap; default False = always write back).
@@ -74,8 +76,23 @@ logger = logging.getLogger(__name__)
 VEC_SIZE_MTP = 4
 
 # Warp-spec MTP kernels are compiled once per shape/config (including T, tile_v,
-# ilp_rows) and cached.
+# ilp_rows, use_packed_fma) and cached.
 _compiled_mtp_ws_kernels: dict[tuple, object] = {}
+
+
+@cute.jit
+def fma_pair(a1, a2, b1, b2, c1, c2):
+    """FMA two pairs: (a1*b1+c1, a2*b2+c2). SM90-compatible scalar fallback.
+
+    ``cute.arch.fma_packed_f32x2`` emits an F32x2 instruction that only exists on
+    SM100+ (Blackwell). The ilp=4 path pairs two FMAs per loop step to expose ILP;
+    when ``use_packed_fma`` is False (SM90, or forced off) we issue the two scalar
+    FMAs explicitly so the compiler still schedules them independently. Ported
+    verbatim from FlashInfer ``gdn_decode_mtp.py:fma_pair``.
+    """
+    result1 = a1 * b1 + c1
+    result2 = a2 * b2 + c2
+    return result1, result2
 
 
 @cute.kernel
@@ -104,6 +121,7 @@ def kda_verify_kernel_mtp_ws(
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
+    use_packed_fma: cutlass.Constexpr[bool],
 ):
     """Warp-specialized KDA MTP kernel. One CTA owns one (i_n, i_hv, i_v) tile.
 
@@ -252,7 +270,35 @@ def kda_verify_kernel_mtp_ws(
             # Warps 1-3: prefetch the first ILP set of state rows into registers,
             # overlapping the h-state DRAM latency with warp 0's Phase 1 compute.
             v_base_prefetch = i_v * tile_v + group_idx * rows_per_group
-            if cutlass.const_expr(ilp_rows == 2):
+            if cutlass.const_expr(ilp_rows == 4):
+                # Prefetch 4 h-state rows (4 independent load streams).
+                v_pf_d = v_base_prefetch + 3
+                if v_pf_d < V:
+                    pf_a = cute.local_tile(
+                        h0_source,
+                        (1, 1, vec_size),
+                        (flat_state_idx, v_base_prefetch, lane_in_group),
+                    )
+                    pf_b = cute.local_tile(
+                        h0_source,
+                        (1, 1, vec_size),
+                        (flat_state_idx, v_base_prefetch + 1, lane_in_group),
+                    )
+                    pf_c = cute.local_tile(
+                        h0_source,
+                        (1, 1, vec_size),
+                        (flat_state_idx, v_base_prefetch + 2, lane_in_group),
+                    )
+                    pf_d = cute.local_tile(
+                        h0_source,
+                        (1, 1, vec_size),
+                        (flat_state_idx, v_base_prefetch + 3, lane_in_group),
+                    )
+                    cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
+                    cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
+                    cute.autovec_copy(pf_c, cute.slice_(r_h, (2, None)))
+                    cute.autovec_copy(pf_d, cute.slice_(r_h, (3, None)))
+            elif cutlass.const_expr(ilp_rows == 2):
                 v_pf_b = v_base_prefetch + 1
                 if v_pf_b < V:
                     pf_a = cute.local_tile(
@@ -370,6 +416,279 @@ def kda_verify_kernel_mtp_ws(
                         )
                         cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
 
+        # ============ Recurrence: ilp_rows == 4 (process 4 V-rows together) ===
+        # Mirrors FlashInfer's ilp_rows==4 path: steps 1+2 fused (decay then h@k)
+        # and steps 4+5 fused (rank-1 update then h@q), DOUBLE accumulators to halve
+        # the K-reduce FFMA dependency chain, and packed F32x2 FMA on SM100. KDA
+        # change vs GDN: per-channel decay r_g[i]/r_g[i+1] (a vec_size register
+        # loaded from sG, not a scalar). The h@k / h@q FMAs are byte-identical to
+        # GDN. use_smem_v / sOutput / intermediate-state snapshots are later stages
+        # and intentionally omitted (GMEM v read + direct o write only).
+        elif cutlass.const_expr(ilp_rows == 4):
+            quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
+
+            for row_quad in cutlass.range_constexpr(quarter_rows):
+                v_idx_a = i_v * tile_v + group_idx * rows_per_group + row_quad * 4
+                v_idx_b = v_idx_a + 1
+                v_idx_c = v_idx_a + 2
+                v_idx_d = v_idx_a + 3
+
+                if v_idx_d < V:
+                    # Load state for 4 rows. Warps 1-3 reuse the Phase-1 prefetch on
+                    # the first quad; everyone else loads in place.
+                    if warp_idx == 0 or row_quad > 0:
+                        h_tile_a = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_a, lane_in_group),
+                        )
+                        h_tile_b = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_b, lane_in_group),
+                        )
+                        h_tile_c = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_c, lane_in_group),
+                        )
+                        h_tile_d = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_d, lane_in_group),
+                        )
+                        cute.autovec_copy(h_tile_a, cute.slice_(r_h, (0, None)))
+                        cute.autovec_copy(h_tile_b, cute.slice_(r_h, (1, None)))
+                        cute.autovec_copy(h_tile_c, cute.slice_(r_h, (2, None)))
+                        cute.autovec_copy(h_tile_d, cute.slice_(r_h, (3, None)))
+
+                    for i_t in cutlass.range_constexpr(T):
+                        # Warp-0-staged q/k/g for this token (shared by all 4 rows).
+                        sQ_tile = cute.local_tile(sQ, (1, vec_size), (i_t, lane_in_group))
+                        sK_tile = cute.local_tile(sK, (1, vec_size), (i_t, lane_in_group))
+                        sG_tile = cute.local_tile(sG, (1, vec_size), (i_t, lane_in_group))
+                        cute.autovec_copy(sQ_tile, r_q)
+                        cute.autovec_copy(sK_tile, r_k)
+                        cute.autovec_copy(sG_tile, r_g)
+                        r_beta = sBeta[i_t]
+
+                        # Steps 1+2 FUSED: per-channel decay (step 1) then h@k (step
+                        # 2). Two accumulators (a/a2) split even/odd K channels so the
+                        # FFMA chain is half-length; combined after the strided loop.
+                        sum_hk_a = cutlass.Float32(0.0)
+                        sum_hk_a2 = cutlass.Float32(0.0)
+                        sum_hk_b = cutlass.Float32(0.0)
+                        sum_hk_b2 = cutlass.Float32(0.0)
+                        sum_hk_c = cutlass.Float32(0.0)
+                        sum_hk_c2 = cutlass.Float32(0.0)
+                        sum_hk_d = cutlass.Float32(0.0)
+                        sum_hk_d2 = cutlass.Float32(0.0)
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            # Step 1: per-channel decay (KDA: r_g[i]/r_g[i+1]).
+                            r_h[0, i] = r_h[0, i] * r_g[i]
+                            r_h[0, i + 1] = r_h[0, i + 1] * r_g[i + 1]
+                            r_h[1, i] = r_h[1, i] * r_g[i]
+                            r_h[1, i + 1] = r_h[1, i + 1] * r_g[i + 1]
+                            r_h[2, i] = r_h[2, i] * r_g[i]
+                            r_h[2, i + 1] = r_h[2, i + 1] * r_g[i + 1]
+                            r_h[3, i] = r_h[3, i] * r_g[i]
+                            r_h[3, i + 1] = r_h[3, i + 1] * r_g[i + 1]
+                            # Step 2: h@k, two channels per step (packed on SM100).
+                            if cutlass.const_expr(use_packed_fma):
+                                sum_hk_a, sum_hk_a2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[0, i], r_h[0, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_a, sum_hk_a2),
+                                )
+                                sum_hk_b, sum_hk_b2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[1, i], r_h[1, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_b, sum_hk_b2),
+                                )
+                                sum_hk_c, sum_hk_c2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[2, i], r_h[2, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_c, sum_hk_c2),
+                                )
+                                sum_hk_d, sum_hk_d2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[3, i], r_h[3, i + 1]),
+                                    src_b=(r_k[i], r_k[i + 1]),
+                                    src_c=(sum_hk_d, sum_hk_d2),
+                                )
+                            else:
+                                sum_hk_a, sum_hk_a2 = fma_pair(
+                                    r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1], sum_hk_a, sum_hk_a2
+                                )
+                                sum_hk_b, sum_hk_b2 = fma_pair(
+                                    r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1], sum_hk_b, sum_hk_b2
+                                )
+                                sum_hk_c, sum_hk_c2 = fma_pair(
+                                    r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1], sum_hk_c, sum_hk_c2
+                                )
+                                sum_hk_d, sum_hk_d2 = fma_pair(
+                                    r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1], sum_hk_d, sum_hk_d2
+                                )
+                        sum_hk_a = sum_hk_a + sum_hk_a2
+                        sum_hk_b = sum_hk_b + sum_hk_b2
+                        sum_hk_c = sum_hk_c + sum_hk_c2
+                        sum_hk_d = sum_hk_d + sum_hk_d2
+
+                        # Full-warp reduction for all 4 h@k dot products.
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hk_a += cute.arch.shuffle_sync_bfly(
+                                sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hk_b += cute.arch.shuffle_sync_bfly(
+                                sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hk_c += cute.arch.shuffle_sync_bfly(
+                                sum_hk_c, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hk_d += cute.arch.shuffle_sync_bfly(
+                                sum_hk_d, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+
+                        # Step 3: delta rule for all 4 rows (GMEM v read).
+                        r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
+                        r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
+                        r_v_c = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_c])
+                        r_v_d = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_d])
+                        v_new_a = (r_v_a - sum_hk_a) * r_beta
+                        v_new_b = (r_v_b - sum_hk_b) * r_beta
+                        v_new_c = (r_v_c - sum_hk_c) * r_beta
+                        v_new_d = (r_v_d - sum_hk_d) * r_beta
+
+                        # Steps 4+5 FUSED: rank-1 update with raw k (step 4) then
+                        # h@q (step 5), per row. Double accumulators again.
+                        sum_hq_a = cutlass.Float32(0.0)
+                        sum_hq_a2 = cutlass.Float32(0.0)
+                        sum_hq_b = cutlass.Float32(0.0)
+                        sum_hq_b2 = cutlass.Float32(0.0)
+                        sum_hq_c = cutlass.Float32(0.0)
+                        sum_hq_c2 = cutlass.Float32(0.0)
+                        sum_hq_d = cutlass.Float32(0.0)
+                        sum_hq_d2 = cutlass.Float32(0.0)
+                        for i in cutlass.range_constexpr(0, vec_size, 2):
+                            if cutlass.const_expr(use_packed_fma):
+                                r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_a, v_new_a),
+                                    src_c=(r_h[0, i], r_h[0, i + 1]),
+                                )
+                                r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_b, v_new_b),
+                                    src_c=(r_h[1, i], r_h[1, i + 1]),
+                                )
+                                r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_c, v_new_c),
+                                    src_c=(r_h[2, i], r_h[2, i + 1]),
+                                )
+                                r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_k[i], r_k[i + 1]),
+                                    src_b=(v_new_d, v_new_d),
+                                    src_c=(r_h[3, i], r_h[3, i + 1]),
+                                )
+                                sum_hq_a, sum_hq_a2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[0, i], r_h[0, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_a, sum_hq_a2),
+                                )
+                                sum_hq_b, sum_hq_b2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[1, i], r_h[1, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_b, sum_hq_b2),
+                                )
+                                sum_hq_c, sum_hq_c2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[2, i], r_h[2, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_c, sum_hq_c2),
+                                )
+                                sum_hq_d, sum_hq_d2 = cute.arch.fma_packed_f32x2(
+                                    src_a=(r_h[3, i], r_h[3, i + 1]),
+                                    src_b=(r_q[i], r_q[i + 1]),
+                                    src_c=(sum_hq_d, sum_hq_d2),
+                                )
+                            else:
+                                r_h[0, i], r_h[0, i + 1] = fma_pair(
+                                    r_k[i], r_k[i + 1], v_new_a, v_new_a, r_h[0, i], r_h[0, i + 1]
+                                )
+                                r_h[1, i], r_h[1, i + 1] = fma_pair(
+                                    r_k[i], r_k[i + 1], v_new_b, v_new_b, r_h[1, i], r_h[1, i + 1]
+                                )
+                                r_h[2, i], r_h[2, i + 1] = fma_pair(
+                                    r_k[i], r_k[i + 1], v_new_c, v_new_c, r_h[2, i], r_h[2, i + 1]
+                                )
+                                r_h[3, i], r_h[3, i + 1] = fma_pair(
+                                    r_k[i], r_k[i + 1], v_new_d, v_new_d, r_h[3, i], r_h[3, i + 1]
+                                )
+                                sum_hq_a, sum_hq_a2 = fma_pair(
+                                    r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], sum_hq_a, sum_hq_a2
+                                )
+                                sum_hq_b, sum_hq_b2 = fma_pair(
+                                    r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], sum_hq_b, sum_hq_b2
+                                )
+                                sum_hq_c, sum_hq_c2 = fma_pair(
+                                    r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], sum_hq_c, sum_hq_c2
+                                )
+                                sum_hq_d, sum_hq_d2 = fma_pair(
+                                    r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], sum_hq_d, sum_hq_d2
+                                )
+                        sum_hq_a = sum_hq_a + sum_hq_a2
+                        sum_hq_b = sum_hq_b + sum_hq_b2
+                        sum_hq_c = sum_hq_c + sum_hq_c2
+                        sum_hq_d = sum_hq_d + sum_hq_d2
+
+                        # Full-warp reduction for all 4 h@q dot products.
+                        for offset in [16, 8, 4, 2, 1]:
+                            sum_hq_a += cute.arch.shuffle_sync_bfly(
+                                sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hq_b += cute.arch.shuffle_sync_bfly(
+                                sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hq_c += cute.arch.shuffle_sync_bfly(
+                                sum_hq_c, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+                            sum_hq_d += cute.arch.shuffle_sync_bfly(
+                                sum_hq_d, offset=offset, mask=-1, mask_and_clamp=31
+                            )
+
+                        # Reduction result is identical on all lanes -> lane 0 writes.
+                        if lane_in_group == 0:
+                            o[(i_n, i_t, i_hv, v_idx_a)] = cutlass.BFloat16(sum_hq_a)
+                            o[(i_n, i_t, i_hv, v_idx_b)] = cutlass.BFloat16(sum_hq_b)
+                            o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(sum_hq_c)
+                            o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(sum_hq_d)
+
+                    # Write final state for all 4 rows back to the pool (once).
+                    if cutlass.const_expr(not disable_state_update):
+                        h_tile_out_a = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_a, lane_in_group),
+                        )
+                        cute.autovec_copy(cute.slice_(r_h, (0, None)), h_tile_out_a)
+                        h_tile_out_b = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_b, lane_in_group),
+                        )
+                        cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
+                        h_tile_out_c = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_c, lane_in_group),
+                        )
+                        cute.autovec_copy(cute.slice_(r_h, (2, None)), h_tile_out_c)
+                        h_tile_out_d = cute.local_tile(
+                            h0_source,
+                            (1, 1, vec_size),
+                            (flat_state_idx, v_idx_d, lane_in_group),
+                        )
+                        cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
+
 
 @cute.jit
 def run_kda_verify_kernel_mtp_ws(
@@ -396,6 +715,7 @@ def run_kda_verify_kernel_mtp_ws(
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
+    use_packed_fma: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Host-side launcher: grid = N * HV * num_v_tiles, block = 128 (4 warps)."""
@@ -440,6 +760,7 @@ def run_kda_verify_kernel_mtp_ws(
         use_qk_l2norm,
         disable_state_update,
         ilp_rows,
+        use_packed_fma,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -463,6 +784,7 @@ def _get_compiled_mtp_ws_kernel(
     softplus_threshold,
     tile_v,
     ilp_rows,
+    use_packed_fma,
 ):
     """Get or lazily compile the warp-spec MTP kernel for one shape/config."""
     key = (
@@ -480,6 +802,7 @@ def _get_compiled_mtp_ws_kernel(
         softplus_threshold,
         tile_v,
         ilp_rows,
+        use_packed_fma,
     )
     if key in _compiled_mtp_ws_kernels:
         return _compiled_mtp_ws_kernels[key]
@@ -534,6 +857,7 @@ def _get_compiled_mtp_ws_kernel(
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=disable_state_update,
         ilp_rows=ilp_rows,
+        use_packed_fma=use_packed_fma,
         stream=stream,
         options="--enable-tvm-ffi --opt-level 1",
     )
@@ -542,7 +866,7 @@ def _get_compiled_mtp_ws_kernel(
     logger.info(
         "CuTe DSL KDA MTP warp-spec kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, "
-        f"tile_v={tile_v}, ilp_rows={ilp_rows}"
+        f"tile_v={tile_v}, ilp_rows={ilp_rows}, use_packed_fma={use_packed_fma}"
     )
     return compiled_kernel
 
@@ -566,6 +890,7 @@ def kda_decode_mtp_ws(
     tile_v: int | None = None,
     ilp_rows: int = 2,
     disable_state_update: bool = False,
+    use_packed_fma: bool | None = None,
 ) -> torch.Tensor:
     """KDA MTP decode — warp-specialized variant (Route 1).
 
@@ -578,7 +903,12 @@ def kda_decode_mtp_ws(
         q/k: (N, T, H, K)   v: (N, T, HV, V)
         a:   (N, T, HV, K)  b: (N, T, HV)   out: (N, T, HV, V)
 
-    Stage 1 constraints: ``state_layout='vk'`` only, ``ilp_rows == 2`` only.
+    ``ilp_rows`` selects how many V-rows a warp processes together: 2 (any valid
+    ``tile_v``) or 4 (requires ``tile_v % 16 == 0``; steps 1+2 and 4+5 are fused
+    with double accumulators + packed F32x2 FMA on SM100). ``use_packed_fma=None``
+    auto-detects SM100+ (Blackwell); pass False to force the scalar fallback.
+
+    Constraints: ``state_layout='vk'`` only; ``ilp_rows in {2, 4}``.
     """
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -591,15 +921,24 @@ def kda_decode_mtp_ws(
 
     assert K == TILE_K, f"KDA MTP (ws) kernel requires K={TILE_K}, got {K}"
 
-    if ilp_rows != 2:
+    if ilp_rows not in (2, 4):
         raise NotImplementedError(
-            f"kda_decode_mtp_ws Stage 1 only implements ilp_rows=2, got {ilp_rows}"
+            f"kda_decode_mtp_ws implements ilp_rows in {{2, 4}}, got {ilp_rows}"
         )
+
+    # packed F32x2 FMA exists only on SM100+ (Blackwell); fall back to scalar
+    # fma_pair elsewhere. None = auto-detect, matching FlashInfer's run_mtp_decode.
+    if use_packed_fma is None:
+        major, _ = torch.cuda.get_device_capability(q.device)
+        use_packed_fma = major >= 10
+    # The packed path only exists in the ilp=4 kernel branch; ilp=2 is scalar.
+    if ilp_rows != 4:
+        use_packed_fma = False
 
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":
         raise NotImplementedError(
-            "kda_decode_mtp_ws Stage 1 only supports state_layout='vk' "
+            "kda_decode_mtp_ws only supports state_layout='vk' "
             f"(FlashInfer is vk-only); got {state_layout!r}"
         )
 
@@ -607,9 +946,14 @@ def kda_decode_mtp_ws(
         tile_v = _select_mtp_tile_v(N, HV, V, T)
     assert tile_v % 4 == 0, f"KDA MTP (ws) requires tile_v % 4 == 0, got tile_v={tile_v}"
     assert V % tile_v == 0, f"KDA MTP (ws) requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
-    # ilp_rows=2 needs rows_per_group = tile_v/4 even so each warp's rows pair up.
-    assert (tile_v // 4) % 2 == 0, (
-        f"ilp_rows=2 requires (tile_v//4) even, got tile_v={tile_v}"
+    # Each warp owns rows_per_group = tile_v/4 V-rows and steps through ilp_rows of
+    # them per iteration, so rows_per_group must be a multiple of ilp_rows — else
+    # the row_pair/row_quad loop count truncates and trailing rows are silently
+    # skipped. ilp=2 -> tile_v % 8 == 0; ilp=4 -> tile_v % 16 == 0.
+    rows_per_group = tile_v // 4
+    assert rows_per_group % ilp_rows == 0, (
+        f"ilp_rows={ilp_rows} requires (tile_v//4) divisible by {ilp_rows}, "
+        f"got tile_v={tile_v} (tile_v//4={rows_per_group})"
     )
 
     # State is token-independent: reuse the single-token normalizer/validator.
@@ -665,6 +1009,7 @@ def kda_decode_mtp_ws(
         softplus_threshold=softplus_threshold,
         tile_v=tile_v,
         ilp_rows=ilp_rows,
+        use_packed_fma=use_packed_fma,
     )
 
     compiled_kernel(

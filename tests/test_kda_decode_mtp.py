@@ -485,7 +485,9 @@ def test_kda_mtp_zero_state(T):
 # Stage 1: vk-only, ilp_rows=2. bf16 rounding differs from the Route-2 kernel
 # (different accumulation order), so we gate on the oracle, not on Route 2.
 # ===========================================================================
-def run_kda_decode_mtp_ws_dense(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None):
+def run_kda_decode_mtp_ws_dense(
+    q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2, use_packed_fma=None
+):
     """Run the warp-specialized fused MTP kernel (kda_decode_mtp_ws), dense vk."""
     N = q.shape[0]
     state_source = state.clone().contiguous()  # (N, HV, V, K), updated in-place
@@ -504,6 +506,8 @@ def run_kda_decode_mtp_ws_dense(q, k, v, a, b, A_log, dt_bias, state, scale, til
         scale=scale,
         use_qk_l2norm_in_kernel=True,
         tile_v=tile_v,
+        ilp_rows=ilp_rows,
+        use_packed_fma=use_packed_fma,
     )
     return o, state_source  # (N, T, HV, V), (N, HV, V, K)
 
@@ -614,6 +618,123 @@ def test_kda_decode_mtp_ws_disable_state_update():
     _assert_close("ws disable_state_update output", o_ref, o_kernel.float())
     # State must be byte-for-byte unchanged.
     assert torch.equal(state_source, state_before), "state pool was modified despite disable_state_update=True"
+
+
+# ===========================================================================
+# Route 1 Stage 2: ilp_rows=4 path (fused steps 1+2 & 4+5, double accumulators,
+# packed F32x2 FMA on SM100 / scalar fma_pair fallback). Requires tile_v % 16 == 0.
+#
+# The core dense test sweeps use_packed_fma ∈ {False, True} to validate BOTH FMA
+# paths against the same fp32 oracle: the False instances exercise the portable
+# scalar fusion (always compiles); the True instances exercise the SM100 packed
+# intrinsic. The tile_v / large_n / disable tests pin use_packed_fma=False so the
+# fusion+double-accumulator math is validated independent of the packed API.
+# ===========================================================================
+@pytest.mark.parametrize("use_packed_fma", [False, True])
+@pytest.mark.parametrize("N,T,H,HV", [(1, 2, 8, 16), (4, 4, 8, 16), (16, 2, 16, 32)])
+def test_kda_decode_mtp_ws_kernel_ilp4_dense(N, T, H, HV, use_packed_fma):
+    K, V = 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=32, ilp_rows=4, use_packed_fma=use_packed_fma,
+    )
+
+    tag = f"ws ilp4 packed={use_packed_fma}"
+    _assert_close(f"{tag} output", o_ref, o_kernel.float())
+    _assert_close(f"{tag} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("tile_v", [16, 32, 64])
+@pytest.mark.parametrize("T", [2, 4])
+def test_kda_decode_mtp_ws_kernel_ilp4_tile_v(tile_v, T):
+    # tile_v ∈ {16,32,64} -> quarter_rows = (tile_v//4)//4 ∈ {1,2,4}, so this also
+    # exercises the row_quad loop running more than once. Scalar FMA (portable).
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=4, use_packed_fma=False,
+    )
+
+    _assert_close(f"ws ilp4 tile_v={tile_v} output", o_ref, o_kernel.float())
+    _assert_close(f"ws ilp4 tile_v={tile_v} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("N", [1024, 2048])
+def test_kda_decode_mtp_ws_kernel_ilp4_large_n(N):
+    """Mid/large batch with ilp=4 (heuristic tile_v=64, valid for ilp=4). Validate
+    against the single-token kernel looped over T (GPU-only, fast)."""
+    T, H, HV, K, V = 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, ilp_rows=4, use_packed_fma=False
+    )
+
+    _assert_close(f"ws ilp4 large N={N} output", o_loop.float(), o_kernel.float())
+    _assert_close(f"ws ilp4 large N={N} final state", state_loop, state_kernel)
+
+
+def test_kda_decode_mtp_ws_ilp4_disable_state_update():
+    """ilp=4 disable_state_update=True: correct per-token output, pool untouched."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, _ = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+
+    state_source = state.clone().contiguous()
+    state_before = state_source.clone()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o_kernel = kda_decode_mtp_ws(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_source,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        tile_v=32,
+        ilp_rows=4,
+        use_packed_fma=False,
+        disable_state_update=True,
+    )
+
+    _assert_close("ws ilp4 disable_state_update output", o_ref, o_kernel.float())
+    assert torch.equal(state_source, state_before), "state pool was modified despite disable_state_update=True"
+
+
+def test_kda_decode_mtp_ws_ilp4_rejects_bad_tile_v():
+    """ilp=4 requires tile_v % 16 == 0; tile_v=8 must raise, not silently skip rows."""
+    N, T, H, HV, K, V = 4, 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    with pytest.raises(AssertionError):
+        run_kda_decode_mtp_ws_dense(
+            q, k, v, a, b, A_log, dt_bias, state, scale,
+            tile_v=8, ilp_rows=4, use_packed_fma=False,
+        )
 
 
 if __name__ == "__main__":
