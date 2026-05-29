@@ -54,6 +54,18 @@ surface state-writeback races before any P3 kernel change lands.
 with vs without the [N,T,HV,V,K] intermediate-state buffer (fire-and-forget GMEM
 stores; expect ~1.0x). Opt-in so the large buffer isn't allocated in normal runs.
 
+--sweep-config sweeps EVERY legal (tile_v, ilp_rows, use_smem_v) config for each
+(HV, N, T) cell, times tokens/s, and marks the winner per work_units=N*HV — the
+data to re-tune _select_mtp_config for KDA (its thresholds are currently inherited
+from FlashInfer's GDN get_mtp_config). It sweeps HV in {32, 64} by default (32 =
+real Kimi-Linear KDA GQA, 64 = FlashInfer GDN) so the same work_units reached from
+two different (HV, N) splits can be cross-checked for a work_units-only optimum.
+Pure config sweep — no intermediate buffer; correctness still cross-checked vs the
+looped route. WARNING: every (N,T,HV,config) is a distinct JIT compile (N is in the
+compile-cache key), so the full grid compiles ~1.3k kernels — expect a long run;
+subset via --sweep-hvs/--sweep-ns/--sweep-ts. Writes a markdown report (winner table
++ work_units-invariance check + full per-cell grid).
+
 Fairness notes:
   - Both routes reset their state buffer before each timed iteration; the reset
     copy_() runs outside the CUDA event window and is NOT counted.
@@ -68,6 +80,8 @@ Usage:
     python benchmarks/bench_kda_decode_mtp.py --tile-v 32          # override heuristic
     python benchmarks/bench_kda_decode_mtp.py --determinism --det-iters 10000
     python benchmarks/bench_kda_decode_mtp.py --bench-intermediate --batch-sizes 64 256
+    python benchmarks/bench_kda_decode_mtp.py --sweep-config                  # full KDA config sweep
+    python benchmarks/bench_kda_decode_mtp.py --sweep-config --sweep-hvs 64 --sweep-ns 64 256 --sweep-ts 2 4
     python benchmarks/bench_kda_decode_mtp.py --output
 
 Note:
@@ -526,6 +540,291 @@ def run_intermediate_overhead(N, T, H, HV, K, V, tile_v_override, warmup, rep):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Config sweep: time ALL legal (tile_v, ilp, use_smem_v) per (HV, N, T) cell,
+# mark the winner per work_units=N*HV, to re-tune _select_mtp_config for KDA.
+# ──────────────────────────────────────────────────────────────────────
+_SWEEP_TILE_V_CHOICES = (8, 16, 32, 64)
+_SWEEP_ILP_CHOICES = (2, 4)
+_SWEEP_SMEM_V_CHOICES = (False, True)
+
+
+def _legal_sweep_configs(V):
+    """All (tile_v, ilp_rows, use_smem_v) the ws kernel accepts at this V.
+
+    Mirrors ``kda_decode_mtp_ws``'s legality asserts EXACTLY: ``tile_v % 4 == 0``,
+    ``V % tile_v == 0``, and ``(tile_v // 4) % ilp_rows == 0`` (so ilp=2 needs
+    ``tile_v % 8 == 0``, ilp=4 needs ``tile_v % 16 == 0``). ``use_smem_v`` is
+    orthogonal (works with any tile_v / ilp). For V=128 this yields 14 configs:
+    tile_v=8 -> ilp=2 only (x2 use_smem_v); tile_v in {16,32,64} -> ilp in {2,4}
+    (x2 use_smem_v each).
+    """
+    configs = []
+    for tile_v in _SWEEP_TILE_V_CHOICES:
+        if tile_v > V or V % tile_v != 0 or tile_v % 4 != 0:
+            continue
+        rows_per_group = tile_v // 4
+        for ilp in _SWEEP_ILP_CHOICES:
+            if rows_per_group % ilp != 0:
+                continue
+            for use_smem_v in _SWEEP_SMEM_V_CHOICES:
+                configs.append((tile_v, ilp, use_smem_v))
+    return configs
+
+
+def _fmt_cfg(tile_v, ilp, use_smem_v):
+    """Compact 'tile_v/ilp/smem_v' config label, e.g. '64/4/T'."""
+    return f"{tile_v}/{ilp}/{'T' if use_smem_v else 'F'}"
+
+
+# Shared header for the live-progress + final winner tables (run_sweep).
+_SWEEP_HDR = (
+    f"{'wu':>7} | {'HV':>3} | {'N':>5} | {'T':>2} | {'winner':>9} | "
+    f"{'Mtok/s':>8} | {'heur':>9} | {'h Mtok/s':>8} | {'win/heur':>8} | {'match':>5}"
+)
+
+
+def _sweep_row(cell):
+    """One winner-table row for a cell (columns match _SWEEP_HDR)."""
+    wu, HV, N, T = cell["work_units"], cell["HV"], cell["N"], cell["T"]
+    if cell["winner"] is None:
+        return (f"{wu:>7} | {HV:>3} | {N:>5} | {T:>2} | {'ERROR':>9} | "
+                f"{'n/a':>8} | {_fmt_cfg(*cell['heur']):>9} | {'n/a':>8} | "
+                f"{'n/a':>8} | {'n/a':>5}")
+    w = cell["winner"]
+    hr = cell["heur_result"]
+    win_cfg = _fmt_cfg(w["tile_v"], w["ilp"], w["use_smem_v"])
+    win_heur = (hr["t_ms"] / w["t_ms"]) if (hr and hr["t_ms"] and w["t_ms"]) else float("nan")
+    match = "=" if (w["tile_v"], w["ilp"], w["use_smem_v"]) == cell["heur"] else "DIFF"
+    h_mtok = hr["mtok_s"] if hr else float("nan")
+    return (f"{wu:>7} | {HV:>3} | {N:>5} | {T:>2} | {win_cfg:>9} | "
+            f"{w['mtok_s']:>8.2f} | {_fmt_cfg(*cell['heur']):>9} | {_fmt(h_mtok, '.2f'):>8} | "
+            f"{_fmt(win_heur, '.2f'):>7}x | {match:>5}")
+
+
+def run_sweep_config(N, T, H, HV, K, V, warmup, rep):
+    """Time EVERY legal (tile_v, ilp_rows, use_smem_v) for one (HV, N, T) cell
+    and pick the empirical winner (max tokens/s).
+
+    Pure config sweep: each config is passed to ``kda_decode_mtp_ws`` explicitly
+    (all three knobs set -> the kernel skips the heuristic), with no intermediate
+    buffer; ``use_packed_fma`` stays auto (SM100 -> packed FMA for ilp=4), matching
+    the production path. Every config is also cross-checked for correctness against
+    the looped single-token route (rel error vs out + final state) — the same gate
+    the main sweep uses. Returns a cell dict for run_sweep / the markdown report.
+    A failure in any single config is captured (``error``) and skipped rather than
+    aborting the (multi-hour) sweep; a cell-level failure sets ``cell['error']``.
+    """
+    device = "cuda"
+    scale = K**-0.5
+    work_units = N * HV
+    tokens = N * T
+    heur = _select_mtp_config(N, HV, V, T)  # (tile_v, ilp_rows, use_smem_v)
+
+    cell = {
+        "HV": HV, "N": N, "T": T, "work_units": work_units, "tokens": tokens,
+        "heur": heur, "configs": [], "winner": None, "heur_result": None,
+        "error": None,
+    }
+
+    try:
+        q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V, device)
+        indices = torch.arange(N, device=device, dtype=torch.int32)
+        state_init = state.clone().contiguous()
+
+        # --- looped single-token reference (correctness oracle), computed once.
+        # Pre-slice per-token tensors so the loop matches _build_routes' fair path.
+        state_loop = state_init.clone()
+        q_tok = [q[:, t].unsqueeze(1).contiguous() for t in range(T)]
+        k_tok = [k[:, t].unsqueeze(1).contiguous() for t in range(T)]
+        v_tok = [v[:, t].unsqueeze(1).contiguous() for t in range(T)]
+        a_tok = [a[:, t].unsqueeze(1).contiguous() for t in range(T)]
+        b_tok = [b[:, t].unsqueeze(1).contiguous() for t in range(T)]
+        o_loop = torch.empty(N, T, HV, V, device=device, dtype=torch.bfloat16)
+        with torch.no_grad():
+            for t in range(T):
+                o_t = kda_decode(
+                    A_log=A_log, dt_bias=dt_bias, q=q_tok[t], k=k_tok[t], v=v_tok[t],
+                    a=a_tok[t], b=b_tok[t], initial_state_source=state_loop,
+                    initial_state_indices=indices, scale=scale,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                o_loop[:, t] = o_t.squeeze(1)
+        state_loop_final = state_loop.clone()
+        del state_loop  # free before the config loop (state is the big buffer)
+
+        # One reusable mutable state buffer shared by every config (reset each run),
+        # so the cell holds at most ~4 state copies regardless of how many configs.
+        state_work = state_init.clone()
+
+        def reset():
+            state_work.copy_(state_init)
+
+        def make_call(tile_v, ilp, use_smem_v):
+            def _call():
+                return kda_decode_mtp_ws(
+                    A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+                    initial_state_source=state_work, initial_state_indices=indices,
+                    scale=scale, use_qk_l2norm_in_kernel=True,
+                    tile_v=tile_v, ilp_rows=ilp, use_smem_v=use_smem_v,
+                    # use_packed_fma left None -> auto-detect SM100 (production path)
+                )
+            return _call
+
+        with torch.no_grad():
+            for tile_v, ilp, use_smem_v in _legal_sweep_configs(V):
+                rec = {
+                    "tile_v": tile_v, "ilp": ilp, "use_smem_v": use_smem_v,
+                    "t_ms": None, "mtok_s": float("nan"),
+                    "out_rel_max": float("nan"), "state_rel_max": float("nan"),
+                    "is_heur": (tile_v, ilp, use_smem_v) == heur, "error": None,
+                }
+                try:
+                    call = make_call(tile_v, ilp, use_smem_v)
+                    reset()
+                    o_r = call().clone()  # first call also warms the JIT compile
+                    st_r = state_work.clone()
+                    _, rec["out_rel_max"] = relative_rms_error_rel_max(o_loop, o_r)
+                    _, rec["state_rel_max"] = relative_rms_error_rel_max(state_loop_final, st_r)
+                    del o_r, st_r
+                    t_ms = benchmark_cuda_fn(call, setup_fn=reset, warmup=warmup, rep=rep)
+                    rec["t_ms"] = t_ms
+                    rec["mtok_s"] = tokens / t_ms / 1e3 if (t_ms and t_ms > 0) else float("nan")
+                except Exception as e:  # noqa: BLE001 — keep the sweep going
+                    rec["error"] = f"{type(e).__name__}: {e}"
+                cell["configs"].append(rec)
+                if rec["is_heur"]:
+                    cell["heur_result"] = rec
+
+        valid = [c for c in cell["configs"] if c["error"] is None and c["t_ms"] and c["t_ms"] > 0]
+        cell["winner"] = min(valid, key=lambda c: c["t_ms"]) if valid else None
+    except Exception as e:  # noqa: BLE001 — one bad cell shouldn't kill the sweep
+        cell["error"] = f"{type(e).__name__}: {e}"
+
+    return cell
+
+
+def run_sweep(args, gpu_name):
+    """Orchestrate the full config sweep: every (HV, N, T) cell x all legal
+    configs, winner per cell, a work_units-invariance check, and a markdown dump
+    to re-tune _select_mtp_config. Always writes the markdown (the full grid is
+    the deliverable and the sweep is expensive)."""
+    hvs, ns, ts = args.sweep_hvs, args.sweep_ns, args.sweep_ts
+    n_cfg = len(_legal_sweep_configs(args.V))
+    n_cells = len(hvs) * len(ns) * len(ts)
+    total = n_cells * n_cfg
+
+    print(f"Config sweep: H={args.H}, K={args.K}, V={args.V} | HV={hvs} x N={ns} x T={ts}")
+    print(f"  {n_cells} cells x {n_cfg} legal configs = {total} timed configs "
+          f"(work_units = N*HV is the heuristic key).")
+    print("  NOTE: each (N,T,HV,tile_v,ilp,use_smem_v) is a DISTINCT JIT compile on "
+          "first use (N is in the compile-cache key), so the first touch of every "
+          "config compiles -> expect a LONG run. Subset via --sweep-hvs/--sweep-ns/"
+          "--sweep-ts for a quick look; drop N=2048 first if you hit OOM.")
+    print(f"  Timing: warmup={args.warmup}, rep={args.rep}.")
+    print()
+    print(f"{'progress':>10} | {_SWEEP_HDR}")
+    print("-" * (13 + len(_SWEEP_HDR)))
+
+    cells = []
+    done = 0
+    for HV in hvs:
+        for T in ts:
+            for N in ns:
+                done += 1
+                cell = run_sweep_config(N, T, args.H, HV, args.K, args.V, args.warmup, args.rep)
+                cells.append(cell)
+                print(f"{f'[{done}/{n_cells}]':>10} | {_sweep_row(cell)}")
+                if cell["error"] is not None:
+                    print(f"           ! cell error: {cell['error']}")
+    print()
+
+    # --- Winner table, sorted so equal work_units (across the HV split) sit
+    # adjacent and the winner-per-work_units trend reads top-to-bottom.
+    print("=== Winner per cell (sorted by work_units, T, HV) ===")
+    print(_SWEEP_HDR)
+    print("-" * len(_SWEEP_HDR))
+    for c in sorted(cells, key=lambda c: (c["work_units"], c["T"], c["HV"])):
+        print(_sweep_row(c))
+    print()
+
+    _print_sweep_invariance(cells)
+    _print_sweep_headline(cells)
+
+    # Persist (always): the full per-cell grid is the re-tuning deliverable.
+    from benchmarks.bench_kda_decode import normalize_gpu_type
+
+    if args.output and args.output != "__AUTO__":
+        output_path = pathlib.Path(args.output)
+    else:
+        output_path = pathlib.Path(
+            f"BENCHMARK_KDA_DECODE_MTP_SWEEP_{normalize_gpu_type(gpu_name)}.md"
+        )
+    write_sweep_markdown_report(args, gpu_name, cells, output_path)
+    print(f"Full grid + winner + invariance tables written to: {output_path.resolve()}")
+    return cells
+
+
+def _invariance_groups(cells):
+    """Group winners by (work_units, T); return [( (wu,T), [cells] )] for the
+    groups reached from >1 (HV, N) split, sorted by (wu, T)."""
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for c in cells:
+        if c["winner"] is not None:
+            groups[(c["work_units"], c["T"])].append(c)
+    return [(kk, v) for kk, v in sorted(groups.items()) if len(v) >= 2]
+
+
+def _winner_triple(cell):
+    w = cell["winner"]
+    return (w["tile_v"], w["ilp"], w["use_smem_v"])
+
+
+def _print_sweep_invariance(cells):
+    """Same work_units & T from different (HV, N) splits — do winners agree?"""
+    multi = _invariance_groups(cells)
+    print("=== Work_units invariance (same work_units & T, different HV/N split) ===")
+    if not multi:
+        print("  (no work_units reached from >1 HV/N split in this grid)")
+        print()
+        return
+    print("  >1 split reaches these work_units; CONSISTENT => optimum is purely work_units-keyed.")
+    for (wu, T), members in multi:
+        wins = {_winner_triple(g) for g in members}
+        verdict = "CONSISTENT" if len(wins) == 1 else "MIXED"
+        splits = ", ".join(
+            f"{g['HV']}:{g['N']}->{_fmt_cfg(*_winner_triple(g))}"
+            for g in sorted(members, key=lambda g: g["HV"])
+        )
+        print(f"  wu={wu:>7} T={T}: {splits}   [{verdict}]")
+    print()
+
+
+def _print_sweep_headline(cells):
+    """How much is the current GDN-inherited heuristic leaving on the table?"""
+    ok = [c for c in cells if c["winner"] is not None]
+    if not ok:
+        print("=== Headline: no successful cells ===")
+        print()
+        return
+    hits = sum(1 for c in ok if _winner_triple(c) == c["heur"])
+    ratios = [
+        c["heur_result"]["t_ms"] / c["winner"]["t_ms"]
+        for c in ok
+        if c["heur_result"] and c["heur_result"]["t_ms"] and c["winner"]["t_ms"]
+    ]
+    print("=== Headline (drives Task 2 re-tune of _select_mtp_config) ===")
+    print(f"  heuristic picks the winner in {hits}/{len(ok)} cells "
+          f"({100.0 * hits / len(ok):.0f}%).")
+    if ratios:
+        avg = sum(ratios) / len(ratios)
+        print(f"  win/heur speedup (gain available from re-tuning): "
+              f"avg={avg:.3f}x, min={min(ratios):.3f}x, max={max(ratios):.3f}x.")
+    print()
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Markdown report
 # ──────────────────────────────────────────────────────────────────────
 def _fmt(x, spec):
@@ -599,6 +898,153 @@ def write_markdown_report(args, gpu_name, results, output_path):
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_sweep_markdown_report(args, gpu_name, cells, output_path):
+    """Write the --sweep-config report: winner-per-cell table (sorted by
+    work_units), work_units-invariance check, and the full per-cell grid (every
+    config's tokens/s + correctness). This is the artifact for re-tuning
+    _select_mtp_config and for the PR doc's config-heuristic section."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    by_wu = sorted(cells, key=lambda c: (c["work_units"], c["T"], c["HV"]))
+
+    lines = []
+    lines.append("# Config Sweep — KDA MTP Decode (warp-spec `kda_decode_mtp_ws`)")
+    lines.append("")
+    lines.append(f"> Auto-generated by `benchmarks/bench_kda_decode_mtp.py --sweep-config` on {now}.")
+    lines.append("")
+    lines.append(
+        f"> **GPU:** {gpu_name}  |  **CUDA:** {torch.version.cuda or 'unknown'}  |  "
+        f"**PyTorch:** {torch.__version__}  |  **Python:** {platform.python_version()}"
+    )
+    lines.append("")
+    lines.append(
+        f"> Grid: H={args.H}, K={args.K}, V={args.V}; HV={args.sweep_hvs}, N={args.sweep_ns}, "
+        f"T={args.sweep_ts}. Per (HV, N, T) cell, ALL legal (tile_v∈{{8,16,32,64}}, "
+        f"ilp∈{{2,4}}, use_smem_v∈{{F,T}}) configs are timed (tokens/s = N*T/time); ilp=4 "
+        f"requires tile_v%16==0; use_smem_v is orthogonal. `use_packed_fma` auto-detects "
+        f"(SM100 → packed FMA for ilp=4). Winner = max tokens/s. **heur** = what "
+        f"`_select_mtp_config` currently picks (FlashInfer-GDN-inherited thresholds). "
+        f"Correctness for every config is cross-checked vs the looped single-token route. "
+        f"Timing: warmup={args.warmup}, rep={args.rep}."
+    )
+    lines.append("")
+
+    # --- Headline ---
+    ok = [c for c in cells if c["winner"] is not None]
+    hits = sum(1 for c in ok if _winner_triple(c) == c["heur"])
+    ratios = [
+        c["heur_result"]["t_ms"] / c["winner"]["t_ms"]
+        for c in ok
+        if c["heur_result"] and c["heur_result"]["t_ms"] and c["winner"]["t_ms"]
+    ]
+    lines.append("## Headline")
+    lines.append("")
+    if ok:
+        lines.append(f"- Heuristic picks the winner in **{hits}/{len(ok)}** cells "
+                     f"({100.0 * hits / len(ok):.0f}%).")
+    if ratios:
+        avg = sum(ratios) / len(ratios)
+        lines.append(f"- win/heur speedup (gain available from re-tuning): "
+                     f"**avg={avg:.3f}x, min={min(ratios):.3f}x, max={max(ratios):.3f}x**.")
+    if len(ok) != len(cells):
+        lines.append(f"- ⚠️ {len(cells) - len(ok)} cell(s) failed (see grid for the error).")
+    lines.append("")
+
+    # --- Winner table ---
+    lines.append("## Winner per cell (sorted by work_units, T, HV)")
+    lines.append("")
+    lines.append("| work_units | HV | N | T | winner (tv/ilp/sv) | win Mtok/s | win ms | "
+                 "heuristic (tv/ilp/sv) | heur Mtok/s | win/heur | match |")
+    lines.append("|--:|--:|--:|--:|:--|--:|--:|:--|--:|--:|:--|")
+    for c in by_wu:
+        heur_cfg = _fmt_cfg(*c["heur"])
+        if c["winner"] is None:
+            lines.append(f"| {c['work_units']} | {c['HV']} | {c['N']} | {c['T']} | ERROR | "
+                         f"n/a | n/a | {heur_cfg} | n/a | n/a | n/a |")
+            continue
+        w = c["winner"]
+        hr = c["heur_result"]
+        win_heur = (hr["t_ms"] / w["t_ms"]) if (hr and hr["t_ms"] and w["t_ms"]) else float("nan")
+        match = "=" if _winner_triple(c) == c["heur"] else "**DIFF**"
+        lines.append(
+            f"| {c['work_units']} | {c['HV']} | {c['N']} | {c['T']} | "
+            f"`{_fmt_cfg(*_winner_triple(c))}` | {w['mtok_s']:.2f} | {_fmt(w['t_ms'], '.4f')} | "
+            f"`{heur_cfg}` | {_fmt(hr['mtok_s'] if hr else float('nan'), '.2f')} | "
+            f"{_fmt(win_heur, '.2f')}x | {match} |"
+        )
+    lines.append("")
+
+    # --- Work_units invariance ---
+    lines.append("## Work_units invariance (same work_units & T, different HV/N split)")
+    lines.append("")
+    lines.append("> Tests whether the optimal config is purely work_units-keyed: for each "
+                 "(work_units, T) reached from >1 (HV, N) split, do the winners agree? A "
+                 "**MIXED** row means the optimum also depends on the N/HV split and a "
+                 "work_units-only threshold table can't fully capture it.")
+    lines.append("")
+    multi = _invariance_groups(cells)
+    if not multi:
+        lines.append("_(no work_units reached from >1 HV/N split in this grid)_")
+    else:
+        lines.append("| work_units | T | splits (HV:N → winner) | verdict |")
+        lines.append("|--:|--:|:--|:--|")
+        for (wu, T), members in multi:
+            wins = {_winner_triple(g) for g in members}
+            verdict = "CONSISTENT" if len(wins) == 1 else "**MIXED**"
+            splits = ", ".join(
+                f"{g['HV']}:{g['N']}→`{_fmt_cfg(*_winner_triple(g))}`"
+                for g in sorted(members, key=lambda g: g["HV"])
+            )
+            lines.append(f"| {wu} | {T} | {splits} | {verdict} |")
+    lines.append("")
+
+    # --- Full per-cell grid ---
+    lines.append("## Full grid (every config per cell)")
+    lines.append("")
+    lines.append("> `★win` marks the per-cell winner; `H` marks the current heuristic pick.")
+    for c in by_wu:
+        lines.append("")
+        lines.append(f"### work_units={c['work_units']} — HV={c['HV']}, N={c['N']}, T={c['T']} "
+                     f"(heuristic `{_fmt_cfg(*c['heur'])}`)")
+        if c["error"] is not None:
+            lines.append("")
+            lines.append(f"**CELL ERROR:** {c['error']}")
+            continue
+        lines.append("")
+        lines.append("| tile_v | ilp | smem_v | time ms | Mtok/s | out rmax | state rmax | mark |")
+        lines.append("|--:|--:|:--:|--:|--:|--:|--:|:--|")
+        ordered = sorted(
+            c["configs"],
+            key=lambda r: (float("inf") if not (r["t_ms"] and r["t_ms"] > 0) else r["t_ms"]),
+        )
+        for rec in ordered:
+            marks = []
+            if c["winner"] is rec:
+                marks.append("★win")
+            if rec["is_heur"]:
+                marks.append("H")
+            if rec["error"]:
+                marks.append(f"ERR({rec['error']})")
+            lines.append(
+                f"| {rec['tile_v']} | {rec['ilp']} | {'T' if rec['use_smem_v'] else 'F'} | "
+                f"{_fmt(rec['t_ms'], '.4f')} | {_fmt(rec['mtok_s'], '.2f')} | "
+                f"{_fmt(rec['out_rel_max'], '.2e')} | {_fmt(rec['state_rel_max'], '.2e')} | "
+                f"{' '.join(marks)} |"
+            )
+    lines.append("")
+    lines.append("## Reproduce")
+    lines.append("")
+    lines.append("```bash")
+    lines.append(
+        "python benchmarks/bench_kda_decode_mtp.py --sweep-config "
+        f"--H {args.H} --sweep-hvs {' '.join(map(str, args.sweep_hvs))} "
+        f"--sweep-ns {' '.join(map(str, args.sweep_ns))} "
+        f"--sweep-ts {' '.join(map(str, args.sweep_ts))} --output"
+    )
+    lines.append("```")
+    lines.append("")
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────
@@ -630,6 +1076,28 @@ def build_parser():
         action="store_true",
         help="Measure Stage-D intermediate-snapshot overhead (ilp=4 ws with vs without "
              "the [N,T,HV,V,K] snapshot buffer) instead of the main route sweep",
+    )
+    parser.add_argument(
+        "--sweep-config",
+        action="store_true",
+        help="Sweep ALL legal (tile_v, ilp, use_smem_v) per (HV, N, T) cell and mark the "
+             "winner per work_units=N*HV — the data to re-tune _select_mtp_config for KDA. "
+             "Uses --sweep-hvs/--sweep-ns/--sweep-ts (not --batch-sizes/--Ts/--HV); ignores "
+             "--tile-v (it enumerates tile_v). Writes a markdown report.",
+    )
+    parser.add_argument(
+        "--sweep-hvs", nargs="+", type=int, default=[32, 64],
+        help="HV values to sweep with --sweep-config (default 32=Kimi-Linear KDA GQA, "
+             "64=FlashInfer GDN).",
+    )
+    parser.add_argument(
+        "--sweep-ns", nargs="+", type=int,
+        default=[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048],
+        help="N (batch) values to sweep with --sweep-config.",
+    )
+    parser.add_argument(
+        "--sweep-ts", nargs="+", type=int, default=[2, 3, 4, 6],
+        help="T (MTP token counts) to sweep with --sweep-config.",
     )
     parser.add_argument(
         "--output",
@@ -679,6 +1147,12 @@ def main(argv=None):
         print()
         print("ALL DETERMINISTIC" if all_ok else "NON-DETERMINISM DETECTED — investigate state writeback race")
         return all_ok
+
+    if args.sweep_config:
+        if args.tile_v is not None:
+            print("NOTE: --tile-v is ignored in --sweep-config mode (the sweep enumerates tile_v).\n")
+        run_sweep(args, gpu_name)
+        return True
 
     if args.bench_intermediate:
         hdr = (
