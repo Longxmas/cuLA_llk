@@ -66,7 +66,7 @@ from cula.ops.kda_decode import (
     _normalize_state_source,
     _prepare_output_tensor,
 )
-from cula.ops.kda_decode_mtp import _normalize_mtp_a, _select_mtp_tile_v
+from cula.ops.kda_decode_mtp import _normalize_mtp_a, _select_mtp_config
 
 logger = logging.getLogger(__name__)
 
@@ -888,7 +888,7 @@ def kda_decode_mtp_ws(
     out: torch.Tensor | None = None,
     state_layout: str = "vk",
     tile_v: int | None = None,
-    ilp_rows: int = 2,
+    ilp_rows: int | None = None,
     disable_state_update: bool = False,
     use_packed_fma: bool | None = None,
 ) -> torch.Tensor:
@@ -905,8 +905,14 @@ def kda_decode_mtp_ws(
 
     ``ilp_rows`` selects how many V-rows a warp processes together: 2 (any valid
     ``tile_v``) or 4 (requires ``tile_v % 16 == 0``; steps 1+2 and 4+5 are fused
-    with double accumulators + packed F32x2 FMA on SM100). ``use_packed_fma=None``
-    auto-detects SM100+ (Blackwell); pass False to force the scalar fallback.
+    with double accumulators + packed F32x2 FMA on SM100). ``ilp_rows=None``
+    (default) picks it from the ``work_units=N*HV`` heuristic
+    (:func:`_select_mtp_config`), mirroring ``tile_v=None``; an explicit value
+    overrides. If an explicit ``tile_v`` makes the heuristic's ilp=4 illegal
+    (``tile_v % 16 != 0``) the auto path falls back to ilp=2 (an explicit
+    ``ilp_rows=4`` with such a ``tile_v`` still asserts, by design).
+    ``use_packed_fma=None`` auto-detects SM100+ (Blackwell); pass False to force
+    the scalar fallback.
 
     Constraints: ``state_layout='vk'`` only; ``ilp_rows in {2, 4}``.
     """
@@ -920,6 +926,24 @@ def kda_decode_mtp_ws(
         assert scale > 0, f"scale must be positive, got {scale}"
 
     assert K == TILE_K, f"KDA MTP (ws) kernel requires K={TILE_K}, got {K}"
+
+    # Resolve tile_v / ilp_rows from the work_units=N*HV heuristic where not
+    # given explicitly (mirrors kda_decode_mtp). The heuristic's use_smem_v is
+    # produced but ignored here (Stage C). An explicit tile_v can make the
+    # heuristic's ilp=4 illegal (needs tile_v % 16 == 0); in the auto path we
+    # fall back to the universally-legal ilp=2 rather than tripping the
+    # rows_per_group assert below. (When tile_v also came from the heuristic,
+    # _select_mtp_config already applied this backstop, so the guard is a no-op.)
+    if tile_v is None or ilp_rows is None:
+        sel_tile_v, sel_ilp_rows, _sel_use_smem_v = _select_mtp_config(
+            N, HV, V, T, disable_state_update=disable_state_update
+        )
+        if tile_v is None:
+            tile_v = sel_tile_v
+        if ilp_rows is None:
+            ilp_rows = sel_ilp_rows
+            if ilp_rows == 4 and tile_v % 16 != 0:
+                ilp_rows = 2
 
     if ilp_rows not in (2, 4):
         raise NotImplementedError(
@@ -942,8 +966,6 @@ def kda_decode_mtp_ws(
             f"(FlashInfer is vk-only); got {state_layout!r}"
         )
 
-    if tile_v is None:
-        tile_v = _select_mtp_tile_v(N, HV, V, T)
     assert tile_v % 4 == 0, f"KDA MTP (ws) requires tile_v % 4 == 0, got tile_v={tile_v}"
     assert V % tile_v == 0, f"KDA MTP (ws) requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
     # Each warp owns rows_per_group = tile_v/4 V-rows and steps through ilp_rows of

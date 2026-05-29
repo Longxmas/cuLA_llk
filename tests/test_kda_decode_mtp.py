@@ -44,6 +44,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling test import
 
 from cula.kda import kda_decode, kda_decode_mtp, kda_decode_mtp_ws
+from cula.ops.kda_decode_mtp import _select_mtp_config, _select_mtp_tile_v
 
 # Trusted single-token reference from the existing decode test. We cross-check
 # our MTP reference against it (pure torch, no kernel) so the MTP oracle is
@@ -735,6 +736,103 @@ def test_kda_decode_mtp_ws_ilp4_rejects_bad_tile_v():
             q, k, v, a, b, A_log, dt_bias, state, scale,
             tile_v=8, ilp_rows=4, use_packed_fma=False,
         )
+
+
+# ===========================================================================
+# Stage 3-A: joint (tile_v, ilp_rows) heuristic. _select_mtp_config mirrors
+# FlashInfer's get_mtp_config (ilp capped at 4); kda_decode_mtp_ws(ilp_rows=None)
+# is the production default that consumes it (small work_units -> ilp=2, mid/large
+# -> ilp=4). use_smem_v is produced for Stage C but not yet consumed.
+# ===========================================================================
+@pytest.mark.parametrize(
+    "N,HV,V,T,expected",
+    [
+        # work_units = N*HV buckets at V=128 (no clamp / back-off).
+        (1, 16, 128, 2, (8, 2, False)),    # wu=16    <=64
+        (4, 16, 128, 4, (8, 2, False)),    # wu=64    <=64 (boundary)
+        (1, 65, 128, 2, (16, 4, False)),   # wu=65    <=128
+        (8, 16, 128, 2, (16, 4, False)),   # wu=128   <=128 (boundary)
+        (16, 16, 128, 2, (16, 2, False)),  # wu=256   <=448, T<=2
+        (16, 16, 128, 4, (32, 4, False)),  # wu=256   <=448, T>=3
+        (7, 64, 128, 2, (16, 2, False)),   # wu=448   <=448 (boundary), T<=2
+        (7, 64, 128, 8, (32, 4, False)),   # wu=448   <=448 (boundary), T>=3
+        (16, 64, 128, 2, (32, 4, False)),  # wu=1024  <=1024 (boundary)
+        (64, 16, 128, 8, (32, 4, False)),  # wu=1024  <=1024
+        (17, 64, 128, 2, (64, 4, True)),   # wu=1088  >1024 (large; smem_v=True)
+        (256, 64, 128, 8, (64, 4, True)),  # wu=16384 >1024
+        # clamp to V + ilp legality back-off at small V.
+        (8, 16, 8, 2, (8, 2, False)),      # wu=128 picks (16,4); clamp->8; 8%16!=0 -> ilp=2
+        (8, 16, 16, 2, (16, 4, False)),    # wu=128 picks (16,4); clamp keeps 16; legal -> ilp=4
+    ],
+)
+def test_select_mtp_config(N, HV, V, T, expected):
+    """The joint heuristic returns the expected (tile_v, ilp_rows, use_smem_v),
+    and _select_mtp_tile_v stays the tile_v projection of the same selection."""
+    assert _select_mtp_config(N, HV, V, T) == expected
+    assert _select_mtp_tile_v(N, HV, V, T) == expected[0]
+
+
+def test_select_mtp_config_ilp_capped_at_4():
+    """We cap ilp at 4 (no ilp=8 path): no bucket — including >1024 with
+    state_update ON + T<=2, where FlashInfer would pick ilp=8 — returns ilp>4."""
+    for N in (1, 8, 16, 64, 256, 4096):
+        for HV in (16, 64):
+            for T in (1, 2, 4, 8):
+                for dsu in (False, True):
+                    _, ilp, _ = _select_mtp_config(N, HV, 128, T, disable_state_update=dsu)
+                    assert ilp in (2, 4), f"N={N},HV={HV},T={T},dsu={dsu} -> ilp={ilp}"
+
+
+@pytest.mark.parametrize(
+    "N,H,HV,T,expected_ilp",
+    [
+        (1, 8, 16, 2, 2),    # work_units=16   -> tile_v=8,  ilp=2
+        (8, 8, 16, 2, 4),    # work_units=128  -> tile_v=16, ilp=4
+        (16, 8, 16, 2, 2),   # work_units=256, T<=2 -> tile_v=16, ilp=2
+        (16, 8, 16, 4, 4),   # work_units=256, T>=3 -> tile_v=32, ilp=4
+        (64, 8, 16, 2, 4),   # work_units=1024 -> tile_v=32, ilp=4
+        (128, 8, 16, 2, 4),  # work_units=2048 -> tile_v=64, ilp=4 (large bucket)
+    ],
+)
+def test_kda_decode_mtp_ws_auto_config(N, H, HV, T, expected_ilp):
+    """Production default: kda_decode_mtp_ws with NO tile_v/ilp_rows lets the
+    work_units heuristic pick both. Confirm the picked ilp AND that the auto path
+    is numerically correct vs the looped single-token kernel (GPU-only, any N)."""
+    K, V = 128, 128
+    scale = K**-0.5
+
+    # Document the branch this case exercises (and guard the default selection).
+    _, sel_ilp, _ = _select_mtp_config(N, HV, V, T)
+    assert sel_ilp == expected_ilp, (
+        f"work_units={N * HV}, T={T}: expected ilp={expected_ilp}, got {sel_ilp}"
+    )
+
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    # No tile_v, no ilp_rows -> both come from _select_mtp_config.
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o_kernel = kda_decode_mtp_ws(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_source,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+    )
+
+    tag = f"ws auto (wu={N * HV}, T={T}, ilp={sel_ilp})"
+    _assert_close(f"{tag} output", o_loop.float(), o_kernel.float())
+    _assert_close(f"{tag} final state", state_loop, state_source)
 
 
 if __name__ == "__main__":

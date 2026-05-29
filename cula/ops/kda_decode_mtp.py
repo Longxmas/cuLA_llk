@@ -524,35 +524,80 @@ def _normalize_mtp_a(a: torch.Tensor, *, N: int, T: int, HV: int, K: int) -> tor
 
 # Valid V-tile sizes: each must be a multiple of NUM_WARPS (4) so V_PER_WARP is
 # integral, and the heuristic picks from these. (flashinfer's get_mtp_config uses
-# {8,16,32,64}; we mirror the tile_v axis. ilp_rows/use_smem_v are P3.)
+# {8,16,32,64}; we mirror the tile_v axis. ilp_rows is P3 (capped at 4 here);
+# use_smem_v is produced but not yet consumed.)
 _MTP_TILE_V_CHOICES = (8, 16, 32, 64)
 
 
-def _select_mtp_tile_v(N: int, HV: int, V: int, T: int) -> int:
-    """Pick tile_v from work_units = N*HV (simplified flashinfer get_mtp_config).
+def _select_mtp_config(
+    N: int,
+    HV: int,
+    V: int,
+    T: int,
+    *,
+    disable_state_update: bool = False,
+) -> tuple[int, int, bool]:
+    """Pick (tile_v, ilp_rows, use_smem_v) from work_units = N*HV.
+
+    Mirrors FlashInfer's ``get_mtp_config`` (``gdn_decode_mtp.py:63-116``)
+    thresholds, with one deliberate divergence: ``ilp_rows`` is **capped at 4**
+    (the warp-spec kernel does not implement the ilp=8 path), so the >1024 bucket
+    uses ilp=4 instead of FlashInfer's ilp=8 (which it picks there for
+    state_update + T<=2). ``use_smem_v`` is produced for the large-batch bucket so
+    Stage C can consume it; the current ``kda_decode_mtp_ws`` ignores it.
 
     Small work_units -> small tile_v -> more V-tiles -> more CTAs to fill the GPU;
     large work_units -> large tile_v -> fewer CTAs, better per-CTA efficiency.
-    Only the tile_v axis is selected here; ilp_rows / use_smem_v are deferred to P3.
+
+    ``disable_state_update`` is accepted for parity with FlashInfer's signature
+    (there it gates the ilp=8 choice); with ilp capped at 4 it does not change the
+    selection here, but threading it keeps the call sites aligned with FlashInfer
+    and ready for the ilp=8 path if it is ever added.
     """
     work_units = N * HV
+
     if work_units <= 64:
-        tile_v = 8
+        tile_v, ilp_rows, use_smem_v = 8, 2, False
     elif work_units <= 128:
-        tile_v = 16
+        tile_v, ilp_rows, use_smem_v = 16, 4, False
     elif work_units <= 448:
-        tile_v = 16 if T <= 2 else 32
+        if T <= 2:
+            tile_v, ilp_rows, use_smem_v = 16, 2, False
+        else:
+            tile_v, ilp_rows, use_smem_v = 32, 4, False
     elif work_units <= 1024:
-        tile_v = 32
+        tile_v, ilp_rows, use_smem_v = 32, 4, False
     else:
-        tile_v = 64
+        # Large batches. FlashInfer uses ilp=8 + use_smem_v=False here when
+        # state_update is ON and T<=2; we cap ilp at 4, so use (64, 4, True)
+        # uniformly. use_smem_v=True is produced for Stage C (use_smem_v/sOutput)
+        # to consume — the current warp-spec kernel ignores the field.
+        tile_v, ilp_rows, use_smem_v = 64, 4, True
 
     # Clamp to V and back off to a divisor of V (V is a multiple of 16 in
-    # practice, so this is a no-op for the common case).
+    # practice, so this is a no-op for the common V=128 case).
     tile_v = min(tile_v, V)
     while tile_v > _MTP_TILE_V_CHOICES[0] and V % tile_v != 0:
         tile_v //= 2
-    return tile_v
+
+    # Legality backstop: ilp=4 requires (tile_v//4) % 4 == 0, i.e. tile_v % 16 == 0
+    # (otherwise the warp-spec kernel's row_quad loop count truncates and trailing
+    # V-rows are silently skipped). If clamping/back-off dropped tile_v below a
+    # multiple of 16 (e.g. small V), fall back to the universally-legal ilp=2.
+    if ilp_rows == 4 and tile_v % 16 != 0:
+        ilp_rows = 2
+
+    return tile_v, ilp_rows, use_smem_v
+
+
+def _select_mtp_tile_v(N: int, HV: int, V: int, T: int) -> int:
+    """Pick tile_v from work_units = N*HV (the tile_v axis of _select_mtp_config).
+
+    Thin wrapper for callers that only need tile_v (the Route-2 kernel
+    ``kda_decode_mtp`` and the benchmark); the full ``(tile_v, ilp_rows,
+    use_smem_v)`` tuple lives in :func:`_select_mtp_config`.
+    """
+    return _select_mtp_config(N, HV, V, T)[0]
 
 
 def kda_decode_mtp(
