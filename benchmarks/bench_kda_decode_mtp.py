@@ -32,8 +32,10 @@ Compares routes that compute the SAME T-token recurrence:
               explicit knobs; it dispatches to the same kernel config as ws or
               ws4 per the picked ilp (the "sel ilp" column reports which).
 
-ws and ws4 pin ilp explicitly so the ws-vs-ws4 head-to-head is NOT muddied by the
-new ilp_rows=None default.
+ws and ws4 pin ilp AND use_smem_v=False explicitly so the ladder ws(ilp2) ->
+ws4(ilp4) -> ws4_smemv(ilp4+smem_v) each isolates ONE knob; otherwise an unset
+use_smem_v defaults to None and the heuristic turns it on at large batch
+(work_units>1024), making ws4 == ws4_smemv there.
 
 Reports per (N, T): wall time, tokens/s (= N*T / time), the tile_v the
 work_units=N*HV heuristic picked, the heuristic's selected ilp ("sel ilp"),
@@ -159,6 +161,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
             use_qk_l2norm_in_kernel=True,
             tile_v=tile_v,
             ilp_rows=2,  # pin ilp=2 so ws-vs-ws4 isn't muddied by the None default
+            use_smem_v=False,  # pin off so ws/ws4/ws4_smemv each isolate ONE knob
         )
 
     def setup_ws():
@@ -168,6 +171,10 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
     # (fused steps 1+2 & 4+5, double accumulators, packed F32x2 FMA on SM100).
     # use_packed_fma=None auto-detects SM100. Only valid when (tile_v//4)%4==0;
     # run_config gates the call on that, so small-tile_v configs skip ws4.
+    # use_smem_v PINNED False: ws4 is the no-smem_v ilp=4 leg so ws4_smemv/ws4
+    # isolates the use_smem_v win. Without the pin, an unset use_smem_v defaults
+    # to None -> the heuristic turns smem_v ON at large batch (work_units>1024,
+    # tile_v=64), which would make ws4 identical to ws4_smemv there.
     state_ws4 = state_init.clone()
 
     def call_ws4():
@@ -185,6 +192,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
             use_qk_l2norm_in_kernel=True,
             tile_v=tile_v,
             ilp_rows=4,
+            use_smem_v=False,  # see comment above: pin off so ws4_smemv/ws4 is clean
         )
 
     def setup_ws4():
