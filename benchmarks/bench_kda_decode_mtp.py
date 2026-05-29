@@ -18,15 +18,19 @@ bench_kda_decode_mtp.py — P3.0 baseline + Route1-vs-Route2 harness for KDA MTP
 
 Compares routes that compute the SAME T-token recurrence:
   1. looped : T sequential single-token kda_decode launches (state carried over).
-  2. fused  : a single kda_decode_mtp launch over T tokens     [Route 2: cuLA SMEM-state].
-  3. ws     : a single kda_decode_mtp_ws launch over T tokens  [Route 1: FlashInfer warp-spec].
+  2. fused  : a single kda_decode_mtp launch over T tokens       [Route 2: cuLA SMEM-state].
+  3. ws     : a single kda_decode_mtp_ws launch, ilp=2           [Route 1: FlashInfer warp-spec].
+  4. ws4    : the same warp-spec kernel, ilp=4 (fused steps 1+2 & 4+5, double
+              accumulators, packed F32x2 FMA on SM100). Skipped (n/a) when the
+              selected tile_v gives (tile_v//4) not divisible by 4.
 
 Reports per (N, T): wall time, tokens/s (= N*T / time), the tile_v the
-work_units=N*HV heuristic picked, fused/ws speedups vs looped, and the
-**ws-vs-fused** head-to-head ratio (the Route1-vs-Route2 judge). Also cross-checks
-each fused/ws output/state against the looped route (rel error) as a sanity gate.
+work_units=N*HV heuristic picked, speedups vs looped, the **ws-vs-fused**
+head-to-head (Route1-vs-Route2 judge) AND the **ws4-vs-ws** head-to-head (the
+ilp=4-vs-ilp=2 win). Also cross-checks each route's output/state against the
+looped route (rel error) as a sanity gate.
 
-Pass --routes to restrict which of {loop,fused,ws} run (default: all three).
+Pass --routes to restrict which of {loop,fused,ws,ws4} run (default: all four).
 
 A bit-for-bit determinism check (--determinism) re-runs the fused kernel many
 times from the same initial state and compares output + final state exactly, to
@@ -142,6 +146,32 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
     def setup_ws():
         state_ws.copy_(state_init)
 
+    # --- ws4 route (Route 1, ilp=4): same warp-spec kernel, 4-row ILP path ---
+    # (fused steps 1+2 & 4+5, double accumulators, packed F32x2 FMA on SM100).
+    # use_packed_fma=None auto-detects SM100. Only valid when (tile_v//4)%4==0;
+    # run_config gates the call on that, so small-tile_v configs skip ws4.
+    state_ws4 = state_init.clone()
+
+    def call_ws4():
+        return kda_decode_mtp_ws(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=state_ws4,
+            initial_state_indices=indices,
+            scale=scale,
+            use_qk_l2norm_in_kernel=True,
+            tile_v=tile_v,
+            ilp_rows=4,
+        )
+
+    def setup_ws4():
+        state_ws4.copy_(state_init)
+
     # --- looped route: T single-token launches, state carried in-place ---
     # Pre-slice per-token tensors once (outside the timed loop) so only the T
     # kernel launches are counted.
@@ -180,10 +210,13 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
         "setup_fused": setup_fused,
         "call_ws": call_ws,
         "setup_ws": setup_ws,
+        "call_ws4": call_ws4,
+        "setup_ws4": setup_ws4,
         "call_loop": call_loop,
         "setup_loop": setup_loop,
         "state_fused": state_fused,
         "state_ws": state_ws,
+        "state_ws4": state_ws4,
         "state_loop": state_loop,
         "state_init": state_init,
     }
@@ -201,8 +234,15 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
 
     routes = _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v_override)
 
+    # ws4 (ilp=4) is only valid when each warp's rows_per_group=tile_v/4 is a
+    # multiple of 4; skip it (n/a) on small tile_v rather than asserting.
+    ws4_ok = (tile_v // 4) % 4 == 0
+    # Routes actually run this config, in display order. Drop ws4 when invalid.
+    active = [r for r in ("loop", "fused", "ws", "ws4") if r in route_set and (r != "ws4" or ws4_ok)]
+    corr_routes = [r for r in active if r != "loop"]
+
     # Correctness reference = looped single-token route (always run once, fresh
-    # state). Each fused/ws route is cross-checked against it (rel error).
+    # state). Each fused/ws/ws4 route is cross-checked against it (rel error).
     nan2 = (float("nan"), float("nan"))
     corr = {}  # route name -> (out_rel_max, state_rel_max)
     with torch.no_grad():
@@ -210,24 +250,22 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
         o_loop = routes["call_loop"]().clone()
         state_loop_final = routes["state_loop"].clone()
 
-        for name in ("fused", "ws"):
-            if name in route_set:
-                routes[f"setup_{name}"]()
-                o_r = routes[f"call_{name}"]().clone()
-                st_r = routes[f"state_{name}"].clone()
-                _, out_rel_max = relative_rms_error_rel_max(o_loop, o_r)
-                _, state_rel_max = relative_rms_error_rel_max(state_loop_final, st_r)
-                corr[name] = (out_rel_max, state_rel_max)
+        for name in corr_routes:
+            routes[f"setup_{name}"]()
+            o_r = routes[f"call_{name}"]().clone()
+            st_r = routes[f"state_{name}"].clone()
+            _, out_rel_max = relative_rms_error_rel_max(o_loop, o_r)
+            _, state_rel_max = relative_rms_error_rel_max(state_loop_final, st_r)
+            corr[name] = (out_rel_max, state_rel_max)
 
     w, r = (1, 1) if ncu_mode else (warmup, rep)
 
     times = {}
     with torch.no_grad():
-        for name in ("loop", "fused", "ws"):
-            if name in route_set:
-                times[name] = benchmark_cuda_fn(
-                    routes[f"call_{name}"], setup_fn=routes[f"setup_{name}"], warmup=w, rep=r
-                )
+        for name in active:
+            times[name] = benchmark_cuda_fn(
+                routes[f"call_{name}"], setup_fn=routes[f"setup_{name}"], warmup=w, rep=r
+            )
 
     tokens = N * T
 
@@ -238,27 +276,39 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
         tl = times.get("loop")
         return (tl / t) if (tl is not None and t is not None and t > 0) else float("nan")
 
-    t_fused, t_ws = times.get("fused"), times.get("ws")
+    def ratio(t_num, t_den):
+        return (t_num / t_den) if (t_num and t_den and t_den > 0) else float("nan")
+
+    t_fused, t_ws, t_ws4 = times.get("fused"), times.get("ws"), times.get("ws4")
     return {
         "N": N,
         "T": T,
         "H": H,
         "HV": HV,
         "tile_v": tile_v,
+        "ws4_ok": ws4_ok,
         "t_loop_ms": times.get("loop"),
         "t_fused_ms": t_fused,
         "t_ws_ms": t_ws,
+        "t_ws4_ms": t_ws4,
         "loop_mtok_s": mtok(times.get("loop")),
         "fused_mtok_s": mtok(t_fused),
         "ws_mtok_s": mtok(t_ws),
+        "ws4_mtok_s": mtok(t_ws4),
         "fused_speedup": speedup_vs_loop(t_fused),  # vs looped
         "ws_speedup": speedup_vs_loop(t_ws),  # vs looped
+        "ws4_speedup": speedup_vs_loop(t_ws4),  # vs looped
         # Head-to-head Route1-vs-Route2: >1 means ws (Route 1) beats fused (Route 2).
-        "ws_vs_fused": (t_fused / t_ws) if (t_fused and t_ws and t_ws > 0) else float("nan"),
+        "ws_vs_fused": ratio(t_fused, t_ws),
+        # ilp=4 vs ilp=2 (the TaskList #6 "biggest win" measure): >1 -> ilp=4 faster.
+        "ws4_vs_ws": ratio(t_ws, t_ws4),
+        "ws4_vs_fused": ratio(t_fused, t_ws4),
         "fused_out_rel_max": corr.get("fused", nan2)[0],
         "fused_state_rel_max": corr.get("fused", nan2)[1],
         "ws_out_rel_max": corr.get("ws", nan2)[0],
         "ws_state_rel_max": corr.get("ws", nan2)[1],
+        "ws4_out_rel_max": corr.get("ws4", nan2)[0],
+        "ws4_state_rel_max": corr.get("ws4", nan2)[1],
     }
 
 
@@ -271,6 +321,12 @@ def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route):
 
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V, device)
     tile_v = tile_v_override if tile_v_override is not None else _select_mtp_tile_v(N, HV, V, T)
+
+    # ws4 (ilp=4) requires (tile_v//4)%4==0; skip (not fail) where it doesn't hold.
+    if route == "ws4" and (tile_v // 4) % 4 != 0:
+        return {"N": N, "T": T, "tile_v": tile_v, "iters": 0, "route": route,
+                "passed": True, "first_bad": -1, "skipped": True}
+
     routes = _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v_override)
 
     call = routes[f"call_{route}"]
@@ -299,6 +355,7 @@ def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route):
         "route": route,
         "passed": first_bad < 0,
         "first_bad": first_bad,
+        "skipped": False,
     }
 
 
@@ -333,15 +390,18 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append("")
     lines.append(
         f"> Setting: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}; routes={args.routes}. "
-        "fused = kda_decode_mtp (Route 2, cuLA SMEM-state); ws = kda_decode_mtp_ws "
-        "(Route 1, FlashInfer warp-spec); looped = T× single-token kda_decode."
+        "fused = kda_decode_mtp (Route 2, cuLA SMEM-state); ws = kda_decode_mtp_ws ilp=2 "
+        "(Route 1, FlashInfer warp-spec); ws4 = kda_decode_mtp_ws ilp=4 (fused steps + packed FMA, "
+        "n/a where tile_v//4 not %4); looped = T× single-token kda_decode."
     )
     lines.append("")
     lines.append("## Summary")
     lines.append("")
     lines.append(f"- fused-vs-looped speedup: {summary([r['fused_speedup'] for r in results])}")
     lines.append(f"- ws-vs-looped speedup:    {summary([r['ws_speedup'] for r in results])}")
+    lines.append(f"- ws4-vs-looped speedup:   {summary([r['ws4_speedup'] for r in results])}")
     lines.append(f"- **ws-vs-fused (Route1/Route2): {summary([r['ws_vs_fused'] for r in results])}**  (>1 → Route 1 wins)")
+    lines.append(f"- **ws4-vs-ws (ilp4/ilp2): {summary([r['ws4_vs_ws'] for r in results])}**  (>1 → ilp=4 wins)")
     lines.append(f"- Batch sizes (N): {args.batch_sizes}")
     lines.append(f"- T values: {args.Ts}")
     lines.append(f"- tile_v: {'heuristic (work_units=N*HV)' if args.tile_v is None else args.tile_v}")
@@ -349,14 +409,15 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append("")
     lines.append("## Performance")
     lines.append("")
-    lines.append("| N | T | tile_v | loop ms | fused ms | ws ms | fused Mtok/s | ws Mtok/s | fused/loop | ws/loop | ws/fused | ws out rmax | ws state rmax |")
-    lines.append("|--:|--:|-------:|--------:|---------:|------:|-------------:|----------:|-----------:|--------:|---------:|------------:|--------------:|")
+    lines.append("| N | T | tile_v | loop ms | fused ms | ws ms | ws4 ms | fused/loop | ws/loop | ws4/loop | ws/fused | ws4/ws | ws out rmax | ws4 out rmax |")
+    lines.append("|--:|--:|-------:|--------:|---------:|------:|-------:|-----------:|--------:|---------:|---------:|-------:|------------:|-------------:|")
     for r in results:
         lines.append(
             f"| {r['N']} | {r['T']} | {r['tile_v']} | {_fmt(r['t_loop_ms'], '.4f')} | {_fmt(r['t_fused_ms'], '.4f')} | "
-            f"{_fmt(r['t_ws_ms'], '.4f')} | {_fmt(r['fused_mtok_s'], '.2f')} | {_fmt(r['ws_mtok_s'], '.2f')} | "
-            f"{_fmt(r['fused_speedup'], '.2f')}x | {_fmt(r['ws_speedup'], '.2f')}x | **{_fmt(r['ws_vs_fused'], '.2f')}x** | "
-            f"{_fmt(r['ws_out_rel_max'], '.2e')} | {_fmt(r['ws_state_rel_max'], '.2e')} |"
+            f"{_fmt(r['t_ws_ms'], '.4f')} | {_fmt(r['t_ws4_ms'], '.4f')} | "
+            f"{_fmt(r['fused_speedup'], '.2f')}x | {_fmt(r['ws_speedup'], '.2f')}x | {_fmt(r['ws4_speedup'], '.2f')}x | "
+            f"**{_fmt(r['ws_vs_fused'], '.2f')}x** | **{_fmt(r['ws4_vs_ws'], '.2f')}x** | "
+            f"{_fmt(r['ws_out_rel_max'], '.2e')} | {_fmt(r['ws4_out_rel_max'], '.2e')} |"
         )
     lines.append("")
     lines.append("## Reproduce")
@@ -386,9 +447,10 @@ def build_parser():
     parser.add_argument(
         "--routes",
         nargs="+",
-        choices=["loop", "fused", "ws"],
-        default=["loop", "fused", "ws"],
-        help="Which routes to run/time. loop=T× single-token, fused=kda_decode_mtp (Route 2), ws=kda_decode_mtp_ws (Route 1).",
+        choices=["loop", "fused", "ws", "ws4"],
+        default=["loop", "fused", "ws", "ws4"],
+        help="Which routes to run/time. loop=T× single-token, fused=kda_decode_mtp (Route 2), "
+        "ws=kda_decode_mtp_ws ilp=2 (Route 1), ws4=kda_decode_mtp_ws ilp=4 (skipped when tile_v//4 not %4).",
     )
     parser.add_argument("--determinism", action="store_true", help="Run bit-for-bit determinism check instead of timing")
     parser.add_argument("--det-iters", type=int, default=10000, help="Determinism check repetitions per config")
@@ -417,9 +479,9 @@ def main(argv=None):
     print()
 
     if args.determinism:
-        det_routes = [r for r in args.routes if r in ("fused", "ws")]
+        det_routes = [r for r in args.routes if r in ("fused", "ws", "ws4")]
         if not det_routes:
-            print("No state-writeback route selected (--routes must include fused and/or ws for --determinism).")
+            print("No state-writeback route selected (--routes must include fused, ws, and/or ws4 for --determinism).")
             return True
         hdr = f"{'route':>6} | {'N':>5} | {'T':>3} | {'tile_v':>6} | {'iters':>8} | {'result':>8}"
         print(hdr)
@@ -429,7 +491,12 @@ def main(argv=None):
             for T in args.Ts:
                 for N in args.batch_sizes:
                     res = run_determinism(N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.det_iters, route)
-                    tag = "PASS" if res["passed"] else f"FAIL@{res['first_bad']}"
+                    if res.get("skipped"):
+                        tag = "SKIP"
+                    elif res["passed"]:
+                        tag = "PASS"
+                    else:
+                        tag = f"FAIL@{res['first_bad']}"
                     all_ok = all_ok and res["passed"]
                     print(f"{res['route']:>6} | {res['N']:5d} | {res['T']:3d} | {res['tile_v']:6d} | {res['iters']:8d} | {tag:>8}")
         print()
@@ -437,8 +504,8 @@ def main(argv=None):
         return all_ok
 
     hdr = (
-        f"{'N':>5} | {'T':>3} | {'tile_v':>6} | {'loop ms':>9} | {'fused ms':>9} | {'ws ms':>9} | "
-        f"{'fused Mt/s':>11} | {'ws Mt/s':>11} | {'ws/loop':>8} | {'ws/fused':>9} | {'ws out rmax':>11} | {'ws st rmax':>11}"
+        f"{'N':>5} | {'T':>3} | {'tile_v':>6} | {'loop ms':>9} | {'fused ms':>9} | {'ws ms':>9} | {'ws4 ms':>9} | "
+        f"{'ws/fused':>8} | {'ws4/ws':>7} | {'ws4/loop':>8} | {'ws4 out rmax':>12} | {'ws4 st rmax':>11}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -450,10 +517,10 @@ def main(argv=None):
             results.append(res)
             print(
                 f"{res['N']:5d} | {res['T']:3d} | {res['tile_v']:6d} | "
-                f"{_fmt(res['t_loop_ms'], '.4f'):>9} | {_fmt(res['t_fused_ms'], '.4f'):>9} | {_fmt(res['t_ws_ms'], '.4f'):>9} | "
-                f"{_fmt(res['fused_mtok_s'], '.2f'):>11} | {_fmt(res['ws_mtok_s'], '.2f'):>11} | "
-                f"{_fmt(res['ws_speedup'], '.2f'):>7}x | {_fmt(res['ws_vs_fused'], '.2f'):>8}x | "
-                f"{_fmt(res['ws_out_rel_max'], '.2e'):>11} | {_fmt(res['ws_state_rel_max'], '.2e'):>11}"
+                f"{_fmt(res['t_loop_ms'], '.4f'):>9} | {_fmt(res['t_fused_ms'], '.4f'):>9} | "
+                f"{_fmt(res['t_ws_ms'], '.4f'):>9} | {_fmt(res['t_ws4_ms'], '.4f'):>9} | "
+                f"{_fmt(res['ws_vs_fused'], '.2f'):>7}x | {_fmt(res['ws4_vs_ws'], '.2f'):>6}x | {_fmt(res['ws4_speedup'], '.2f'):>7}x | "
+                f"{_fmt(res['ws4_out_rel_max'], '.2e'):>12} | {_fmt(res['ws4_state_rel_max'], '.2e'):>11}"
             )
     print()
 
