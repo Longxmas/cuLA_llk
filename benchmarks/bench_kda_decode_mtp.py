@@ -93,6 +93,7 @@ Usage:
     python benchmarks/bench_kda_decode_mtp.py --sweep-config                  # full KDA config sweep
     python benchmarks/bench_kda_decode_mtp.py --sweep-config --sweep-hvs 64 --sweep-ns 64 256 --sweep-ts 2 4
     python benchmarks/bench_kda_decode_mtp.py --knob-sweep --batch-sizes 1 2 64 256 --Ts 2 4   # opt_level + fast_math, separately
+    python benchmarks/bench_kda_decode_mtp.py --prod-defaults                  # ws/inline (opt3+fast_math) vs loop, shipped config
     python benchmarks/bench_kda_decode_mtp.py --opt-level 3                    # pin opt_level 3 for the main table
     python benchmarks/bench_kda_decode_mtp.py --fast-math --routes loop ws4 inline4            # pin fast_math on
     python benchmarks/bench_kda_decode_mtp.py --output
@@ -153,10 +154,25 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
     ws/ws4/ws4_smemv/ws_auto + inline/inline4; ``fast_math`` to the ws/inline
     routes only (loop = kda_decode stays no-fastmath; fused = Route-2 is out of
     scope and unchanged). Defaults (1, False) reproduce the validated build.
+
+    Either knob may be ``None`` => omit it from the call so the wrapper's OWN
+    default applies. With both None (the bench ``--prod-defaults`` mode) every
+    route runs at its SHIPPED production config: loop = kda_decode opt-1/no
+    fast_math, ws/inline = opt-3 + fast_math — so the vs-loop columns are a true
+    production-vs-production comparison (a single global opt_level/fast_math
+    cannot express loop@opt1 + ws/inline@opt3 at once).
     """
     N, T = q.shape[0], q.shape[1]
     device = q.device
     indices = torch.arange(N, device=device, dtype=torch.int32)
+
+    # Knob kwargs per route family; None => omit (wrapper default = production).
+    loop_kw = {} if opt_level is None else {"opt_level": opt_level}
+    mtp_kw = {}
+    if opt_level is not None:
+        mtp_kw["opt_level"] = opt_level
+    if fast_math is not None:
+        mtp_kw["fast_math"] = fast_math
 
     state_init = state.clone().contiguous()  # (N, HV, V, K)
 
@@ -201,8 +217,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=2,  # pin ilp=2 so ws-vs-ws4 isn't muddied by the None default
             use_smem_v=False,  # pin off so ws/ws4/ws4_smemv each isolate ONE knob
-            opt_level=opt_level,
-            fast_math=fast_math,
+            **mtp_kw,
         )
 
     def setup_ws():
@@ -234,8 +249,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=4,
             use_smem_v=False,  # see comment above: pin off so ws4_smemv/ws4 is clean
-            opt_level=opt_level,
-            fast_math=fast_math,
+            **mtp_kw,
         )
 
     def setup_ws4():
@@ -264,8 +278,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=4,
             use_smem_v=True,
-            opt_level=opt_level,
-            fast_math=fast_math,
+            **mtp_kw,
         )
 
     def setup_ws4_smemv():
@@ -292,8 +305,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             use_qk_l2norm_in_kernel=True,
             tile_v=tile_v,  # None in heuristic mode -> kernel auto-selects tile_v
             ilp_rows=None,  # heuristic picks ilp (the whole point of this route)
-            opt_level=opt_level,
-            fast_math=fast_math,
+            **mtp_kw,
         )
 
     def setup_ws_auto():
@@ -323,8 +335,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=2,
             use_smem_v=False,
-            opt_level=opt_level,
-            fast_math=fast_math,
+            **mtp_kw,
         )
 
     def setup_inline():
@@ -351,8 +362,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=4,
             use_smem_v=False,
-            opt_level=opt_level,
-            fast_math=fast_math,
+            **mtp_kw,
         )
 
     def setup_inline4():
@@ -384,7 +394,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
                 initial_state_indices=indices,
                 scale=scale,
                 use_qk_l2norm_in_kernel=True,
-                opt_level=opt_level,  # loop = single-token kda_decode; no fast_math (stays no-fastmath)
+                **loop_kw,  # loop = single-token kda_decode; no fast_math (stays no-fastmath)
             )
             o_loop[:, t] = o_t.squeeze(1)
         return o_loop
@@ -1457,7 +1467,15 @@ def build_parser():
         "--fast-math", action="store_true",
         help="Enable fastmath= on the ws/inline transcendentals (exp/log/rsqrt). "
              "kda_decode (loop) stays no-fastmath. Default off. Applies to the main "
-             "+ --determinism modes.",
+             "+ --determinism modes. Ignored under --prod-defaults.",
+    )
+    parser.add_argument(
+        "--prod-defaults", action="store_true",
+        help="Run every route at its SHIPPED wrapper default instead of a global "
+             "pin: loop=kda_decode (opt-1, no fast_math), ws/inline=opt-3 + "
+             "fast_math. Use this for the true production-vs-loop comparison (a "
+             "single --opt-level/--fast-math can't be opt1 for loop AND opt3 for "
+             "ws/inline at once). Overrides --opt-level/--fast-math.",
     )
     parser.add_argument(
         "--knob-sweep", action="store_true",
@@ -1496,10 +1514,17 @@ def main(argv=None):
         run_knob_sweep(args, gpu_name)
         return True
 
+    # --prod-defaults => omit the knobs (None) so each route uses its wrapper
+    # default = shipped production config (loop opt1/no-fastmath, ws/inline opt3+fm).
+    eff_opt_level = None if args.prod_defaults else args.opt_level
+    eff_fast_math = None if args.prod_defaults else args.fast_math
+    knob_banner = ("per-route production defaults (loop=opt1/no-fastmath, "
+                   "ws/inline=opt3+fast_math)" if args.prod_defaults
+                   else f"opt_level={args.opt_level}, fast_math={'on' if args.fast_math else 'off'}")
     print(f"GPU: {gpu_name}")
     print(f"Config: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}, "
           f"tile_v={'heuristic' if args.tile_v is None else args.tile_v}, routes={args.routes}, "
-          f"opt_level={args.opt_level}, fast_math={'on' if args.fast_math else 'off'}")
+          f"{knob_banner}")
     print()
 
     if args.determinism:
@@ -1515,7 +1540,7 @@ def main(argv=None):
             for T in args.Ts:
                 for N in args.batch_sizes:
                     res = run_determinism(N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.det_iters, route,
-                                          opt_level=args.opt_level, fast_math=args.fast_math)
+                                          opt_level=eff_opt_level, fast_math=eff_fast_math)
                     if res.get("skipped"):
                         tag = "SKIP"
                     elif res["passed"]:
@@ -1600,7 +1625,7 @@ def main(argv=None):
     for T in args.Ts:
         for N in args.batch_sizes:
             res = run_config(N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.warmup, args.rep, args.ncu, route_set,
-                             opt_level=args.opt_level, fast_math=args.fast_math)
+                             opt_level=eff_opt_level, fast_math=eff_fast_math)
             results.append(res)
             row = [f"{res['N']:5d}", f"{res['T']:3d}", f"{res['tile_v']:6d}", f"{res['sel_ilp']:7d}"]
             row += [f"{_fmt(res[tk], '.4f'):>10}" for (_, tk, _, _) in sel_cols]
