@@ -135,6 +135,7 @@ def kda_verify_kernel_mtp_ws(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
 ):
     """Warp-specialized KDA MTP kernel. One CTA owns one (i_n, i_hv, i_v) tile.
 
@@ -174,8 +175,11 @@ def kda_verify_kernel_mtp_ws(
 
     # A_log/dt_bias don't vary with token. exp(A_log) is per-head and (for KDA)
     # shared across all K channels, so hoist it out of the per-channel/token loop.
+    # ``fast_math`` (constexpr) threads to every transcendental's ``fastmath=``:
+    # False (default) reproduces the no-fastmath port; True is the FlashInfer-style
+    # fast intrinsic (issue 17 compile-knob tuning).
     r_A_log = cutlass.Float32(A_log[i_hv])
-    r_exp_A = cute.exp(r_A_log)
+    r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
 
     # SMEM broadcast buffers (warp 0 -> all warps). sG is [T, K] (per-channel),
     # unlike GDN's scalar [T]; staged exactly like sK. +8 K-padding keeps each
@@ -258,8 +262,8 @@ def kda_verify_kernel_mtp_ws(
                         sum_k += cute.arch.shuffle_sync_bfly(
                             sum_k, offset=offset, mask=-1, mask_and_clamp=31
                         )
-                    inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6) * scale
-                    inv_norm_k = cute.rsqrt(sum_k + 1e-6)
+                    inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+                    inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
                     for i in cutlass.range_constexpr(vec_size):
                         r_q[i] = r_q[i] * inv_norm_q_scaled
                         r_k[i] = r_k[i] * inv_norm_k
@@ -280,9 +284,9 @@ def kda_verify_kernel_mtp_ws(
                         dt_bias[i_hv, kk]
                     )
                     beta_x = softplus_beta * x
-                    exp_beta_x = cute.exp(beta_x)
+                    exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
                     softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + exp_beta_x
+                        cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
                     )
                     use_softplus = (
                         cutlass.Float32(1.0)
@@ -293,12 +297,12 @@ def kda_verify_kernel_mtp_ws(
                         use_softplus * softplus_val
                         + (cutlass.Float32(1.0) - use_softplus) * x
                     )
-                    sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x)
+                    sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
 
                 # Update gate beta is a per-(head, token) scalar (warp-uniform).
                 r_b = cutlass.Float32(b[i_n, i_t, i_hv])
                 r_beta = cutlass.Float32(1.0) / (
-                    cutlass.Float32(1.0) + cute.exp(-r_b)
+                    cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
                 )
                 sBeta[i_t] = r_beta
 
@@ -887,6 +891,7 @@ def run_kda_verify_kernel_mtp_ws(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Host-side launcher: grid = N * HV * num_v_tiles, block = 128 (4 warps)."""
@@ -943,6 +948,7 @@ def run_kda_verify_kernel_mtp_ws(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        fast_math,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -969,8 +975,17 @@ def _get_compiled_mtp_ws_kernel(
     use_packed_fma,
     use_smem_v,
     cache_intermediate_states,
+    opt_level=1,
+    fast_math=False,
 ):
-    """Get or lazily compile the warp-spec MTP kernel for one shape/config."""
+    """Get or lazily compile the warp-spec MTP kernel for one shape/config.
+
+    ``opt_level`` (CuTe DSL ``--opt-level``, NOT a kernel constexpr) and
+    ``fast_math`` (a kernel constexpr threading ``fastmath=`` onto the
+    transcendentals) are both part of the cache key so the same shape can be
+    compiled at distinct compile-knob settings without colliding. Defaults
+    (1, False) preserve the historical no-fastmath / opt-level-1 build.
+    """
     key = (
         N,
         T,
@@ -989,6 +1004,8 @@ def _get_compiled_mtp_ws_kernel(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        opt_level,
+        fast_math,
     )
     if key in _compiled_mtp_ws_kernels:
         return _compiled_mtp_ws_kernels[key]
@@ -1058,8 +1075,9 @@ def _get_compiled_mtp_ws_kernel(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        fast_math=fast_math,
         stream=stream,
-        options="--enable-tvm-ffi --opt-level 1",
+        options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
 
     _compiled_mtp_ws_kernels[key] = compiled_kernel
@@ -1094,6 +1112,8 @@ def kda_decode_mtp_ws(
     use_packed_fma: bool | None = None,
     use_smem_v: bool | None = None,
     intermediate_states_buffer: torch.Tensor | None = None,
+    opt_level: int = 3,
+    fast_math: bool = True,
 ) -> torch.Tensor:
     """KDA MTP decode — warp-specialized variant (Route 1).
 
@@ -1134,6 +1154,17 @@ def kda_decode_mtp_ws(
     snapshots are taken. Produce-only — cuLA does NOT implement the rollback;
     the caller owns the buffer and the rollback policy. The return value is
     always just ``o`` (the buffer is filled in place).
+
+    ``opt_level`` selects the CuTe DSL ``--opt-level`` (codegen optimization,
+    not a kernel constexpr) and ``fast_math`` toggles ``fastmath=`` on the
+    kernel's exp/log/rsqrt. Both are part of the compile cache key (a new setting
+    triggers a fresh JIT) and are independent. Defaults are the B200-tuned config
+    (issue 17 knob sweep): ``opt_level=3`` (small consistent edge on this kernel,
+    no precision/determinism regression) and ``fast_math=True`` (the warp-spec
+    kernel stages g once so the gain is small but free). Pass ``opt_level=1`` /
+    ``fast_math=False`` to reproduce the original no-fastmath / opt-1 build. NOTE
+    the single-token ``kda_decode`` keeps ``opt_level=1`` (opt-3 regressed it at
+    large N) and has no ``fast_math``.
 
     Constraints: ``state_layout='vk'`` only; ``ilp_rows in {2, 4}``.
     """
@@ -1288,6 +1319,8 @@ def kda_decode_mtp_ws(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        opt_level=opt_level,
+        fast_math=fast_math,
     )
 
     compiled_kernel(
@@ -1341,8 +1374,10 @@ def kda_decode_mtp_ws(
 # becomes ``r_h[row,i] *= r_g_arr[i_t, i]``. beta stays a scalar array. The inline
 # ilp=4 path uses plain scalar FMA (no packed-FMA / double-accumulator — matches
 # FlashInfer); ``use_packed_fma`` is accepted for launcher/signature parity but
-# unused in the body. All transcendentals drop ``fastmath`` to match the warp-spec
-# kernel / ``kda_decode.py`` (keeps the inline g/softplus bit-comparable to ws).
+# unused in the body. All transcendentals take the same ``fast_math`` constexpr as
+# the warp-spec kernel: default False reproduces the no-fastmath port (g/softplus
+# bit-comparable to ws / ``kda_decode.py``); True enables the FlashInfer-style fast
+# intrinsics (issue 17 compile-knob tuning).
 # ============================================================================
 
 
@@ -1376,6 +1411,7 @@ def kda_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],  # signature parity; unused (scalar FMA)
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
 ):
     """Inline KDA MTP kernel. One CTA owns one (i_n, i_hv, i_v) tile.
 
@@ -1412,7 +1448,7 @@ def kda_verify_kernel_mtp_inline(
 
     # exp(A_log) is per-head, shared across all K channels (KDA), hoisted once.
     r_A_log = cutlass.Float32(A_log[i_hv])
-    r_exp_A = cute.exp(r_A_log)
+    r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
 
     # Inline: NO sQ/sK/sG/sBeta. Only sVdata/sOutput, and only under use_smem_v
     # (allocated conditionally so the off-path footprint is just alignment slack).
@@ -1470,7 +1506,7 @@ def kda_verify_kernel_mtp_inline(
         for i_t in cutlass.range_constexpr(T):
             r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
             r_beta_arr[i_t] = cutlass.Float32(1.0) / (
-                cutlass.Float32(1.0) + cute.exp(-r_b_val)
+                cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=fast_math)
             )
             for i in cutlass.range_constexpr(vec_size):
                 kk = k_start + i
@@ -1478,9 +1514,9 @@ def kda_verify_kernel_mtp_inline(
                     dt_bias[i_hv, kk]
                 )
                 beta_x = softplus_beta * x
-                exp_beta_x = cute.exp(beta_x)
+                exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
                 softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x
+                    cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
                 )
                 use_softplus = (
                     cutlass.Float32(1.0)
@@ -1491,7 +1527,7 @@ def kda_verify_kernel_mtp_inline(
                     use_softplus * softplus_val
                     + (cutlass.Float32(1.0) - use_softplus) * x
                 )
-                r_g_arr[(i_t, i)] = cute.exp(-r_exp_A * softplus_x)
+                r_g_arr[(i_t, i)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
 
         # ============ Recurrence: ilp_rows == 4 (process 4 V-rows together) ===
         # Plain scalar FMA + deferred L2 norm + register-pipelined q/k. KDA change:
@@ -1578,7 +1614,7 @@ def kda_verify_kernel_mtp_inline(
                                 sum_sq_k += cute.arch.shuffle_sync_bfly(
                                     sum_sq_k, offset=offset, mask=-1, mask_and_clamp=31
                                 )
-                            inv_norm_k = cute.rsqrt(sum_sq_k + 1e-6)
+                            inv_norm_k = cute.rsqrt(sum_sq_k + 1e-6, fastmath=fast_math)
                             sum_hk_a = sum_hk_a * inv_norm_k
                             sum_hk_b = sum_hk_b * inv_norm_k
                             sum_hk_c = sum_hk_c * inv_norm_k
@@ -1688,7 +1724,7 @@ def kda_verify_kernel_mtp_inline(
                                 sum_sq_q += cute.arch.shuffle_sync_bfly(
                                     sum_sq_q, offset=offset, mask=-1, mask_and_clamp=31
                                 )
-                            inv_norm_q_scaled = cute.rsqrt(sum_sq_q + 1e-6) * scale
+                            inv_norm_q_scaled = cute.rsqrt(sum_sq_q + 1e-6, fastmath=fast_math) * scale
                             sum_hq_a = sum_hq_a * inv_norm_q_scaled
                             sum_hq_b = sum_hq_b * inv_norm_q_scaled
                             sum_hq_c = sum_hq_c * inv_norm_q_scaled
@@ -1825,8 +1861,8 @@ def kda_verify_kernel_mtp_inline(
                                 sum_sq_k += cute.arch.shuffle_sync_bfly(
                                     sum_sq_k, offset=offset, mask=-1, mask_and_clamp=31
                                 )
-                            inv_nk_arr[i_t] = cute.rsqrt(sum_sq_k + 1e-6)
-                            inv_nq_arr[i_t] = cute.rsqrt(sum_sq_q + 1e-6) * scale
+                            inv_nk_arr[i_t] = cute.rsqrt(sum_sq_k + 1e-6, fastmath=fast_math)
+                            inv_nq_arr[i_t] = cute.rsqrt(sum_sq_q + 1e-6, fastmath=fast_math) * scale
                         else:
                             for i in cutlass.range_constexpr(vec_size):
                                 r_q_all[(i_t, i)] = r_q_all[(i_t, i)] * scale
@@ -1986,6 +2022,7 @@ def run_kda_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Host-side launcher (inline): grid = N * HV * num_v_tiles, block = 128."""
@@ -2032,6 +2069,7 @@ def run_kda_verify_kernel_mtp_inline(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        fast_math,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[NUM_THREADS, 1, 1],
@@ -2058,8 +2096,15 @@ def _get_compiled_mtp_inline_kernel(
     use_packed_fma,
     use_smem_v,
     cache_intermediate_states,
+    opt_level=1,
+    fast_math=False,
 ):
-    """Get or lazily compile the inline MTP kernel for one shape/config."""
+    """Get or lazily compile the inline MTP kernel for one shape/config.
+
+    ``opt_level`` (CuTe DSL ``--opt-level``) and ``fast_math`` (kernel constexpr
+    threading ``fastmath=`` onto the transcendentals) are part of the cache key.
+    Defaults (1, False) preserve the validated no-fastmath / opt-level-1 build.
+    """
     key = (
         N,
         T,
@@ -2078,6 +2123,8 @@ def _get_compiled_mtp_inline_kernel(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        opt_level,
+        fast_math,
     )
     if key in _compiled_mtp_inline_kernels:
         return _compiled_mtp_inline_kernels[key]
@@ -2142,8 +2189,9 @@ def _get_compiled_mtp_inline_kernel(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        fast_math=fast_math,
         stream=stream,
-        options="--enable-tvm-ffi --opt-level 1",
+        options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
 
     _compiled_mtp_inline_kernels[key] = compiled_kernel
@@ -2178,6 +2226,8 @@ def kda_decode_mtp_ws_inline(
     use_packed_fma: bool | None = None,
     use_smem_v: bool | None = None,
     intermediate_states_buffer: torch.Tensor | None = None,
+    opt_level: int = 3,
+    fast_math: bool = True,
 ) -> torch.Tensor:
     """KDA MTP decode — INLINE variant (Route 1, small-batch path).
 
@@ -2192,7 +2242,12 @@ def kda_decode_mtp_ws_inline(
 
     The inline ilp=4 path uses scalar FMA (no packed-FMA / double-accumulator), so
     ``use_packed_fma`` does not affect numerics here; it is accepted only to keep
-    the signature identical to the warp-spec entry point.
+    the signature identical to the warp-spec entry point. ``opt_level`` and
+    ``fast_math`` behave exactly as in :func:`kda_decode_mtp_ws` and default to
+    the same B200-tuned config (``opt_level=3``, ``fast_math=True``); fast_math
+    helps the inline kernel most (it recomputes g/beta per V-row, so faster
+    intrinsics save the most here). Pass ``opt_level=1`` / ``fast_math=False`` for
+    the original build.
     """
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -2317,6 +2372,8 @@ def kda_decode_mtp_ws_inline(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        opt_level=opt_level,
+        fast_math=fast_math,
     )
 
     compiled_kernel(

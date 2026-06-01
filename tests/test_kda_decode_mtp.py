@@ -148,7 +148,7 @@ def make_inputs_mtp(N, T, H, HV, K, V, device="cuda", seed=42):
     return q, k, v, a, b, A_log, dt_bias, state
 
 
-def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale):
+def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scale, opt_level=1):
     """
     MTP semantics via T sequential calls to the existing single-token
     ``kda_decode`` kernel (dense layout), carrying the state across tokens.
@@ -190,6 +190,7 @@ def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scal
             initial_state_indices=indices,
             scale=scale,
             use_qk_l2norm_in_kernel=True,
+            opt_level=opt_level,
         )
         o_all[:, t] = o_t.squeeze(1)  # (N, HV, V)
 
@@ -494,7 +495,7 @@ def test_kda_mtp_zero_state(T):
 # ===========================================================================
 def run_kda_decode_mtp_ws_dense(
     q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2,
-    use_packed_fma=None, use_smem_v=None,
+    use_packed_fma=None, use_smem_v=None, opt_level=1, fast_math=False,
 ):
     """Run the warp-specialized fused MTP kernel (kda_decode_mtp_ws), dense vk."""
     N = q.shape[0]
@@ -517,6 +518,8 @@ def run_kda_decode_mtp_ws_dense(
         ilp_rows=ilp_rows,
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
+        opt_level=opt_level,
+        fast_math=fast_math,
     )
     return o, state_source  # (N, T, HV, V), (N, HV, V, K)
 
@@ -1177,7 +1180,7 @@ def test_kda_decode_mtp_ws_intermediate_determinism(ilp_rows):
 # ===========================================================================
 def run_kda_decode_mtp_ws_inline_dense(
     q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2,
-    use_packed_fma=None, use_smem_v=None,
+    use_packed_fma=None, use_smem_v=None, opt_level=1, fast_math=False,
 ):
     """Run the inline fused MTP kernel (kda_decode_mtp_ws_inline), dense vk."""
     N = q.shape[0]
@@ -1200,6 +1203,8 @@ def run_kda_decode_mtp_ws_inline_dense(
         ilp_rows=ilp_rows,
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
+        opt_level=opt_level,
+        fast_math=fast_math,
     )
     return o, state_source  # (N, T, HV, V), (N, HV, V, K)
 
@@ -1524,6 +1529,173 @@ def test_kda_decode_mtp_ws_inline_matches_warp_spec(N, T, H, HV, tile_v, ilp_row
     # the differing bf16 accumulation order, comfortably under a 2e-2 band.
     _assert_close(f"{tag} output", o_ws.float(), o_inline.float(), atol=2e-2, rtol=2e-2)
     _assert_close(f"{tag} final state", state_ws, state_inline, atol=2e-2, rtol=2e-2)
+
+
+# ===========================================================================
+# Compile-knob tuning (issue 17): opt_level + fast_math
+#
+# Two compile-knobs are now exposed on the decode entry points, implemented in
+# ONE change but TESTED SEPARATELY (each test varies exactly one knob, the other
+# pinned at its default):
+#   - opt_level: CuTe DSL --opt-level (codegen optimization; NOT a kernel
+#     constexpr). On kda_decode (single-token / loop baseline), kda_decode_mtp_ws
+#     and kda_decode_mtp_ws_inline. Default 1 (the historical pin); 2/3 must
+#     stay correct (opt-level should not change the answer beyond FP reassoc).
+#   - fast_math: kernel constexpr threading fastmath= onto the ws/inline
+#     transcendentals (exp/log/rsqrt). Default False reproduces the validated
+#     no-fastmath port; True is the FlashInfer-style fast intrinsic. kda_decode
+#     (single-token) is intentionally NOT given fast_math (stays no-fastmath).
+# All gate on the SAME fp32 torch oracle at the standard 3e-2/2e-2 band: these
+# knobs are codegen/intrinsic choices, not algorithm changes, so accuracy must
+# hold. The default (opt_level=1, fast_math=False) path is already covered by
+# every other test in this file; these add the 2/3 and fast_math=True legs.
+# ===========================================================================
+@pytest.mark.parametrize("opt_level", [2, 3])
+def test_kda_decode_mtp_ws_opt_level(opt_level):
+    """ws kernel at --opt-level 2/3 stays correct vs the fp32 oracle (fast_math off)."""
+    N, T, H, HV, K, V = 16, 4, 16, 32, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, opt_level=opt_level, fast_math=False
+    )
+
+    _assert_close(f"ws opt_level={opt_level} output", o_ref, o_kernel.float())
+    _assert_close(f"ws opt_level={opt_level} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("ilp_rows", [2, 4])
+def test_kda_decode_mtp_ws_fast_math(ilp_rows):
+    """ws kernel with fast_math=True stays within the oracle band (opt_level fixed).
+
+    The fast intrinsics drift more than the default exp/log/rsqrt, but bf16 input
+    rounding dominates, so the 3e-2/2e-2 band still holds. tile_v=32 keeps ilp=4
+    legal so both ILP paths' transcendentals are exercised."""
+    N, T, H, HV, K, V = 16, 4, 16, 32, 128, 128
+    tile_v = 32
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
+        opt_level=1, fast_math=True,
+    )
+
+    _assert_close(f"ws fast_math ilp={ilp_rows} output", o_ref, o_kernel.float())
+    _assert_close(f"ws fast_math ilp={ilp_rows} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("opt_level", [2, 3])
+def test_kda_decode_mtp_ws_inline_opt_level(opt_level):
+    """inline kernel at --opt-level 2/3 stays correct vs the fp32 oracle (fast_math off)."""
+    N, T, H, HV, K, V = 2, 4, 16, 32, 128, 128  # small batch = inline's target
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, opt_level=opt_level, fast_math=False
+    )
+
+    _assert_close(f"inline opt_level={opt_level} output", o_ref, o_kernel.float())
+    _assert_close(f"inline opt_level={opt_level} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("ilp_rows", [2, 4])
+def test_kda_decode_mtp_ws_inline_fast_math(ilp_rows):
+    """inline kernel with fast_math=True stays within the oracle band (opt_level fixed)."""
+    N, T, H, HV, K, V = 2, 4, 16, 32, 128, 128
+    tile_v = 32
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
+        opt_level=1, fast_math=True,
+    )
+
+    _assert_close(f"inline fast_math ilp={ilp_rows} output", o_ref, o_kernel.float())
+    _assert_close(f"inline fast_math ilp={ilp_rows} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("opt_level", [2, 3])
+def test_kda_decode_single_token_opt_level(opt_level):
+    """Single-token kda_decode (the bench 'loop' baseline) at --opt-level 2/3 stays
+    correct vs the fp32 oracle. This is the 3rd kernel in the opt-level scope; it
+    has no fast_math knob (intentionally no-fastmath)."""
+    N, T, H, HV, K, V = 4, 2, 16, 32, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, opt_level=opt_level
+    )
+
+    _assert_close(f"single-token opt_level={opt_level} output", o_ref, o_loop.float())
+    _assert_close(f"single-token opt_level={opt_level} final state", state_ref, state_loop)
+
+
+# --- shipped production default (opt_level=3 + fast_math=True, B200-tuned) ----
+# The dense/tile_v/etc. tests drive the helpers, which pin the reference path
+# (opt_level=1, fast_math=False); these two exercise the actual default callers
+# get with NO knob args (both knobs at once), so the shipped config is covered.
+def test_kda_decode_mtp_ws_default_config():
+    """ws entry point with no knob args == production default (opt3 + fast_math)."""
+    N, T, H, HV, K, V = 16, 4, 16, 32, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o = kda_decode_mtp_ws(  # no opt_level / fast_math -> production default (3, True)
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+    )
+    _assert_close("ws default-config (opt3+fast_math) output", o_ref, o.float())
+    _assert_close("ws default-config (opt3+fast_math) final state", state_ref, state_source)
+
+
+def test_kda_decode_mtp_ws_inline_default_config():
+    """inline entry point with no knob args == production default (opt3 + fast_math)."""
+    N, T, H, HV, K, V = 2, 4, 16, 32, 128, 128  # small batch = inline's target
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o = kda_decode_mtp_ws_inline(  # no opt_level / fast_math -> production default (3, True)
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+    )
+    _assert_close("inline default-config (opt3+fast_math) output", o_ref, o.float())
+    _assert_close("inline default-config (opt3+fast_math) final state", state_ref, state_source)
 
 
 if __name__ == "__main__":
