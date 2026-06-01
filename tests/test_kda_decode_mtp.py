@@ -44,7 +44,12 @@ import torch.nn.functional as F
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling test import
 
-from cula.kda import kda_decode, kda_decode_mtp, kda_decode_mtp_ws
+from cula.kda import (
+    kda_decode,
+    kda_decode_mtp,
+    kda_decode_mtp_ws,
+    kda_decode_mtp_ws_inline,
+)
 from cula.ops.kda_decode_mtp import _select_mtp_config, _select_mtp_tile_v
 
 # Trusted single-token reference from the existing decode test. We cross-check
@@ -1155,6 +1160,370 @@ def test_kda_decode_mtp_ws_intermediate_determinism(ilp_rows):
         assert torch.equal(inter_i, inter_ref), f"snapshot non-deterministic at iter {i} (ilp={ilp_rows})"
         assert torch.equal(o_i, o_ref), f"output non-deterministic at iter {i} (ilp={ilp_rows})"
         assert torch.equal(st_i, st_ref), f"final state non-deterministic at iter {i} (ilp={ilp_rows})"
+
+
+# ===========================================================================
+# Route 1 inline variant: kda_decode_mtp_ws_inline
+#
+# Same contract as kda_decode_mtp_ws but the inline kernel (no warp-0 staging /
+# Phase-1 barrier, deferred L2 norm, register-resident q/k/g/beta — FlashInfer's
+# small-batch path, B*HV<=128). Same fp32 oracle gate. The ONLY KDA change is
+# again the per-channel decay; deferred-L2-norm and the register pipeline are
+# ported verbatim. ilp=4 here is scalar-FMA only (no packed-FMA/double-accum), so
+# use_packed_fma does not change numerics — but the dense test still sweeps it to
+# confirm the arg is inert and both values compile. A dedicated cross-check
+# asserts the inline and warp-spec kernels agree (both are exact ports of the
+# same math, differing only in accumulation order).
+# ===========================================================================
+def run_kda_decode_mtp_ws_inline_dense(
+    q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2,
+    use_packed_fma=None, use_smem_v=None,
+):
+    """Run the inline fused MTP kernel (kda_decode_mtp_ws_inline), dense vk."""
+    N = q.shape[0]
+    state_source = state.clone().contiguous()  # (N, HV, V, K), updated in-place
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+
+    o = kda_decode_mtp_ws_inline(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_source,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        tile_v=tile_v,
+        ilp_rows=ilp_rows,
+        use_packed_fma=use_packed_fma,
+        use_smem_v=use_smem_v,
+    )
+    return o, state_source  # (N, T, HV, V), (N, HV, V, K)
+
+
+@pytest.mark.parametrize("N", [1, 2, 4, 16])
+@pytest.mark.parametrize("T", [2, 4, 8])
+@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
+def test_kda_decode_mtp_ws_inline_kernel_dense(N, T, H, HV):
+    K, V = 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close("inline mtp kernel output", o_ref, o_kernel.float())
+    _assert_close("inline mtp kernel final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("tile_v", [8, 16, 32, 64])
+@pytest.mark.parametrize("T", [2, 4])
+def test_kda_decode_mtp_ws_inline_kernel_tile_v(tile_v, T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v
+    )
+
+    _assert_close(f"inline mtp tile_v={tile_v} output", o_ref, o_kernel.float())
+    _assert_close(f"inline mtp tile_v={tile_v} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("use_packed_fma", [False, True])
+@pytest.mark.parametrize("N,T,H,HV", [(1, 2, 8, 16), (2, 4, 8, 16), (4, 2, 16, 32)])
+def test_kda_decode_mtp_ws_inline_kernel_ilp4_dense(N, T, H, HV, use_packed_fma):
+    """Inline ilp=4 path (scalar FMA + deferred L2 norm). use_packed_fma is inert
+    here (no packed instruction in the inline body) so both values must give the
+    SAME result; sweeping it confirms the arg compiles and is ignored."""
+    K, V = 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=32, ilp_rows=4, use_packed_fma=use_packed_fma,
+    )
+
+    tag = f"inline ilp4 packed={use_packed_fma}"
+    _assert_close(f"{tag} output", o_ref, o_kernel.float())
+    _assert_close(f"{tag} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("tile_v", [16, 32, 64])
+@pytest.mark.parametrize("T", [2, 4])
+def test_kda_decode_mtp_ws_inline_kernel_ilp4_tile_v(tile_v, T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=4, use_packed_fma=False,
+    )
+
+    _assert_close(f"inline ilp4 tile_v={tile_v} output", o_ref, o_kernel.float())
+    _assert_close(f"inline ilp4 tile_v={tile_v} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("T", [2, 4, 8])
+def test_kda_decode_mtp_ws_inline_kernel_zero_state(T):
+    N, H, HV, K, V = 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, _ = make_inputs_mtp(N, T, H, HV, K, V)
+    state = torch.zeros(N, HV, V, K, device="cuda", dtype=torch.float32)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    _assert_close("inline mtp zero-state output", o_ref, o_kernel.float())
+    _assert_close("inline mtp zero-state final state", state_ref, state_kernel)
+
+
+def test_kda_decode_mtp_ws_inline_disable_state_update():
+    """disable_state_update=True leaves the pool untouched while still producing
+    correct per-token outputs (inline path)."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, _ = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+
+    state_source = state.clone().contiguous()
+    state_before = state_source.clone()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o_kernel = kda_decode_mtp_ws_inline(
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=q.to(torch.bfloat16),
+        k=k.to(torch.bfloat16),
+        v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16),
+        b=b.to(torch.bfloat16),
+        initial_state_source=state_source,
+        initial_state_indices=indices,
+        scale=scale,
+        use_qk_l2norm_in_kernel=True,
+        disable_state_update=True,
+    )
+
+    _assert_close("inline disable_state_update output", o_ref, o_kernel.float())
+    assert torch.equal(state_source, state_before), "state pool modified despite disable_state_update=True"
+
+
+def test_kda_decode_mtp_ws_inline_ilp4_rejects_bad_tile_v():
+    """Explicit ilp_rows=4 with tile_v not a multiple of 16 must assert (the
+    row_quad loop would otherwise silently skip trailing V-rows)."""
+    N, T, H, HV, K, V = 4, 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    with pytest.raises(AssertionError):
+        run_kda_decode_mtp_ws_inline_dense(
+            q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=8, ilp_rows=4,
+        )
+
+
+@pytest.mark.parametrize("N", [1024, 2048])
+def test_kda_decode_mtp_ws_inline_kernel_large_n(N):
+    """The inline kernel is correct at large N too (its target is small batch, but
+    the kernel is N-agnostic). Validate vs the looped single-token kernel."""
+    T, H, HV, K, V = 2, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+    # Pin a small tile_v/ilp so this exercises the inline path proper, not the
+    # large-batch (tile_v=64) config the heuristic would otherwise pick.
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=16, ilp_rows=4,
+    )
+
+    _assert_close(f"inline mtp large N={N} output", o_loop.float(), o_kernel.float())
+    _assert_close(f"inline mtp large N={N} final state", state_loop, state_kernel)
+
+
+@pytest.mark.parametrize("use_smem_v", [False, True])
+@pytest.mark.parametrize("tile_v,ilp_rows", [(8, 2), (16, 2), (32, 4), (64, 4)])
+def test_kda_decode_mtp_ws_inline_smem_v_dense(use_smem_v, tile_v, ilp_rows):
+    """Inline use_smem_v on/off correct vs the fp32 oracle across tile_v + ilp."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ref, state_ref = torch_kda_mtp_ref(
+        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
+    )
+    o_kernel, state_kernel = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=use_smem_v,
+    )
+
+    tag = f"inline smem_v={use_smem_v} tile_v={tile_v} ilp={ilp_rows}"
+    _assert_close(f"{tag} output", o_ref, o_kernel.float())
+    _assert_close(f"{tag} final state", state_ref, state_kernel)
+
+
+@pytest.mark.parametrize("tile_v,ilp_rows", [(8, 2), (16, 2), (32, 4), (64, 4)])
+def test_kda_decode_mtp_ws_inline_smem_v_bit_identical_to_gmem(tile_v, ilp_rows):
+    """Inline use_smem_v only relocates v reads / o writes; output AND state pool
+    must be byte-for-byte identical to use_smem_v=False (relocation + sOutput-race
+    check), exactly as for the warp-spec kernel."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_gmem, state_gmem = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=False,
+    )
+    o_smem, state_smem = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=True,
+    )
+
+    assert torch.equal(o_smem, o_gmem), (
+        f"inline use_smem_v output diverged from GMEM (tile_v={tile_v}, ilp={ilp_rows}): "
+        f"max|diff|={(o_smem.float() - o_gmem.float()).abs().max().item()}"
+    )
+    assert torch.equal(state_smem, state_gmem), (
+        f"inline use_smem_v state diverged from GMEM (tile_v={tile_v}, ilp={ilp_rows})"
+    )
+
+
+@pytest.mark.parametrize("use_smem_v", [False, True])
+@pytest.mark.parametrize("tile_v,ilp_rows", [(16, 2), (32, 4)])
+def test_kda_decode_mtp_ws_inline_intermediate_vs_oracle(use_smem_v, tile_v, ilp_rows):
+    """Inline per-token snapshots match the fp32 oracle state after each token."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    inter_ref = oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state.clone(), scale)
+
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32)
+    _o = kda_decode_mtp_ws_inline(
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, use_smem_v=use_smem_v,
+        intermediate_states_buffer=inter,
+    )
+
+    tag = f"inline inter smem_v={use_smem_v} tile_v={tile_v} ilp={ilp_rows}"
+    for t in range(T):
+        _assert_close(f"{tag} snapshot[t={t}]", inter_ref[:, t], inter[:, t])
+
+
+@pytest.mark.parametrize("tile_v,ilp_rows", [(16, 2), (32, 4)])
+def test_kda_decode_mtp_ws_inline_intermediate_last_eq_final_state(tile_v, ilp_rows):
+    """The t=T-1 inline snapshot equals the final state pool bit-for-bit."""
+    N, T, H, HV, K, V = 4, 4, 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32)
+    _o = kda_decode_mtp_ws_inline(
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
+        intermediate_states_buffer=inter,
+    )
+
+    assert torch.equal(inter[:, T - 1], state_source), (
+        f"inline t=T-1 snapshot != final state pool (tile_v={tile_v}, ilp={ilp_rows}): "
+        f"max|diff|={(inter[:, T - 1] - state_source).abs().max().item()}"
+    )
+
+
+@pytest.mark.parametrize("N,H,HV", [(1, 8, 16), (2, 16, 32), (4, 8, 16)])
+@pytest.mark.parametrize("T", [2, 4])
+def test_kda_decode_mtp_ws_inline_auto_config(N, H, HV, T):
+    """Production default: no tile_v/ilp_rows/use_smem_v -> all from
+    _select_mtp_config. Small work_units (the inline target) must stay correct vs
+    the loop with whatever config the heuristic picks."""
+    K, V = 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale
+    )
+
+    state_source = state.clone().contiguous()
+    indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    o_kernel = kda_decode_mtp_ws_inline(
+        A_log=A_log, dt_bias=dt_bias,
+        q=q.to(torch.bfloat16), k=k.to(torch.bfloat16), v=v.to(torch.bfloat16),
+        a=a.to(torch.bfloat16), b=b.to(torch.bfloat16),
+        initial_state_source=state_source, initial_state_indices=indices,
+        scale=scale, use_qk_l2norm_in_kernel=True,
+    )
+
+    _assert_close(f"inline auto N={N} HV={HV} output", o_loop.float(), o_kernel.float())
+    _assert_close(f"inline auto N={N} HV={HV} final state", state_loop, state_source)
+
+
+@pytest.mark.parametrize("N,T,H,HV", [(1, 2, 8, 16), (2, 4, 16, 32), (4, 4, 8, 16)])
+@pytest.mark.parametrize("tile_v,ilp_rows", [(16, 2), (32, 4)])
+def test_kda_decode_mtp_ws_inline_matches_warp_spec(N, T, H, HV, tile_v, ilp_rows):
+    """The inline and warp-spec kernels are exact ports of the same gated-delta-rule
+    math (decay-first, per-channel g), differing only in q/k/g/beta staging and
+    (deferred vs eager) L2-norm accumulation order. So for the same config they must
+    agree closely — tighter than the oracle tolerance, since both compute in fp32
+    over bf16 inputs. This cross-check pins the two variants together: a regression
+    in either surfaces here even if it stays within the loose oracle band."""
+    K, V = 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+
+    o_ws, state_ws = run_kda_decode_mtp_ws_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
+    )
+    o_inline, state_inline = run_kda_decode_mtp_ws_inline_dense(
+        q, k, v, a, b, A_log, dt_bias, state, scale,
+        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
+    )
+
+    tag = f"inline-vs-ws N={N} T={T} HV={HV} tile_v={tile_v} ilp={ilp_rows}"
+    # Both land within 3e-2 of the oracle; their mutual difference is dominated by
+    # the differing bf16 accumulation order, comfortably under a 2e-2 band.
+    _assert_close(f"{tag} output", o_ws.float(), o_inline.float(), atol=2e-2, rtol=2e-2)
+    _assert_close(f"{tag} final state", state_ws, state_inline, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
