@@ -42,6 +42,8 @@ triton 的 CUDA 机器上跑 (如 B200);Mac 无 GPU 不能跑。
     python benchmarks/diag_kda_mtp_small_batch.py                       # Part 1 + Part 2, 默认 HV=64
     python benchmarks/diag_kda_mtp_small_batch.py --part 1 --HV 64
     python benchmarks/diag_kda_mtp_small_batch.py --part 2 --batch-sizes 1 2 4 8 16 --Ts 2 4
+    # 显式 config 对比(把 tile_v 提高/ilp=4)@ kernel-only,聚焦 N=4,T=2:
+    python benchmarks/diag_kda_mtp_small_batch.py --part 4 --batch-sizes 4 --Ts 2
     python benchmarks/diag_kda_mtp_small_batch.py --check               # 跑一次数值校验再计时
     # 单 config 长跑供外部 profiler (nsys/ncu) 包裹:
     python benchmarks/diag_kda_mtp_small_batch.py --profile-config 1 2 8 ws --profile-iters 2000
@@ -471,6 +473,118 @@ def run_part3(args, device):
 
 
 # ============================================================================
+# Part 4 — 显式 (tile_v, ilp) config sweep @ kernel-only (CUDA graph replay)
+#   回答:把 tile_v 提高 / ilp 设 4,在 t_graph(纯 device)口径下相对 Triton 如何。
+#   隔离逻辑:同一 (N,T) 下并排 (16,2)=现状 / (16,4)=只换 ilp(同 grid 同冗余) /
+#   (32,4)=提议修复(冗余 8x→4x + grid 减半)。口径强制 t_graph(小 batch 的 t_pipe
+#   是 host-bound 假象);分支强制 recompute(use_gate_in_kernel=True,即要优化的
+#   分支);变体钉 ws;use_smem_v=False 以隔离 tile_v 效应。
+# ============================================================================
+def _parse_configs(spec_list):
+    """["16:2","16:4","32:4"] -> [(16,2),(16,4),(32,4)]。"""
+    out = []
+    for s in spec_list:
+        if ":" not in s:
+            raise ValueError(f"--configs 项格式应为 TILE_V:ILP,得到 {s!r}")
+        tv_s, ilp_s = s.split(":", 1)
+        out.append((int(tv_s), int(ilp_s)))
+    return out
+
+
+def _config_legal(tile_v, ilp, V):
+    """镜像 kda_decode_mtp_ws 的合法性断言,返回 (ok, 原因)。"""
+    if ilp not in (2, 4):
+        return False, "ilp∉{2,4}"
+    if tile_v not in TILE_V_CHOICES:
+        return False, "tv∉{8,16,32,64}"
+    if V % tile_v != 0:
+        return False, "V%tv!=0"
+    rows_per_group = tile_v // 4
+    if rows_per_group % ilp != 0:
+        return False, f"(tv//4={rows_per_group})%ilp"
+    if ilp == 4 and tile_v % 16 != 0:
+        return False, "ilp4 需 tv%16==0"
+    return True, ""
+
+
+def run_part4(args, device):
+    configs = _parse_configs(args.configs)
+    print("\n" + "=" * 100)
+    print("Part 4 — 显式 (tile_v, ilp) config sweep @ kernel-only (CUDA graph replay,纯 device)")
+    print("  分支=recompute(use_gate_in_kernel=True) 变体=ws use_smem_v=False(隔离 tile_v) dsu=True")
+    print(f"  H={args.H} HV={args.HV} K={args.K} V={args.V}  warmup={args.warmup} rep={args.rep}")
+    print(f"  configs={['%d:%d' % c for c in configs]}  ('*'=该 (N,T) 下 heuristic 当前选中=现状基准)")
+    print("=" * 100)
+    hdr = (f"{'N':>4} {'T':>3} | {'variant':>7} {'tile_v':>6} {'ilp':>3} | "
+           f"{'redund':>6} {'grid':>6} | {'maxΔ':>9} | {'t_graph us':>10} | {'vs Tri':>7} | heur")
+    print(hdr)
+    print("-" * len(hdr))
+
+    for N in args.batch_sizes:
+        for T in args.Ts:
+            q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
+                N, T, args.H, args.HV, args.K, args.V, device)
+            scale = args.K ** -0.5
+
+            # heuristic 当前在该 (N,T) 会选的 config(用于标 '*' = 现状基准)。
+            h_tv, h_ilp, _ = _select_mtp_config(N, args.HV, args.V, T)
+            if h_ilp == 4 and h_tv % 16 != 0:
+                h_ilp = 2
+
+            # Triton 基线(t_graph) + 数值参照 o_ref。
+            tri_g = None
+            o_ref = None
+            if _HAVE_TRITON and N * args.HV <= TRITON_MAX_GRID_Z:
+                qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
+                tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
+                                       state0.clone(), indices, scale, True)
+                try:
+                    o_ref = tri().reshape(N, T, args.HV, args.V).float()
+                    warmup(tri, args.warmup)
+                    tri_g = t_graph_ms(tri, 3, args.rep)
+                    print(f"{N:>4} {T:>3} | {'triton':>7} {'-':>6} {'-':>3} | "
+                          f"{'4x':>6} {N * args.HV * (args.V // 32):>6} | {'-':>9} | "
+                          f"{tri_g * 1e3:>10.1f} | {'(base)':>7} |")
+                except Exception as e:
+                    print(f"{N:>4} {T:>3} | triton graph-capture FAIL: {str(e)[:60]}")
+
+            for (tv, ilp) in configs:
+                ok, why = _config_legal(tv, ilp, args.V)
+                star = " *" if (tv, ilp) == (h_tv, h_ilp) else ""
+                if not ok:
+                    print(f"{N:>4} {T:>3} | {'ws-rec':>7} {tv:>6} {ilp:>3} | "
+                          f"{'-':>6} {'-':>6} | {'illegal':>9} | {why:>10} | {'-':>7} |{star}")
+                    continue
+                num_vt = args.V // tv
+                grid = N * args.HV * num_vt
+                fn = make_cula_call("ws", q, k, v, a, b, A_log, dt_bias,
+                                    state0.clone(), indices, scale, tv, ilp, False, True,
+                                    precompute_gating=False)
+                try:
+                    # 先对 Triton ref 校验,避免拿算错的 config 去比快。
+                    d_s = "n/a"
+                    if o_ref is not None:
+                        d = (fn().float() - o_ref).abs().max().item()
+                        d_s = f"{d:.1e}{'!' if d > 5e-2 else ''}"
+                    warmup(fn, args.warmup)
+                    tg = t_graph_ms(fn, 3, args.rep)
+                    vs = f"{tri_g / tg:.2f}x" if tri_g else "n/a"
+                    print(f"{N:>4} {T:>3} | {'ws-rec':>7} {tv:>6} {ilp:>3} | "
+                          f"{str(num_vt) + 'x':>6} {grid:>6} | {d_s:>9} | "
+                          f"{tg * 1e3:>10.1f} | {vs:>7} |{star}")
+                except Exception as e:
+                    print(f"{N:>4} {T:>3} | {'ws-rec':>7} {tv:>6} {ilp:>3} | "
+                          f"graph FAIL: {str(e)[:50]}")
+            print()
+
+    print("解读: t_graph=纯 device kernel(双方 wrapper+launcher 全移除)。vs Tri>1 = cuLA kernel 更快。")
+    print("     redund=num_v_tiles=V/tile_v(每 (i_n,i_hv) 的 gating 重算次数;Triton 固定 4x)。")
+    print("     关键对照 @ N=4,T=2: (16,2)现状 → (16,4)只换 ilp → (32,4)提议修复,看缺口由谁补回:")
+    print("       现状 vs (16,4) = 纯 ilp 贡献(同 grid 同冗余);(16,4) vs (32,4) = 冗余+grid 贡献。")
+    print("     '*' = 当前 heuristic 在该 (N,T) 选中的 config。")
+
+
+# ============================================================================
 # 单 config 长跑,供 nsys/ncu 等外部 profiler 包裹
 # ============================================================================
 def run_profile_config(args, device):
@@ -509,14 +623,18 @@ def main():
     ap.add_argument("--V", type=int, default=128)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--rep", type=int, default=300)
-    ap.add_argument("--part", choices=["1", "2", "3", "all"], default="all",
-                    help="1=host/device拆分 2=tile_v sweep 3=kernel-only(CUDA graph) all=1+2")
+    ap.add_argument("--part", choices=["1", "2", "3", "4", "all"], default="all",
+                    help="1=host/device拆分 2=tile_v sweep 3=kernel-only(CUDA graph) "
+                         "4=显式config sweep@kernel-only(recompute分支) all=1+2")
     ap.add_argument("--state-update", dest="dsu", action="store_false",
                     help="计时含状态写回(disable_state_update=False,复现含写回口径);默认 forward-only")
     ap.add_argument("--check", action="store_true", help="计时前先对 Triton 跑一次数值校验")
     ap.add_argument("--profile-config", nargs=4, metavar=("N", "T", "TILE_V", "VARIANT"),
                     default=None, help="单 config 长跑供 nsys/ncu 包裹,如: 1 2 8 ws")
     ap.add_argument("--profile-iters", type=int, default=2000)
+    ap.add_argument("--configs", type=str, nargs="+",
+                    default=["16:2", "16:4", "32:4", "32:2", "64:4"],
+                    help="Part 4 的显式 TILE_V:ILP 列表(默认覆盖 N=4,T=2 的 (16,2)现状→(16,4)→(32,4) 对照)")
     ap.set_defaults(dsu=True)
     args = ap.parse_args()
 
@@ -553,6 +671,8 @@ def main():
         run_part2(args, device)
     if args.part == "3":
         run_part3(args, device)
+    if args.part == "4":
+        run_part4(args, device)
 
 
 if __name__ == "__main__":
