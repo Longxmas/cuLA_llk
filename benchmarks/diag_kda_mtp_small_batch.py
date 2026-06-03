@@ -511,7 +511,8 @@ def run_part4(args, device):
     configs = _parse_configs(args.configs)
     print("\n" + "=" * 100)
     print("Part 4 — 显式 (tile_v, ilp) config sweep @ kernel-only (CUDA graph replay,纯 device)")
-    print("  分支=recompute(use_gate_in_kernel=True) 变体=ws use_smem_v=False(隔离 tile_v) dsu=True")
+    print(f"  分支=recompute(use_gate_in_kernel=True) 变体={args.variants}(ws=warp-spec/inl=无 warp-spec) "
+          f"use_smem_v=False dsu=True")
     print(f"  H={args.H} HV={args.HV} K={args.K} V={args.V}  warmup={args.warmup} rep={args.rep}")
     print(f"  configs={['%d:%d' % c for c in configs]}  ('*'=该 (N,T) 下 heuristic 当前选中=现状基准)")
     print("=" * 100)
@@ -552,35 +553,44 @@ def run_part4(args, device):
                 ok, why = _config_legal(tv, ilp, args.V)
                 star = " *" if (tv, ilp) == (h_tv, h_ilp) else ""
                 if not ok:
-                    print(f"{N:>4} {T:>3} | {'ws-rec':>7} {tv:>6} {ilp:>3} | "
+                    print(f"{N:>4} {T:>3} | {'-':>7} {tv:>6} {ilp:>3} | "
                           f"{'-':>6} {'-':>6} | {'illegal':>9} | {why:>10} | {'-':>7} |{star}")
                     continue
                 num_vt = args.V // tv
                 grid = N * args.HV * num_vt
-                fn = make_cula_call("ws", q, k, v, a, b, A_log, dt_bias,
-                                    state0.clone(), indices, scale, tv, ilp, False, True,
-                                    precompute_gating=False)
-                try:
-                    # 先对 Triton ref 校验,避免拿算错的 config 去比快。
-                    d_s = "n/a"
-                    if o_ref is not None:
-                        d = (fn().float() - o_ref).abs().max().item()
-                        d_s = f"{d:.1e}{'!' if d > 5e-2 else ''}"
-                    warmup(fn, args.warmup)
-                    tg = t_graph_ms(fn, 3, args.rep)
-                    vs = f"{tri_g / tg:.2f}x" if tri_g else "n/a"
-                    print(f"{N:>4} {T:>3} | {'ws-rec':>7} {tv:>6} {ilp:>3} | "
-                          f"{str(num_vt) + 'x':>6} {grid:>6} | {d_s:>9} | "
-                          f"{tg * 1e3:>10.1f} | {vs:>7} |{star}")
-                except Exception as e:
-                    print(f"{N:>4} {T:>3} | {'ws-rec':>7} {tv:>6} {ilp:>3} | "
-                          f"graph FAIL: {str(e)[:50]}")
+                # ws=warp-spec(warp0 算 gating + barrier 广播);inl=无 warp-spec(4 warp
+                # 各自算 gating,无 barrier,但仍 4-warp CTA)。两者同 grid/tile_v/ilp,唯一
+                # 变量是 warp-spec → 判定 config 治不了的差距是否来自 warp-spec。
+                for variant in args.variants:
+                    vlabel = "ws-rec" if variant == "ws" else "inl-rec"
+                    fn = make_cula_call(variant, q, k, v, a, b, A_log, dt_bias,
+                                        state0.clone(), indices, scale, tv, ilp, False, True,
+                                        precompute_gating=False)
+                    try:
+                        # 先对 Triton ref 校验,避免拿算错的 config 去比快。
+                        d_s = "n/a"
+                        if o_ref is not None:
+                            d = (fn().float() - o_ref).abs().max().item()
+                            d_s = f"{d:.1e}{'!' if d > 5e-2 else ''}"
+                        warmup(fn, args.warmup)
+                        tg = t_graph_ms(fn, 3, args.rep)
+                        vs = f"{tri_g / tg:.2f}x" if tri_g else "n/a"
+                        print(f"{N:>4} {T:>3} | {vlabel:>7} {tv:>6} {ilp:>3} | "
+                              f"{str(num_vt) + 'x':>6} {grid:>6} | {d_s:>9} | "
+                              f"{tg * 1e3:>10.1f} | {vs:>7} |{star}")
+                    except Exception as e:
+                        print(f"{N:>4} {T:>3} | {vlabel:>7} {tv:>6} {ilp:>3} | "
+                              f"graph FAIL: {str(e)[:50]}")
             print()
 
     print("解读: t_graph=纯 device kernel(双方 wrapper+launcher 全移除)。vs Tri>1 = cuLA kernel 更快。")
     print("     redund=num_v_tiles=V/tile_v(每 (i_n,i_hv) 的 gating 重算次数;Triton 固定 4x)。")
     print("     关键对照 @ N=4,T=2: (16,2)现状 → (16,4)只换 ilp → (32,4)提议修复,看缺口由谁补回:")
     print("       现状 vs (16,4) = 纯 ilp 贡献(同 grid 同冗余);(16,4) vs (32,4) = 冗余+grid 贡献。")
+    print("     ws-rec vs inl-rec(同 tile_v/ilp,唯一差 warp-spec): inl 优于 ws 且≈triton →")
+    print("       config 治不了的差距来自 warp-spec(warp0 串行 gating/barrier 等待);inl≈ws(都差) →")
+    print("       来自 4-warp 胖 CTA 占用率/wave 量化(与 warp-spec 无关)。注意 inline 是 scalar-FMA")
+    print("       (无 packed F32x2),ilp=4 的 compute 略逊 ws,解读 ilp 差异时扣掉这一项。")
     print("     '*' = 当前 heuristic 在该 (N,T) 选中的 config。")
 
 
@@ -635,6 +645,9 @@ def main():
     ap.add_argument("--configs", type=str, nargs="+",
                     default=["16:2", "16:4", "32:4", "32:2", "64:4"],
                     help="Part 4 的显式 TILE_V:ILP 列表(默认覆盖 N=4,T=2 的 (16,2)现状→(16,4)→(32,4) 对照)")
+    ap.add_argument("--variants", type=str, nargs="+", default=["ws", "inline"],
+                    choices=["ws", "inline"],
+                    help="Part 4 测哪些变体(默认 ws+inline,对照 warp-spec 的影响)")
     ap.set_defaults(dsu=True)
     args = ap.parse_args()
 
