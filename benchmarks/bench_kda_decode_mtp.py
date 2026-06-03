@@ -14,19 +14,18 @@
 # limitations under the License.
 
 """
-bench_kda_decode_mtp.py — P3.0 baseline + Route1-vs-Route2 harness for KDA MTP decode.
+bench_kda_decode_mtp.py — perf harness for KDA MTP decode (ws / inline vs looped).
 
 Compares routes that compute the SAME T-token recurrence:
   1. looped : T sequential single-token kda_decode launches (state carried over).
-  2. fused  : a single kda_decode_mtp launch over T tokens       [Route 2: cuLA SMEM-state].
-  3. ws     : a single kda_decode_mtp_ws launch, ilp=2 (explicit) [Route 1: FlashInfer warp-spec].
-  4. ws4    : the same warp-spec kernel, ilp=4 (explicit; fused steps 1+2 & 4+5,
+  2. ws     : a single kda_decode_mtp_ws launch, ilp=2 (explicit) [FlashInfer warp-spec].
+  3. ws4    : the same warp-spec kernel, ilp=4 (explicit; fused steps 1+2 & 4+5,
               double accumulators, packed F32x2 FMA on SM100). Skipped (n/a) when
               the selected tile_v gives (tile_v//4) not divisible by 4.
-  5. ws4_smemv: ws4 plus Stage-C use_smem_v=True (v preloaded into SMEM + merged
+  4. ws4_smemv: ws4 plus Stage-C use_smem_v=True (v preloaded into SMEM + merged
               coalesced output writeback). Head-to-head vs ws4 isolates the
               use_smem_v win; same (tile_v//4)%4 gate as ws4.
-  6. ws_auto: the warp-spec kernel with ilp_rows=None — the PRODUCTION DEFAULT,
+  5. ws_auto: the warp-spec kernel with ilp_rows=None — the PRODUCTION DEFAULT,
               where the work_units=N*HV heuristic (_select_mtp_config) picks
               (tile_v, ilp_rows, use_smem_v). Shows what callers get with no
               explicit knobs; it dispatches to the same kernel config as ws or
@@ -39,16 +38,16 @@ use_smem_v defaults to None and the heuristic turns it on at large batch
 
 Reports per (N, T): wall time, tokens/s (= N*T / time), the tile_v the
 work_units=N*HV heuristic picked, the heuristic's selected ilp ("sel ilp"),
-speedups vs looped, the **ws-vs-fused** head-to-head (Route1-vs-Route2 judge) AND
-the **ws4-vs-ws** head-to-head (the ilp=4-vs-ilp=2 win). Also cross-checks each
-route's output/state against the looped route (rel error) as a sanity gate.
+speedups vs looped, and the **ws4-vs-ws** head-to-head (the ilp=4-vs-ilp=2 win).
+Also cross-checks each route's output/state against the looped route (rel error)
+as a sanity gate.
 
-Pass --routes to restrict which of {loop,fused,ws,ws4,ws4_smemv,ws_auto} run
-(default: all).
+Pass --routes to restrict which of {loop,ws,ws4,ws4_smemv,ws_auto,inline,inline4}
+run (default: all).
 
-A bit-for-bit determinism check (--determinism) re-runs the fused kernel many
-times from the same initial state and compares output + final state exactly, to
-surface state-writeback races before any P3 kernel change lands.
+A bit-for-bit determinism check (--determinism) re-runs a state-writeback kernel
+many times from the same initial state and compares output + final state exactly,
+to surface state-writeback races before any kernel change lands.
 
 --bench-intermediate measures the Stage-D snapshot overhead: the ilp=4 ws kernel
 with vs without the [N,T,HV,V,K] intermediate-state buffer (fire-and-forget GMEM
@@ -70,7 +69,7 @@ subset via --sweep-hvs/--sweep-ns/--sweep-ts. Writes a markdown report (winner t
 single comparison): opt_level (CuTe DSL --opt-level) and fast_math (fastmath= on the
 ws/inline exp/log/rsqrt). It prints Table A = opt_level in {1,2,3} at fast_math=off,
 and Table B = fast_math in {off,on} at opt_level=1, across loop/ws/ws4/inline/inline4
-(Route-2 fused excluded; loop=kda_decode has no fast_math). opt-level scope is the 3
+(loop=kda_decode has no fast_math). opt-level scope is the 3
 kernels (loop single-token + ws + inline); fast_math scope is ws/inline only. The
 --opt-level/--fast-math flags (without --knob-sweep) instead pin ONE setting for the
 main + --determinism modes, so a setting can be A/B'd by re-running. Defaults
@@ -81,7 +80,7 @@ Fairness notes:
     copy_() runs outside the CUDA event window and is NOT counted.
   - The looped route's per-token tensors are pre-sliced ONCE outside the timed
     loop, so only the T kernel launches are timed (not python slicing) — this
-    gives the baseline its best shot; the fused win is purely about fusion.
+    gives the baseline its best shot; the ws win is purely about fusion/occupancy.
 
 Usage:
     python benchmarks/bench_kda_decode_mtp.py
@@ -118,11 +117,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from benchmarks.utils import benchmark_cuda_fn, relative_rms_error_rel_max
 from cula.kda import (
     kda_decode,
-    kda_decode_mtp,
     kda_decode_mtp_ws,
     kda_decode_mtp_ws_inline,
 )
-from cula.ops.kda_decode_mtp import _select_mtp_config, _select_mtp_tile_v
+from cula.ops.kda_decode_mtp_ws import _select_mtp_config, _select_mtp_tile_v
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -143,17 +141,18 @@ def make_inputs_mtp(N, T, H, HV, K, V, device="cuda", seed=42):
 
 
 def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level=1, fast_math=False):
-    """Build the fused + looped callables, their state buffers, and setup fns.
+    """Build the ws/inline + looped callables, their state buffers, and setup fns.
 
-    Returns a dict with keys: call_fused, setup_fused, call_loop, setup_loop,
-    state_fused, state_loop (the live buffers, mutated in-place).
+    Returns a dict with keys: call_<route>, setup_<route>, state_<route> for each
+    of ws/ws4/ws4_smemv/ws_auto/inline/inline4/loop (the live buffers, mutated
+    in-place).
 
     ``opt_level`` (CuTe DSL --opt-level) and ``fast_math`` (fastmath= on the
     transcendentals) are the issue-17 compile knobs. They are applied to the
     routes in their scope: ``opt_level`` to loop (single-token kda_decode) +
     ws/ws4/ws4_smemv/ws_auto + inline/inline4; ``fast_math`` to the ws/inline
-    routes only (loop = kda_decode stays no-fastmath; fused = Route-2 is out of
-    scope and unchanged). Defaults (1, False) reproduce the validated build.
+    routes only (loop = kda_decode stays no-fastmath). Defaults (1, False)
+    reproduce the validated build.
 
     Either knob may be ``None`` => omit it from the call so the wrapper's OWN
     default applies. With both None (the bench ``--prod-defaults`` mode) every
@@ -175,28 +174,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
         mtp_kw["fast_math"] = fast_math
 
     state_init = state.clone().contiguous()  # (N, HV, V, K)
-
-    # --- fused route: one launch over T tokens ---
-    state_fused = state_init.clone()
-
-    def call_fused():
-        return kda_decode_mtp(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            initial_state_source=state_fused,
-            initial_state_indices=indices,
-            scale=scale,
-            use_qk_l2norm_in_kernel=True,
-            tile_v=tile_v,
-        )
-
-    def setup_fused():
-        state_fused.copy_(state_init)
 
     # --- ws route (Route 1): one warp-specialized launch over T tokens ---
     state_ws = state_init.clone()
@@ -403,8 +380,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
         state_loop.copy_(state_init)
 
     return {
-        "call_fused": call_fused,
-        "setup_fused": setup_fused,
         "call_ws": call_ws,
         "setup_ws": setup_ws,
         "call_ws4": call_ws4,
@@ -419,7 +394,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
         "setup_inline4": setup_inline4,
         "call_loop": call_loop,
         "setup_loop": setup_loop,
-        "state_fused": state_fused,
         "state_ws": state_ws,
         "state_ws4": state_ws4,
         "state_ws4_smemv": state_ws4_smemv,
@@ -458,13 +432,13 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
     # when ilp=4 is invalid for this tile_v.
     active = [
         r
-        for r in ("loop", "fused", "ws", "ws_auto", "ws4", "ws4_smemv", "inline", "inline4")
+        for r in ("loop", "ws", "ws_auto", "ws4", "ws4_smemv", "inline", "inline4")
         if r in route_set and (r not in ("ws4", "ws4_smemv", "inline4") or ws4_ok)
     ]
     corr_routes = [r for r in active if r != "loop"]
 
     # Correctness reference = looped single-token route (always run once, fresh
-    # state). Each fused/ws/ws4 route is cross-checked against it (rel error).
+    # state). Each ws/ws4/inline route is cross-checked against it (rel error).
     nan2 = (float("nan"), float("nan"))
     corr = {}  # route name -> (out_rel_max, state_rel_max)
     with torch.no_grad():
@@ -501,7 +475,7 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
     def ratio(t_num, t_den):
         return (t_num / t_den) if (t_num and t_den and t_den > 0) else float("nan")
 
-    t_fused, t_ws, t_ws4 = times.get("fused"), times.get("ws"), times.get("ws4")
+    t_ws, t_ws4 = times.get("ws"), times.get("ws4")
     t_ws_auto = times.get("ws_auto")
     t_ws4_smemv = times.get("ws4_smemv")
     t_inline = times.get("inline")
@@ -520,27 +494,21 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
         "sel_ilp": sel_ilp,
         "sel_smem_v": sel_smem_v,
         "t_loop_ms": times.get("loop"),
-        "t_fused_ms": t_fused,
         "t_ws_ms": t_ws,
         "t_ws4_ms": t_ws4,
         "t_ws4_smemv_ms": t_ws4_smemv,
         "t_ws_auto_ms": t_ws_auto,
         "loop_mtok_s": mtok(times.get("loop")),
-        "fused_mtok_s": mtok(t_fused),
         "ws_mtok_s": mtok(t_ws),
         "ws4_mtok_s": mtok(t_ws4),
         "ws4_smemv_mtok_s": mtok(t_ws4_smemv),
         "ws_auto_mtok_s": mtok(t_ws_auto),
-        "fused_speedup": speedup_vs_loop(t_fused),  # vs looped
         "ws_speedup": speedup_vs_loop(t_ws),  # vs looped
         "ws4_speedup": speedup_vs_loop(t_ws4),  # vs looped
         "ws4_smemv_speedup": speedup_vs_loop(t_ws4_smemv),  # vs looped
         "ws_auto_speedup": speedup_vs_loop(t_ws_auto),  # vs looped
-        # Head-to-head Route1-vs-Route2: >1 means ws (Route 1) beats fused (Route 2).
-        "ws_vs_fused": ratio(t_fused, t_ws),
-        # ilp=4 vs ilp=2 (the TaskList #6 "biggest win" measure): >1 -> ilp=4 faster.
+        # ilp=4 vs ilp=2 (the "biggest win" measure): >1 -> ilp=4 faster.
         "ws4_vs_ws": ratio(t_ws, t_ws4),
-        "ws4_vs_fused": ratio(t_fused, t_ws4),
         # Stage C: use_smem_v win over plain ilp=4. >1 -> smem_v faster (expected
         # at large batch / tile_v=64 from the coalesced merged writeback).
         "ws4_smemv_vs_ws4": ratio(t_ws4, t_ws4_smemv),
@@ -559,8 +527,6 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
         "inline_state_rel_max": corr.get("inline", nan2)[1],
         "inline4_out_rel_max": corr.get("inline4", nan2)[0],
         "inline4_state_rel_max": corr.get("inline4", nan2)[1],
-        "fused_out_rel_max": corr.get("fused", nan2)[0],
-        "fused_state_rel_max": corr.get("fused", nan2)[1],
         "ws_out_rel_max": corr.get("ws", nan2)[0],
         "ws_state_rel_max": corr.get("ws", nan2)[1],
         "ws4_out_rel_max": corr.get("ws4", nan2)[0],
@@ -976,7 +942,7 @@ def write_markdown_report(args, gpu_name, results, output_path):
         return f"avg={sum(vals) / len(vals):.2f}x, min={min(vals):.2f}x, max={max(vals):.2f}x"
 
     lines = []
-    lines.append("# Benchmark Results - KDA MTP Decode (Route 1 ws vs Route 2 fused)")
+    lines.append("# Benchmark Results - KDA MTP Decode (ws / inline vs looped single-token)")
     lines.append("")
     lines.append(f"> Auto-generated by `benchmarks/bench_kda_decode_mtp.py` on {now}.")
     lines.append("")
@@ -987,8 +953,8 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append("")
     lines.append(
         f"> Setting: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}; routes={args.routes}. "
-        "fused = kda_decode_mtp (Route 2, cuLA SMEM-state); ws = kda_decode_mtp_ws ilp=2 "
-        "(Route 1, FlashInfer warp-spec); ws4 = kda_decode_mtp_ws ilp=4 (fused steps + packed FMA, "
+        "ws = kda_decode_mtp_ws ilp=2 "
+        "(FlashInfer warp-spec); ws4 = kda_decode_mtp_ws ilp=4 (fused steps + packed FMA, "
         "n/a where tile_v//4 not %4); ws4sv = ws4 + use_smem_v (Stage C: SMEM v preload + merged "
         "writeback); ws_auto = kda_decode_mtp_ws ilp_rows=None (production default, ilp picked by the "
         "work_units heuristic — 'sel ilp' column); looped = T× single-token kda_decode."
@@ -996,11 +962,9 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append("")
     lines.append("## Summary")
     lines.append("")
-    lines.append(f"- fused-vs-looped speedup: {summary([r['fused_speedup'] for r in results])}")
     lines.append(f"- ws-vs-looped speedup:    {summary([r['ws_speedup'] for r in results])}")
     lines.append(f"- ws4-vs-looped speedup:   {summary([r['ws4_speedup'] for r in results])}")
     lines.append(f"- ws_auto-vs-looped speedup: {summary([r['ws_auto_speedup'] for r in results])}  (production default; ilp picked by heuristic — see 'sel ilp')")
-    lines.append(f"- **ws-vs-fused (Route1/Route2): {summary([r['ws_vs_fused'] for r in results])}**  (>1 → Route 1 wins)")
     lines.append(f"- **ws4-vs-ws (ilp4/ilp2): {summary([r['ws4_vs_ws'] for r in results])}**  (>1 → ilp=4 wins)")
     lines.append(f"- **ws4_smemv-vs-ws4 (Stage C use_smem_v): {summary([r['ws4_smemv_vs_ws4'] for r in results])}**  (>1 → use_smem_v wins; expect at large batch / tile_v=64)")
     lines.append(f"- **inline-vs-ws (inline variant, ilp=2): {summary([r['inline_vs_ws'] for r in results])}**  (>1 → inline staging wins; expect at small work_units = N*HV)")
@@ -1012,14 +976,14 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append("")
     lines.append("## Performance")
     lines.append("")
-    lines.append("| N | T | tile_v | sel ilp | loop ms | fused ms | ws ms | ws4 ms | ws4sv ms | fused/loop | ws/loop | ws4/loop | ws/fused | ws4/ws | ws4sv/ws4 | ws out rmax | ws4 out rmax | ws4sv out rmax |")
-    lines.append("|--:|--:|-------:|--------:|--------:|---------:|------:|-------:|--------:|-----------:|--------:|---------:|---------:|-------:|----------:|------------:|-------------:|---------------:|")
+    lines.append("| N | T | tile_v | sel ilp | loop ms | ws ms | ws4 ms | ws4sv ms | ws/loop | ws4/loop | ws4/ws | ws4sv/ws4 | ws out rmax | ws4 out rmax | ws4sv out rmax |")
+    lines.append("|--:|--:|-------:|--------:|--------:|------:|-------:|--------:|--------:|---------:|-------:|----------:|------------:|-------------:|---------------:|")
     for r in results:
         lines.append(
-            f"| {r['N']} | {r['T']} | {r['tile_v']} | {r['sel_ilp']} | {_fmt(r['t_loop_ms'], '.4f')} | {_fmt(r['t_fused_ms'], '.4f')} | "
+            f"| {r['N']} | {r['T']} | {r['tile_v']} | {r['sel_ilp']} | {_fmt(r['t_loop_ms'], '.4f')} | "
             f"{_fmt(r['t_ws_ms'], '.4f')} | {_fmt(r['t_ws4_ms'], '.4f')} | {_fmt(r['t_ws4_smemv_ms'], '.4f')} | "
-            f"{_fmt(r['fused_speedup'], '.2f')}x | {_fmt(r['ws_speedup'], '.2f')}x | {_fmt(r['ws4_speedup'], '.2f')}x | "
-            f"**{_fmt(r['ws_vs_fused'], '.2f')}x** | **{_fmt(r['ws4_vs_ws'], '.2f')}x** | **{_fmt(r['ws4_smemv_vs_ws4'], '.2f')}x** | "
+            f"{_fmt(r['ws_speedup'], '.2f')}x | {_fmt(r['ws4_speedup'], '.2f')}x | "
+            f"**{_fmt(r['ws4_vs_ws'], '.2f')}x** | **{_fmt(r['ws4_smemv_vs_ws4'], '.2f')}x** | "
             f"{_fmt(r['ws_out_rel_max'], '.2e')} | {_fmt(r['ws4_out_rel_max'], '.2e')} | {_fmt(r['ws4_smemv_out_rel_max'], '.2e')} |"
         )
     lines.append("")
@@ -1192,7 +1156,7 @@ _KNOB_RMAX = {"ws": "ws_out_rel_max", "ws4": "ws4_out_rel_max",
 
 def run_knob_sweep(args, gpu_name):
     """Sweep the two issue-17 compile knobs SEPARATELY (never mixing both in one
-    comparison), across loop/ws/ws4/inline/inline4 (Route-2 fused excluded):
+    comparison), across loop/ws/ws4/inline/inline4:
 
       Table A — opt-level: fast_math fixed OFF, opt_level in --knob-opt-levels.
       Table B — fast_math:  opt_level fixed 1, fast_math in {off, on} (ws/inline
@@ -1212,7 +1176,7 @@ def run_knob_sweep(args, gpu_name):
     print("=== Compile-knob sweep (issue 17): opt_level + fast_math, measured SEPARATELY ===")
     print(f"  Config: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}, "
           f"tile_v={'heuristic' if args.tile_v is None else args.tile_v}")
-    print(f"  Routes: {', '.join(_KNOB_ROUTES)} (Route-2 fused excluded).")
+    print(f"  Routes: {', '.join(_KNOB_ROUTES)}.")
     print(f"  Cells (N x T): N={args.batch_sizes}, T={args.Ts}; opt_levels={opt_levels}")
     print(f"  Timing: warmup={args.warmup}, rep={args.rep}.")
     print("  NOTE: every (N,T,route,opt_level/fast_math) is a DISTINCT JIT compile; the big "
@@ -1404,7 +1368,7 @@ def _write_knob_sweep_markdown(args, gpu_name, opt_levels, a_rows, b_rows, outpu
 # Main
 # ──────────────────────────────────────────────────────────────────────
 def build_parser():
-    parser = argparse.ArgumentParser(description="Benchmark KDA MTP decode: fused vs T× single-token")
+    parser = argparse.ArgumentParser(description="Benchmark KDA MTP decode: ws/inline vs T× single-token")
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 4, 16, 64, 256])
     parser.add_argument("--Ts", nargs="+", type=int, default=[2, 4], help="MTP token counts to benchmark")
     parser.add_argument("--H", type=int, default=16, help="Q/K head count")
@@ -1418,10 +1382,10 @@ def build_parser():
     parser.add_argument(
         "--routes",
         nargs="+",
-        choices=["loop", "fused", "ws", "ws4", "ws4_smemv", "ws_auto", "inline", "inline4"],
-        default=["loop", "fused", "ws", "ws_auto", "ws4", "ws4_smemv", "inline", "inline4"],
-        help="Which routes to run/time. loop=T× single-token, fused=kda_decode_mtp (Route 2), "
-        "ws=kda_decode_mtp_ws ilp=2 (Route 1), ws4=kda_decode_mtp_ws ilp=4 (skipped when tile_v//4 not %4), "
+        choices=["loop", "ws", "ws4", "ws4_smemv", "ws_auto", "inline", "inline4"],
+        default=["loop", "ws", "ws_auto", "ws4", "ws4_smemv", "inline", "inline4"],
+        help="Which routes to run/time. loop=T× single-token, "
+        "ws=kda_decode_mtp_ws ilp=2, ws4=kda_decode_mtp_ws ilp=4 (skipped when tile_v//4 not %4), "
         "ws_auto=kda_decode_mtp_ws ilp_rows=None (production default; heuristic picks ilp), "
         "inline=kda_decode_mtp_ws_inline ilp=2 (inline variant, head-to-head vs ws), "
         "inline4=inline ilp=4 (vs ws4; skipped when tile_v//4 not %4).",
@@ -1460,7 +1424,7 @@ def build_parser():
     parser.add_argument(
         "--opt-level", type=int, default=1, choices=[1, 2, 3],
         help="CuTe DSL --opt-level for the in-scope kernels (loop=kda_decode + "
-             "ws/ws4/ws4_smemv/ws_auto + inline/inline4; Route-2 fused is unchanged). "
+             "ws/ws4/ws4_smemv/ws_auto + inline/inline4). "
              "Default 1 (the historical pin). Applies to the main + --determinism modes.",
     )
     parser.add_argument(
@@ -1528,9 +1492,9 @@ def main(argv=None):
     print()
 
     if args.determinism:
-        det_routes = [r for r in args.routes if r in ("fused", "ws", "ws4", "ws4_smemv", "ws_auto", "inline", "inline4")]
+        det_routes = [r for r in args.routes if r in ("ws", "ws4", "ws4_smemv", "ws_auto", "inline", "inline4")]
         if not det_routes:
-            print("No state-writeback route selected (--routes must include fused, ws, ws4, ws4_smemv, ws_auto, inline, and/or inline4 for --determinism).")
+            print("No state-writeback route selected (--routes must include ws, ws4, ws4_smemv, ws_auto, inline, and/or inline4 for --determinism).")
             return True
         hdr = f"{'route':>6} | {'N':>5} | {'T':>3} | {'tile_v':>6} | {'iters':>8} | {'result':>8}"
         print(hdr)
@@ -1583,7 +1547,7 @@ def main(argv=None):
         return True
 
     # Dynamic head-to-head table: every column follows the selected --routes, so
-    # e.g. `--routes loop ws4 inline inline4` drops the fused/ws/ws4sv/wsAuto ms
+    # e.g. `--routes loop ws4 inline inline4` drops the ws/ws4sv/wsAuto ms
     # columns AND every comparison that involves them (an h2h shows only when BOTH
     # of its routes are selected; a route's vs-loop speedup + out-rmax show only
     # when that route is selected). One ms col + one /loop speedup + one out-rmax
@@ -1591,7 +1555,6 @@ def main(argv=None):
     # (route_key, t_key, speedup_key, display)
     ROUTE_COLS = [
         ("loop", "t_loop_ms", None, "loop"),
-        ("fused", "t_fused_ms", "fused_speedup", "fused"),
         ("ws", "t_ws_ms", "ws_speedup", "ws"),
         ("ws_auto", "t_ws_auto_ms", "ws_auto_speedup", "wsAuto"),
         ("ws4", "t_ws4_ms", "ws4_speedup", "ws4"),
@@ -1601,7 +1564,6 @@ def main(argv=None):
     ]
     # (result_key, label, routes_required)
     H2H = [
-        ("ws_vs_fused", "ws/fused", ("ws", "fused")),
         ("ws4_vs_ws", "ws4/ws", ("ws4", "ws")),
         ("ws4_smemv_vs_ws4", "ws4sv/ws4", ("ws4_smemv", "ws4")),
         ("inline_vs_ws", "inl/ws", ("inline", "ws")),

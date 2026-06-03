@@ -46,11 +46,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # for sibling 
 
 from cula.kda import (
     kda_decode,
-    kda_decode_mtp,
     kda_decode_mtp_ws,
     kda_decode_mtp_ws_inline,
 )
-from cula.ops.kda_decode_mtp import _select_mtp_config, _select_mtp_tile_v
+from cula.ops.kda_decode_mtp_ws import _select_mtp_config, _select_mtp_tile_v
 
 # Trusted single-token reference from the existing decode test. We cross-check
 # our MTP reference against it (pure torch, no kernel) so the MTP oracle is
@@ -197,41 +196,6 @@ def run_kda_decode_mtp_via_loop_dense(q, k, v, a, b, A_log, dt_bias, state, scal
     return o_all, state_source
 
 
-def run_kda_decode_mtp_dense(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None):
-    """
-    Run the fused MTP kernel (kda_decode_mtp) in dense layout.
-
-    Args use the MTP-shaped tensors:
-        q, k: (N, T, H, K)   v: (N, T, HV, V)
-        a: (N, T, HV, K)     b: (N, T, HV)     state: (N, HV, V, K)
-
-    tile_v: optional V-tile override; None uses the work_units=N*HV heuristic.
-
-    Returns:
-        o:            (N, T, HV, V) bfloat16
-        state_source: (N, HV, V, K) float32   (updated in-place by the kernel)
-    """
-    N = q.shape[0]
-    state_source = state.clone().contiguous()  # (N, HV, V, K)
-    indices = torch.arange(N, device=q.device, dtype=torch.int32)
-
-    o = kda_decode_mtp(
-        A_log=A_log,
-        dt_bias=dt_bias,
-        q=q.to(torch.bfloat16),
-        k=k.to(torch.bfloat16),
-        v=v.to(torch.bfloat16),
-        a=a.to(torch.bfloat16),
-        b=b.to(torch.bfloat16),
-        initial_state_source=state_source,  # updated in-place after all T tokens
-        initial_state_indices=indices,
-        scale=scale,
-        use_qk_l2norm_in_kernel=True,
-        tile_v=tile_v,
-    )
-    return o, state_source  # (N, T, HV, V), (N, HV, V, K)
-
-
 def _assert_close(name, ref, actual, atol=3e-2, rtol=2e-2):
     """
     Assert tensors are close, always reporting the observed margins.
@@ -322,127 +286,6 @@ def test_kda_mtp_ref_matches_looped_kernel_dense(N, T, H, HV):
 
 
 # ---------------------------------------------------------------------------
-# Tests: fused MTP kernel (kda_decode_mtp) vs torch reference (dense layout).
-# This is the load-bearing P1 test for the new kernel.
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("N", [1, 4, 16, 64])
-@pytest.mark.parametrize("T", [2, 4, 8])
-@pytest.mark.parametrize("H,HV", [(8, 16), (16, 32)])
-def test_kda_decode_mtp_kernel_dense(N, T, H, HV):
-    K, V = 128, 128
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-
-    o_ref, state_ref = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
-    )
-    o_kernel, state_kernel = run_kda_decode_mtp_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale
-    )
-
-    _assert_close("mtp kernel output", o_ref, o_kernel.float())
-    _assert_close("mtp kernel final state", state_ref, state_kernel)
-
-
-@pytest.mark.parametrize("T", [2, 4, 8])
-def test_kda_decode_mtp_kernel_zero_state(T):
-    N, H, HV, K, V = 4, 8, 16, 128, 128
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, _ = make_inputs_mtp(N, T, H, HV, K, V)
-    state = torch.zeros(N, HV, V, K, device="cuda", dtype=torch.float32)
-
-    o_ref, state_ref = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
-    )
-    o_kernel, state_kernel = run_kda_decode_mtp_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale
-    )
-
-    _assert_close("mtp kernel zero-state output", o_ref, o_kernel.float())
-    _assert_close("mtp kernel zero-state final state", state_ref, state_kernel)
-
-
-@pytest.mark.parametrize("T", [2, 4])
-def test_kda_decode_mtp_kernel_kv_layout(T):
-    """Fused kernel with the 'kv' state layout (pool, HV, K, V)."""
-    N, H, HV, K, V = 4, 8, 16, 128, 128
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, state_vk = make_inputs_mtp(N, T, H, HV, K, V)
-
-    o_ref, state_ref_vk = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state_vk.clone(), scale
-    )
-
-    # kv layout state: (N, HV, K, V)
-    state_kv = state_vk.permute(0, 1, 3, 2).contiguous()
-    indices = torch.arange(N, device=q.device, dtype=torch.int32)
-    o_kernel = kda_decode_mtp(
-        A_log=A_log,
-        dt_bias=dt_bias,
-        q=q.to(torch.bfloat16),
-        k=k.to(torch.bfloat16),
-        v=v.to(torch.bfloat16),
-        a=a.to(torch.bfloat16),
-        b=b.to(torch.bfloat16),
-        initial_state_source=state_kv,
-        initial_state_indices=indices,
-        scale=scale,
-        use_qk_l2norm_in_kernel=True,
-        state_layout="kv",
-    )
-
-    _assert_close("mtp kv output", o_ref, o_kernel.float())
-    _assert_close("mtp kv final state", state_ref_vk, state_kv.permute(0, 1, 3, 2).contiguous())
-
-
-# ---------------------------------------------------------------------------
-# Tests (P2): parameterized tile_v. Each tile_v ∈ {8,16,32,64} must reproduce
-# the same recurrence; only the CTA V-tiling / warp reduction width changes.
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("tile_v", [8, 16, 32, 64])
-@pytest.mark.parametrize("T", [2, 4])
-def test_kda_decode_mtp_kernel_tile_v(tile_v, T):
-    N, H, HV, K, V = 4, 8, 16, 128, 128
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-
-    o_ref, state_ref = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
-    )
-    o_kernel, state_kernel = run_kda_decode_mtp_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=tile_v
-    )
-
-    _assert_close(f"mtp tile_v={tile_v} output", o_ref, o_kernel.float())
-    _assert_close(f"mtp tile_v={tile_v} final state", state_ref, state_kernel)
-
-
-# ---------------------------------------------------------------------------
-# Test (P2): mid/large batch. N >= 1024 used to raise NotImplementedError;
-# the single parameterized kernel + work_units heuristic now covers it. We
-# validate against the established single-token kernel looped over T (fast,
-# GPU-only) rather than the O(N*HV*T) python oracle.
-# ---------------------------------------------------------------------------
-@pytest.mark.parametrize("N", [1024, 2048])
-def test_kda_decode_mtp_kernel_large_n(N):
-    T, H, HV, K, V = 2, 8, 16, 128, 128
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-
-    # Reference: T sequential single-token kernel calls (state carried over).
-    o_loop, state_loop = run_kda_decode_mtp_via_loop_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale
-    )
-    # Fused MTP kernel with heuristic tile_v (work_units = N*HV -> tile_v=64 here).
-    o_kernel, state_kernel = run_kda_decode_mtp_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale
-    )
-
-    _assert_close(f"mtp large N={N} output", o_loop.float(), o_kernel.float())
-    _assert_close(f"mtp large N={N} final state", state_loop, state_kernel)
-
-
-# ---------------------------------------------------------------------------
 # Test: a single MTP step (T=1) must equal the existing single-token decode
 # (sanity check that the MTP reference reduces to the established baseline)
 # ---------------------------------------------------------------------------
@@ -488,10 +331,9 @@ def test_kda_mtp_zero_state(T):
 #
 # kda_decode_mtp_ws is the FlashInfer-style warp-specialized variant (grid =
 # N*HV*num_v_tiles, register-resident state, full-warp shuffle reduction,
-# decay-first order with per-channel g). It is a SEPARATE implementation of the
-# same contract as kda_decode_mtp, validated against the SAME fp32 torch oracle.
-# Stage 1: vk-only, ilp_rows=2. bf16 rounding differs from the Route-2 kernel
-# (different accumulation order), so we gate on the oracle, not on Route 2.
+# decay-first order with per-channel g), validated against the fp32 torch oracle.
+# vk-only. bf16 rounding (accumulation order) differs from the looped single-token
+# kernel, so we gate on the oracle, not on bit-for-bit equality with the loop.
 # ===========================================================================
 def run_kda_decode_mtp_ws_dense(
     q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2,

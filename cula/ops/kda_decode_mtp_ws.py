@@ -1,11 +1,10 @@
 """CuTe DSL KDA MTP decode — warp-specialized variant (issue #17, Route 1).
 
 This is the "migrate flashinfer's warp-specialized GDN MTP kernel into cuLA,
-changing only the decay" route (P3 plan Appendix A). It is an alternative
-implementation of the same public contract as ``kda_decode_mtp`` (in
-``kda_decode.py``'s sibling ``kda_decode_mtp.py``), kept as a SEPARATE module so
-the two routes can be benchmarked head-to-head (``bench_kda_decode_mtp.py``)
-before deciding which one goes upstream.
+changing only the decay" route (P3 plan Appendix A). It is the production KDA MTP
+decode kernel; the public entry points are ``kda_decode_mtp_ws`` (warp-spec) and
+``kda_decode_mtp_ws_inline`` (the inline small-batch variant), benchmarked
+against the looped single-token ``kda_decode`` in ``bench_kda_decode_mtp.py``.
 
 Source attribution: the kernel structure (warp specialization, register-resident
 state, full-warp shuffle reduction, CTA decomposition ``B*HV*num_v_tiles``) is
@@ -23,10 +22,10 @@ Everything else (steps 2-5 of the gated delta rule, the warp-spec Phase 1, the
 state prefetch, L2 norm) is copied verbatim.
 
 This kernel keeps FlashInfer's DECAY-FIRST order (decay the whole state, then dot
-with the raw k), NOT cuLA's gk-premultiply order. That divergence is intentional:
-Route 1 is a faithful port; cuLA's gk-premultiply lives in the Route-2 kernel
-(``kda_decode_mtp.py``). The two will produce slightly different bf16 rounding;
-both are validated against the fp32 torch oracle at atol 3e-2 / rtol 2e-2.
+with the raw k), NOT a gk-premultiply order. That divergence is intentional: this
+is a faithful port. The bf16 rounding differs slightly from the looped
+single-token kernel (different accumulation order); both are validated against the
+fp32 torch oracle at atol 3e-2 / rtol 2e-2.
 
 Scope (this file):
 - Warp-specialized variant only (no inline variant — Route 1 drops it).
@@ -72,13 +71,12 @@ from cula.ops.kda_decode import (
     _normalize_state_source,
     _prepare_output_tensor,
 )
-from cula.ops.kda_decode_mtp import _normalize_mtp_a, _select_mtp_config
 
 logger = logging.getLogger(__name__)
 
 # vec_size = 4 -> 32 threads/group = a full warp, 4 groups (warps) per block.
-# Full-warp shuffle reduction over K is independent of tile_v, so unlike the
-# Route-2 kernel we do NOT specialize the kernel body per tile_v.
+# Full-warp shuffle reduction over K is independent of tile_v, so the kernel body
+# is NOT specialized per tile_v (tile_v stays a plain constexpr, not a body shape).
 VEC_SIZE_MTP = 4
 
 # Warp-spec MTP kernels are compiled once per shape/config (including T, tile_v,
@@ -88,6 +86,96 @@ _compiled_mtp_ws_kernels: dict[tuple, object] = {}
 # Inline-variant MTP kernels (small batch). Same cache-key shape as the warp-spec
 # table above; kept in a separate dict so the two variants never collide.
 _compiled_mtp_inline_kernels: dict[tuple, object] = {}
+
+
+# ---------------------------------------------------------------------------
+# Host-side config helpers (relocated from the now-deleted Route-2
+# ``kda_decode_mtp.py``; they are pure-Python and shared by the ws + inline
+# entry points, the benchmark, and the tests).
+# ---------------------------------------------------------------------------
+def _normalize_mtp_a(a: torch.Tensor, *, N: int, T: int, HV: int, K: int) -> torch.Tensor:
+    """Normalize `a` to the compile-time dense MTP shape (N, T, HV, K)."""
+    if a.dim() == 4 and tuple(a.shape) == (N, T, HV, K):
+        return a
+    if a.dim() == 3 and tuple(a.shape) == (N, T, HV * K):
+        return a.view(N, T, HV, K)
+    raise ValueError(f"Unexpected a shape for MTP dense: {tuple(a.shape)}; expected {(N, T, HV, K)}")
+
+
+# Valid V-tile sizes: each must be a multiple of NUM_WARPS (4) so V_PER_WARP is
+# integral, and the heuristic picks from these. (flashinfer's get_mtp_config uses
+# {8,16,32,64}; we mirror the tile_v axis. ilp_rows is capped at 4 here;
+# use_smem_v is consumed by Stage C.)
+_MTP_TILE_V_CHOICES = (8, 16, 32, 64)
+
+
+def _select_mtp_config(
+    N: int,
+    HV: int,
+    V: int,
+    T: int,
+    *,
+    disable_state_update: bool = False,
+) -> tuple[int, int, bool]:
+    """Pick (tile_v, ilp_rows, use_smem_v) from work_units = N*HV.
+
+    Mirrors FlashInfer's ``get_mtp_config`` (``gdn_decode_mtp.py:63-116``)
+    thresholds, with one deliberate divergence: ``ilp_rows`` is **capped at 4**
+    (the warp-spec kernel does not implement the ilp=8 path), so the >1024 bucket
+    uses ilp=4 instead of FlashInfer's ilp=8 (which it picks there for
+    state_update + T<=2). ``use_smem_v`` is produced for the large-batch bucket and
+    consumed by the ws/inline kernels (Stage C).
+
+    Small work_units -> small tile_v -> more V-tiles -> more CTAs to fill the GPU;
+    large work_units -> large tile_v -> fewer CTAs, better per-CTA efficiency.
+
+    ``disable_state_update`` is accepted for parity with FlashInfer's signature
+    (there it gates the ilp=8 choice); with ilp capped at 4 it does not change the
+    selection here, but threading it keeps the call sites aligned with FlashInfer
+    and ready for the ilp=8 path if it is ever added.
+    """
+    work_units = N * HV
+
+    if work_units <= 64:
+        tile_v, ilp_rows, use_smem_v = 8, 2, False
+    elif work_units <= 128:
+        tile_v, ilp_rows, use_smem_v = 16, 4, False
+    elif work_units <= 448:
+        if T <= 2:
+            tile_v, ilp_rows, use_smem_v = 16, 2, False
+        else:
+            tile_v, ilp_rows, use_smem_v = 32, 4, False
+    elif work_units <= 1024:
+        tile_v, ilp_rows, use_smem_v = 32, 4, False
+    else:
+        # Large batches. FlashInfer uses ilp=8 + use_smem_v=False here when
+        # state_update is ON and T<=2; we cap ilp at 4, so use (64, 4, True)
+        # uniformly.
+        tile_v, ilp_rows, use_smem_v = 64, 4, True
+
+    # Clamp to V and back off to a divisor of V (V is a multiple of 16 in
+    # practice, so this is a no-op for the common V=128 case).
+    tile_v = min(tile_v, V)
+    while tile_v > _MTP_TILE_V_CHOICES[0] and V % tile_v != 0:
+        tile_v //= 2
+
+    # Legality backstop: ilp=4 requires (tile_v//4) % 4 == 0, i.e. tile_v % 16 == 0
+    # (otherwise the warp-spec kernel's row_quad loop count truncates and trailing
+    # V-rows are silently skipped). If clamping/back-off dropped tile_v below a
+    # multiple of 16 (e.g. small V), fall back to the universally-legal ilp=2.
+    if ilp_rows == 4 and tile_v % 16 != 0:
+        ilp_rows = 2
+
+    return tile_v, ilp_rows, use_smem_v
+
+
+def _select_mtp_tile_v(N: int, HV: int, V: int, T: int) -> int:
+    """Pick tile_v from work_units = N*HV (the tile_v axis of _select_mtp_config).
+
+    Thin wrapper for callers that only need tile_v (the benchmark); the full
+    ``(tile_v, ilp_rows, use_smem_v)`` tuple lives in :func:`_select_mtp_config`.
+    """
+    return _select_mtp_config(N, HV, V, T)[0]
 
 
 @cute.jit
