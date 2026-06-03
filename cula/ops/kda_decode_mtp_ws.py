@@ -1,51 +1,32 @@
-"""CuTe DSL KDA MTP decode — warp-specialized variant (issue #17, Route 1).
+"""CuTe DSL KDA MTP decode
 
-This is the "migrate flashinfer's warp-specialized GDN MTP kernel into cuLA,
-changing only the decay" route (P3 plan Appendix A). It is the production KDA MTP
-decode kernel; the public entry points are ``kda_decode_mtp_ws`` (warp-spec) and
-``kda_decode_mtp_ws_inline`` (the inline small-batch variant), benchmarked
-against the looped single-token ``kda_decode`` in ``bench_kda_decode_mtp.py``.
+Production KDA MTP decode kernel. Public entry points: ``kda_decode_mtp_ws``
+(warp-spec) and ``kda_decode_mtp_ws_inline`` (small-batch inline variant). The
+defining feature is KDA's per-K-channel decay gate ``g_t in R^K`` (``beta`` stays a
+per-(head, token) scalar); the whole kernel is built around that channel axis.
 
-Source attribution: the kernel structure (warp specialization, register-resident
-state, full-warp shuffle reduction, CTA decomposition ``B*HV*num_v_tiles``) is
-ported from FlashInfer's ``flashinfer/gdn_kernels/gdn_decode_mtp.py``
-(``gdn_verify_kernel_mtp``), Apache-2.0. The ONLY algorithmic change is the
-decay: GDN uses a scalar gate ``g_t`` per (head, token); KDA uses a per-K-channel
-gate ``g_t in R^K``. Concretely:
-    - ``a``: [N, T, HV]      -> [N, T, HV, K]     (per channel)
-    - ``dt_bias``: [HV]      -> [HV, K]           (per channel)
-    - SMEM gate ``sG``: [T]  -> [T, K]            (per channel, staged like sK)
-    - decay step ``r_h[row,i] *= r_g``  ->  ``*= r_g[i]``  (lane owns channels
-      ``k_start .. k_start+vec_size``, so it scales each with the matching g)
-    - ``beta`` stays a per-(head, token) scalar.
-Everything else (steps 2-5 of the gated delta rule, the warp-spec Phase 1, the
-state prefetch, L2 norm) is copied verbatim.
-
-This kernel keeps FlashInfer's DECAY-FIRST order (decay the whole state, then dot
-with the raw k), NOT a gk-premultiply order. That divergence is intentional: this
-is a faithful port. The bf16 rounding differs slightly from the looped
-single-token kernel (different accumulation order); both are validated against the
-fp32 torch oracle at atol 3e-2 / rtol 2e-2.
+Grid = N*HV*num_v_tiles, one CTA per (i_n, i_hv, i_v V-tile). State is
+register-resident across the T tokens; the K-reduce is a full-warp shuffle. The
+recurrence uses the DECAY-FIRST order (decay the whole state, then dot with raw k);
+bf16 rounding differs slightly from the single-token ``kda_decode`` (accumulation
+order), both validated against the fp32 torch oracle at atol 3e-2 / rtol 2e-2.
 
 Scope (this file):
-- Warp-specialized variant only (no inline variant — Route 1 drops it).
-- ``ilp_rows in {2, 4}``. ilp=2 (Stage 1) covers every tile_v in {8,16,32,64};
-  ilp=4 (Stage 2) fuses steps 1+2 and 4+5, uses double accumulators + packed
-  F32x2 FMA on SM100 (scalar ``fma_pair`` fallback elsewhere), and requires
-  ``tile_v % 16 == 0`` (so {16,32,64}). ilp=8 is not ported.
-- ``vk`` state layout only (FlashInfer is vk-only; kv is a later add-back).
-- ``use_smem_v`` (Stage C): preload the v-tile into SMEM + merged coalesced
-  output writeback (``sOutput``); constexpr, off by default unless the heuristic
-  (large batch / tile_v=64) or an explicit arg turns it on. Works with ilp 2/4.
+- Warp-spec variant + inline variant. ``ilp_rows in {2, 4}``: ilp=2 covers every
+  tile_v in {8,16,32,64}; ilp=4 fuses steps 1+2 and 4+5 with double accumulators +
+  packed F32x2 FMA on SM100 (scalar ``fma_pair`` fallback elsewhere) and requires
+  ``tile_v % 16 == 0`` (so {16,32,64}).
+- ``vk`` state layout only.
+- ``use_smem_v`` (Stage C): preload the v-tile into SMEM + coalesced merged output
+  writeback. Constexpr, off unless the heuristic / an explicit arg turns it on.
 - ``cache_intermediate_states`` (Stage D): when an ``intermediate_states_buffer``
   ([N, T, HV, V, K] vk) is passed, snapshot every token's post-state to GMEM
-  (sequence-indexed) for speculative-decoding rollback. Produce-only: cuLA fills
-  the buffer; it does NOT implement the rollback. Constexpr, off by default.
-- ``disable_state_update`` supported (cheap; default False = always write back).
+  (sequence-indexed) for speculative-decoding rollback. Produce-only.
+- ``disable_state_update`` supported (default False = always write back).
 
 Math per token t (decay-first, per-channel g):
     g_t   = exp(-exp(A_log) * softplus(a_t + dt_bias))       # (K,) per-channel
-    S    <- diag... S * g_t                                   # step 1 (per channel)
+    S    <- S * diag(g_t)                                     # step 1 (per channel)
     s     = S @ k_norm                                        # step 2 (reduce K)
     v_new = sigmoid(b_t) * (v_t - s)                          # step 3
     S    += v_new (x) k_norm                                  # step 4 (rank-1, raw k)
@@ -87,11 +68,15 @@ _compiled_mtp_ws_kernels: dict[tuple, object] = {}
 # table above; kept in a separate dict so the two variants never collide.
 _compiled_mtp_inline_kernels: dict[tuple, object] = {}
 
+# Gating pre-pass kernels (compute g + beta once per (i_n, i_t, i_hv), shared by
+# both the ws and inline recurrence kernels when precompute_gating is on). Cached
+# by (N, T, HV, K, softplus_beta, softplus_threshold, opt_level, fast_math).
+_compiled_mtp_gating_kernels: dict[tuple, object] = {}
+
 
 # ---------------------------------------------------------------------------
-# Host-side config helpers (relocated from the now-deleted Route-2
-# ``kda_decode_mtp.py``; they are pure-Python and shared by the ws + inline
-# entry points, the benchmark, and the tests).
+# Host-side config helpers (pure-Python; shared by the ws + inline entry points,
+# the benchmark, and the tests).
 # ---------------------------------------------------------------------------
 def _normalize_mtp_a(a: torch.Tensor, *, N: int, T: int, HV: int, K: int) -> torch.Tensor:
     """Normalize `a` to the compile-time dense MTP shape (N, T, HV, K)."""
@@ -102,10 +87,8 @@ def _normalize_mtp_a(a: torch.Tensor, *, N: int, T: int, HV: int, K: int) -> tor
     raise ValueError(f"Unexpected a shape for MTP dense: {tuple(a.shape)}; expected {(N, T, HV, K)}")
 
 
-# Valid V-tile sizes: each must be a multiple of NUM_WARPS (4) so V_PER_WARP is
-# integral, and the heuristic picks from these. (flashinfer's get_mtp_config uses
-# {8,16,32,64}; we mirror the tile_v axis. ilp_rows is capped at 4 here;
-# use_smem_v is consumed by Stage C.)
+# Valid V-tile sizes {8,16,32,64}: each a multiple of NUM_WARPS (4) so V_PER_WARP
+# is integral; the heuristic picks from these.
 _MTP_TILE_V_CHOICES = (8, 16, 32, 64)
 
 
@@ -117,23 +100,6 @@ def _select_mtp_config(
     *,
     disable_state_update: bool = False,
 ) -> tuple[int, int, bool]:
-    """Pick (tile_v, ilp_rows, use_smem_v) from work_units = N*HV.
-
-    Mirrors FlashInfer's ``get_mtp_config`` (``gdn_decode_mtp.py:63-116``)
-    thresholds, with one deliberate divergence: ``ilp_rows`` is **capped at 4**
-    (the warp-spec kernel does not implement the ilp=8 path), so the >1024 bucket
-    uses ilp=4 instead of FlashInfer's ilp=8 (which it picks there for
-    state_update + T<=2). ``use_smem_v`` is produced for the large-batch bucket and
-    consumed by the ws/inline kernels (Stage C).
-
-    Small work_units -> small tile_v -> more V-tiles -> more CTAs to fill the GPU;
-    large work_units -> large tile_v -> fewer CTAs, better per-CTA efficiency.
-
-    ``disable_state_update`` is accepted for parity with FlashInfer's signature
-    (there it gates the ilp=8 choice); with ilp capped at 4 it does not change the
-    selection here, but threading it keeps the call sites aligned with FlashInfer
-    and ready for the ilp=8 path if it is ever added.
-    """
     work_units = N * HV
 
     if work_units <= 64:
@@ -148,9 +114,7 @@ def _select_mtp_config(
     elif work_units <= 1024:
         tile_v, ilp_rows, use_smem_v = 32, 4, False
     else:
-        # Large batches. FlashInfer uses ilp=8 + use_smem_v=False here when
-        # state_update is ON and T<=2; we cap ilp at 4, so use (64, 4, True)
-        # uniformly.
+        # Large batches: ilp capped at 4, so (64, 4, True) uniformly.
         tile_v, ilp_rows, use_smem_v = 64, 4, True
 
     # Clamp to V and back off to a divisor of V (V is a multiple of 16 in
@@ -160,9 +124,6 @@ def _select_mtp_config(
         tile_v //= 2
 
     # Legality backstop: ilp=4 requires (tile_v//4) % 4 == 0, i.e. tile_v % 16 == 0
-    # (otherwise the warp-spec kernel's row_quad loop count truncates and trailing
-    # V-rows are silently skipped). If clamping/back-off dropped tile_v below a
-    # multiple of 16 (e.g. small V), fall back to the universally-legal ilp=2.
     if ilp_rows == 4 and tile_v % 16 != 0:
         ilp_rows = 2
 
@@ -170,27 +131,199 @@ def _select_mtp_config(
 
 
 def _select_mtp_tile_v(N: int, HV: int, V: int, T: int) -> int:
-    """Pick tile_v from work_units = N*HV (the tile_v axis of _select_mtp_config).
+    # Pick tile_v from work_units = N*HV (the tile_v axis of _select_mtp_config).
 
-    Thin wrapper for callers that only need tile_v (the benchmark); the full
-    ``(tile_v, ilp_rows, use_smem_v)`` tuple lives in :func:`_select_mtp_config`.
-    """
     return _select_mtp_config(N, HV, V, T)[0]
 
 
 @cute.jit
 def fma_pair(a1, a2, b1, b2, c1, c2):
-    """FMA two pairs: (a1*b1+c1, a2*b2+c2). SM90-compatible scalar fallback.
-
-    ``cute.arch.fma_packed_f32x2`` emits an F32x2 instruction that only exists on
-    SM100+ (Blackwell). The ilp=4 path pairs two FMAs per loop step to expose ILP;
-    when ``use_packed_fma`` is False (SM90, or forced off) we issue the two scalar
-    FMAs explicitly so the compiler still schedules them independently. Ported
-    verbatim from FlashInfer ``gdn_decode_mtp.py:fma_pair``.
-    """
+    # FMA two pairs: (a1*b1+c1, a2*b2+c2).
     result1 = a1 * b1 + c1
     result2 = a2 * b2 + c2
     return result1, result2
+
+@cute.kernel
+def kda_gating_kernel_mtp(
+    A_log: cute.Tensor,  # [HV] fp32
+    a: cute.Tensor,  # [N, T, HV, K] (per-channel decay input)
+    dt_bias: cute.Tensor,  # [HV, K] (per-channel decay bias)
+    b: cute.Tensor,  # [N, T, HV] (update-gate logit)
+    g: cute.Tensor,  # [N, T, HV, K] fp32 OUT — per-channel decay gate
+    beta: cute.Tensor,  # [N, T, HV] fp32 OUT — sigmoid update gate
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    fast_math: cutlass.Constexpr[bool],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    # Flat CTA index -> (i_n, i_t, i_hv). Layout matches the [N, T, HV] row-major
+    # order so consecutive CTAs over i_hv hit consecutive a/g rows.
+    i_hv = bidx % HV
+    tmp = bidx // HV
+    i_t = tmp % T
+    i_n = tmp // T
+
+    kk = tidx  # block = K threads; this thread owns K-channel kk
+
+    # exp(A_log) is per-head, shared across all K channels (KDA); each thread
+    # recomputes the single value (1 exp) rather than staging it through SMEM.
+    r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
+
+    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
+    beta_x = softplus_beta * x
+    exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
+    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+        cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
+    )
+    use_softplus = (
+        cutlass.Float32(1.0)
+        if beta_x <= softplus_threshold
+        else cutlass.Float32(0.0)
+    )
+    softplus_x = (
+        use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
+    )
+    g[(i_n, i_t, i_hv, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
+
+    # beta = sigmoid(b) is a per-(i_n, i_t, i_hv) scalar — thread 0 writes it.
+    if tidx == 0:
+        r_b = cutlass.Float32(b[i_n, i_t, i_hv])
+        beta[(i_n, i_t, i_hv)] = cutlass.Float32(1.0) / (
+            cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
+        )
+
+
+@cute.jit
+def run_kda_gating_kernel_mtp(
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    b: cute.Tensor,
+    g: cute.Tensor,
+    beta: cute.Tensor,
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    fast_math: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    """Host-side launcher for the gating pre-pass: grid = N*T*HV, block = K."""
+    n = a.layout.shape[0]
+    grid_size = n * T * HV
+    kda_gating_kernel_mtp(
+        A_log,
+        a,
+        dt_bias,
+        b,
+        g,
+        beta,
+        softplus_beta,
+        softplus_threshold,
+        HV,
+        T,
+        K,
+        fast_math,
+    ).launch(
+        grid=(grid_size, 1, 1),
+        block=[K, 1, 1],
+        stream=stream,
+    )
+
+
+def _get_compiled_mtp_gating_kernel(
+    N,
+    T,
+    HV,
+    K,
+    softplus_beta,
+    softplus_threshold,
+    opt_level=1,
+    fast_math=False,
+):
+    key = (N, T, HV, K, softplus_beta, softplus_threshold, opt_level, fast_math)
+    if key in _compiled_mtp_gating_kernels:
+        return _compiled_mtp_gating_kernels[key]
+
+    a = torch.zeros(N, T, HV, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(N, T, HV, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
+    g = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    beta = torch.zeros(N, T, HV, dtype=torch.float32, device="cuda")
+
+    a_tensor = from_dlpack(a, assumed_align=16)
+    b_tensor = from_dlpack(b, assumed_align=16)
+    A_log_tensor = from_dlpack(A_log, assumed_align=16)
+    dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+    g_tensor = from_dlpack(g, assumed_align=16)
+    beta_tensor = from_dlpack(beta, assumed_align=16)
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    compiled_kernel = cute.compile(
+        run_kda_gating_kernel_mtp,
+        A_log_tensor,
+        a_tensor,
+        dt_bias_tensor,
+        b_tensor,
+        g_tensor,
+        beta_tensor,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        HV=HV,
+        T=T,
+        K=K,
+        fast_math=fast_math,
+        stream=stream,
+        options=f"--enable-tvm-ffi --opt-level {opt_level}",
+    )
+
+    _compiled_mtp_gating_kernels[key] = compiled_kernel
+    logger.info(
+        "CuTe DSL KDA MTP gating pre-pass kernel compiled: "
+        f"N={N}, T={T}, HV={HV}, K={K}, opt_level={opt_level}, fast_math={fast_math}"
+    )
+    return compiled_kernel
+
+
+def _run_mtp_gating_prepass(
+    A_log,
+    a,
+    dt_bias,
+    b,
+    *,
+    N,
+    T,
+    HV,
+    K,
+    softplus_beta,
+    softplus_threshold,
+    opt_level,
+    fast_math,
+    device,
+    stream,
+):
+    g = torch.empty(N, T, HV, K, dtype=torch.float32, device=device)
+    beta = torch.empty(N, T, HV, dtype=torch.float32, device=device)
+    compiled_kernel = _get_compiled_mtp_gating_kernel(
+        N,
+        T,
+        HV,
+        K,
+        softplus_beta,
+        softplus_threshold,
+        opt_level=opt_level,
+        fast_math=fast_math,
+    )
+    compiled_kernel(A_log, a, dt_bias, b, g, beta, stream)
+    return g, beta
 
 
 @cute.kernel
@@ -200,13 +333,15 @@ def kda_verify_kernel_mtp_ws(
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
-    A_log: cute.Tensor,  # [HV] fp32
-    a: cute.Tensor,  # [N, T, HV, K] (KDA: per-channel decay input)
-    dt_bias: cute.Tensor,  # [HV, K] (KDA: per-channel decay bias)
+    A_log: cute.Tensor,  # [HV] fp32 (gating recompute; dummy when precompute_gating)
+    a: cute.Tensor,  # [N, T, HV, K] (per-channel decay input; dummy when precompute)
+    dt_bias: cute.Tensor,  # [HV, K] (per-channel decay bias; dummy when precompute)
     q: cute.Tensor,  # [N, T, H, K]
     k: cute.Tensor,  # [N, T, H, K]
     v: cute.Tensor,  # [N, T, HV, V]
-    b: cute.Tensor,  # [N, T, HV]
+    b: cute.Tensor,  # [N, T, HV] (update-gate logit; dummy when precompute_gating)
+    g: cute.Tensor,  # [N, T, HV, K] fp32 precomputed decay gate (dummy when not)
+    beta_pre: cute.Tensor,  # [N, T, HV] fp32 precomputed sigmoid gate (dummy when not)
     o: cute.Tensor,  # [N, T, HV, V] output
     h0_indices: cute.Tensor,  # [N] int32 (state-pool slot per sequence; <0 = pad)
     softplus_beta: cutlass.Constexpr[float],
@@ -223,22 +358,9 @@ def kda_verify_kernel_mtp_ws(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    precompute_gating: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
 ):
-    """Warp-specialized KDA MTP kernel. One CTA owns one (i_n, i_hv, i_v) tile.
-
-    Phase 1: warp 0 computes q/k (L2-normed) + per-channel g + scalar beta for
-    all T tokens and writes them to SMEM; warps 1-3 prefetch the first ILP set
-    of state rows from GMEM into registers. If ``use_smem_v`` (Stage C), all warps
-    also cooperatively preload the v-tile into ``sVdata``. A barrier publishes the
-    SMEM. Then all 4 warps run the T-step recurrence with state register-resident,
-    one CTA covering ``tile_v`` V-rows (4 warps x rows_per_group), each lane owning
-    ``vec_size`` K-channels of a V-row and reducing over K via full-warp shuffle.
-    Outputs go straight to ``o`` (default) or, under ``use_smem_v``, accumulate in
-    ``sOutput`` for a single coalesced merged writeback after the recurrence. If
-    ``cache_intermediate_states`` (Stage D), each token's post-state is snapshotted
-    fire-and-forget to ``intermediate_states`` (sequence-indexed) for spec-decode.
-    """
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
     warp_idx = cute.arch.warp_idx()
@@ -261,17 +383,13 @@ def kda_verify_kernel_mtp_ws(
 
     cache_idx = h0_indices[i_n]
 
-    # A_log/dt_bias don't vary with token. exp(A_log) is per-head and (for KDA)
-    # shared across all K channels, so hoist it out of the per-channel/token loop.
-    # ``fast_math`` (constexpr) threads to every transcendental's ``fastmath=``:
-    # False (default) reproduces the no-fastmath port; True is the FlashInfer-style
-    # fast intrinsic (issue 17 compile-knob tuning).
-    r_A_log = cutlass.Float32(A_log[i_hv])
-    r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
+    # exp(A_log) is per-head, shared across all K channels — hoist once. Needed
+    # only on the recompute path (the pre-pass already folds it into g in GMEM).
+    if cutlass.const_expr(not precompute_gating):
+        r_A_log = cutlass.Float32(A_log[i_hv])
+        r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
 
-    # SMEM broadcast buffers (warp 0 -> all warps). sG is [T, K] (per-channel),
-    # unlike GDN's scalar [T]; staged exactly like sK. +8 K-padding keeps each
-    # row 16B-aligned for vectorized access.
+    # SMEM broadcast buffers (warp 0 -> all warps). sG is [T, K] (per-channel);
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(
         cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16
@@ -284,15 +402,8 @@ def kda_verify_kernel_mtp_ws(
     )
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
 
-    # use_smem_v (Stage C): preload the CTA's v-tile into SMEM (one cooperative
-    # load up front instead of a GMEM read every token) and accumulate this
-    # CTA's outputs in SMEM for a single coalesced merged writeback at the end
-    # (vs lane-0 scatter writes per token). Helps large batch / tile_v=64 write
-    # bandwidth. Allocated LAST and only when enabled, so the offsets of the
-    # unconditional broadcast buffers (sQ/sK/sG/sBeta) — and the off-path's total
-    # SMEM footprint — never shift. 16B alignment like the other ws buffers (NOT
-    # Route-2's 128B; see cdf6a89), so the launcher's flat +128 slack covers the
-    # cumulative per-tensor padding without per-tensor 128B rounding.
+    # use_smem_v (Stage C): preload the v-tile into SMEM + accumulate outputs for a
+    # coalesced merged writeback. Allocated last/conditionally so off-path offsets stay put.
     if cutlass.const_expr(use_smem_v):
         sVdata = smem.allocate_tensor(
             cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
@@ -301,11 +412,8 @@ def kda_verify_kernel_mtp_ws(
             cutlass.BFloat16, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16
         )
 
-    # Per-lane registers. r_g holds this lane's vec_size channels of g (the KDA
-    # change vs GDN's scalar). r_h holds up to 8 V-rows of state (only ilp_rows
-    # used); each r_h[row] spans the warp's 32 lanes to cover all K=128 channels.
-    # Explicit-layout form (matches la_decode.py and FlashInfer); the row-major
-    # (vec_size, 1) stride keeps each r_h[row] contiguous for autovec_copy/slice_.
+    # Per-lane registers: r_g = this lane's vec_size channels of g; r_h = up to 8
+    # V-rows of state (only ilp_rows used), each row spanning 32 lanes over K=128.
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
@@ -364,42 +472,46 @@ def kda_verify_kernel_mtp_ws(
                     sQ[(i_t, k_start + i)] = r_q[i]
                     sK[(i_t, k_start + i)] = r_k[i]
 
-                # KDA per-channel decay gate: each lane computes g for its own
-                # vec_size channels. g[kk] = exp(-exp(A_log) * softplus(a+dt_bias)).
-                for i in cutlass.range_constexpr(vec_size):
-                    kk = k_start + i
-                    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(
-                        dt_bias[i_hv, kk]
-                    )
-                    beta_x = softplus_beta * x
-                    exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
-                    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
-                    )
-                    use_softplus = (
-                        cutlass.Float32(1.0)
-                        if beta_x <= softplus_threshold
-                        else cutlass.Float32(0.0)
-                    )
-                    softplus_x = (
-                        use_softplus * softplus_val
-                        + (cutlass.Float32(1.0) - use_softplus) * x
-                    )
-                    sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
+                if cutlass.const_expr(precompute_gating):
+                    # warp 0 stages this token's g (each lane its vec_size channels)
+                    # + scalar beta from the pre-pass GMEM buffers into SMEM.
+                    for i in cutlass.range_constexpr(vec_size):
+                        kk = k_start + i
+                        sG[(i_t, kk)] = cutlass.Float32(g[i_n, i_t, i_hv, kk])
+                    sBeta[i_t] = cutlass.Float32(beta_pre[i_n, i_t, i_hv])
+                else:
+                    # KDA per-channel decay gate: each lane computes g for its own
+                    # vec_size channels. g[kk] = exp(-exp(A_log) * softplus(a+dt_bias)).
+                    for i in cutlass.range_constexpr(vec_size):
+                        kk = k_start + i
+                        x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(
+                            dt_bias[i_hv, kk]
+                        )
+                        beta_x = softplus_beta * x
+                        exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
+                        softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                            cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
+                        )
+                        use_softplus = (
+                            cutlass.Float32(1.0)
+                            if beta_x <= softplus_threshold
+                            else cutlass.Float32(0.0)
+                        )
+                        softplus_x = (
+                            use_softplus * softplus_val
+                            + (cutlass.Float32(1.0) - use_softplus) * x
+                        )
+                        sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
 
-                # Update gate beta is a per-(head, token) scalar (warp-uniform).
-                r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-                r_beta = cutlass.Float32(1.0) / (
-                    cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
-                )
-                sBeta[i_t] = r_beta
+                    # Update gate beta is a per-(head, token) scalar (warp-uniform).
+                    r_b = cutlass.Float32(b[i_n, i_t, i_hv])
+                    r_beta = cutlass.Float32(1.0) / (
+                        cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
+                    )
+                    sBeta[i_t] = r_beta
 
-                # Cooperatively preload this CTA's v-tile into SMEM. Warp 0 covers
-                # the first 32 tile-local columns (tidx<32); warps 1-3 cover the
-                # rest below (their tidx 32..127). Guarded by tidx<tile_v so only
-                # the tile_v owners write — together all columns 0..tile_v-1 are
-                # filled exactly once (no overlap; tidx is the global thread id).
-                # Mirrors FlashInfer gdn_decode_mtp.py:405-412.
+                # Preload the v-tile into SMEM: warp 0 covers tile-local cols 0..31,
+                # warps 1-3 the rest (tidx<tile_v guard -> each col written once).
                 if cutlass.const_expr(use_smem_v):
                     if tidx < tile_v:
                         v_global_idx = i_v * tile_v + tidx
@@ -455,10 +567,8 @@ def kda_verify_kernel_mtp_ws(
                     cute.autovec_copy(pf_a, cute.slice_(r_h, (0, None)))
                     cute.autovec_copy(pf_b, cute.slice_(r_h, (1, None)))
 
-            # Warps 1-3 help preload the v-tile (their tidx 32..127 cover the
-            # tile-local columns warp 0's 32 lanes can't reach, e.g. cols 32..63
-            # at tile_v=64). Same tidx<tile_v guard as warp 0 -> every column
-            # written exactly once. Mirrors FlashInfer gdn_decode_mtp.py:471-480.
+            # Warps 1-3 cover the tile-local v columns warp 0 can't reach
+            # (tidx 32..127); same tidx<tile_v guard -> each column written once.
             if cutlass.const_expr(use_smem_v):
                 for i_t in cutlass.range_constexpr(T):
                     if tidx < tile_v:
@@ -542,16 +652,8 @@ def kda_verify_kernel_mtp_ws(
                             r_h[0, i] += r_k[i] * v_new_a
                             r_h[1, i] += r_k[i] * v_new_b
 
-                        # Stage D: snapshot the post-token state (r_h now holds the
-                        # state AFTER consuming token i_t) to the GMEM cache. Indexed
-                        # by SEQUENCE i_n (NOT the pool slot cache_idx used for the
-                        # h0_source writeback): flat_idx = i_n*T*HV + i_t*HV + i_hv,
-                        # i.e. intermediate_states[N,T,HV,V,K] flattened. Each lane
-                        # writes its own vec_size K-channels of rows v_idx_a/b; rows
-                        # and (i_n,i_t,i_hv,i_v) tiles are disjoint across the CTA,
-                        # so the stores are race-free and fire-and-forget — placed
-                        # before step 5 so they overlap the readout + reduction +
-                        # output (mirrors FlashInfer gdn_decode_mtp.py:1265-1279).
+                        # Stage D: snapshot post-token state, sequence-indexed
+                        # (flat_idx = i_n*T*HV + i_t*HV + i_hv), race-free before step 5.
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_a = cute.local_tile(
@@ -608,14 +710,9 @@ def kda_verify_kernel_mtp_ws(
                         cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
 
         # ============ Recurrence: ilp_rows == 4 (process 4 V-rows together) ===
-        # Mirrors FlashInfer's ilp_rows==4 path: steps 1+2 fused (decay then h@k)
-        # and steps 4+5 fused (rank-1 update then h@q), DOUBLE accumulators to halve
-        # the K-reduce FFMA dependency chain, and packed F32x2 FMA on SM100. KDA
-        # change vs GDN: per-channel decay r_g[i]/r_g[i+1] (a vec_size register
-        # loaded from sG, not a scalar). The h@k / h@q FMAs are byte-identical to
-        # GDN. Stage-C use_smem_v (SMEM v read + sOutput merged writeback) and
-        # Stage-D intermediate-state snapshots are wired in below under their
-        # respective constexpr guards.
+        # Steps 1+2 fused (decay then h@k) and 4+5 fused (rank-1 then h@q), with
+        # double accumulators (halve the K-reduce FFMA chain) + packed F32x2 FMA on
+        # SM100. Per-channel decay r_g[i]/r_g[i+1] loaded from sG.
         elif cutlass.const_expr(ilp_rows == 4):
             quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
 
@@ -664,9 +761,8 @@ def kda_verify_kernel_mtp_ws(
                         cute.autovec_copy(sG_tile, r_g)
                         r_beta = sBeta[i_t]
 
-                        # Steps 1+2 FUSED: per-channel decay (step 1) then h@k (step
-                        # 2). Two accumulators (a/a2) split even/odd K channels so the
-                        # FFMA chain is half-length; combined after the strided loop.
+                        # Steps 1+2 fused: per-channel decay then h@k. Two accumulators
+                        # (a/a2) split even/odd K so the FFMA chain is half-length.
                         sum_hk_a = cutlass.Float32(0.0)
                         sum_hk_a2 = cutlass.Float32(0.0)
                         sum_hk_b = cutlass.Float32(0.0)
@@ -869,13 +965,8 @@ def kda_verify_kernel_mtp_ws(
                                 o[(i_n, i_t, i_hv, v_idx_c)] = cutlass.BFloat16(sum_hq_c)
                                 o[(i_n, i_t, i_hv, v_idx_d)] = cutlass.BFloat16(sum_hq_d)
 
-                        # Stage D: snapshot the post-token state. Steps 4+5 are
-                        # fused here, so r_h reaches its final (post-token i_t)
-                        # value only after the loop above — hence the snapshot is
-                        # LAST in the timestep (after the output write), all lanes
-                        # participating (each writes its vec_size K-channels). Same
-                        # sequence-indexed flat_idx and race-free fire-and-forget
-                        # stores as the ilp=2 path (mirrors gdn_decode_mtp.py:1135-1160).
+                        # Stage D: snapshot post-token state (sequence-indexed),
+                        # last here since fused 4+5 means r_h is final only now.
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_a = cute.local_tile(
@@ -931,15 +1022,9 @@ def kda_verify_kernel_mtp_ws(
                         cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
 
         # ============ Merged output writeback (use_smem_v only) ============
-        # Each group wrote its own disjoint tile-local columns of sOutput (lane 0
-        # only), so there is no write-write race; the barrier publishes all of
-        # those before any thread reads. Then all 128 threads cooperatively flush
-        # sOutput -> o, one tile-local column per thread (tidx<tile_v) across all
-        # T tokens — consecutive threads hit consecutive v_global, so the GMEM o
-        # writes coalesce (vs the per-token lane-0 scatter the non-smem path does).
-        # Outside the ilp branches but inside `cache_idx >= 0` (uniform across the
-        # CTA), so the barrier never deadlocks. Mirrors FlashInfer
-        # gdn_decode_mtp.py:1325-1334.
+        # Barrier publishes all groups' disjoint lane-0 sOutput writes, then all 128
+        # threads flush sOutput -> o (one tile-local column each, all T tokens) so the
+        # GMEM writes coalesce. Inside `cache_idx >= 0` so the barrier never deadlocks.
         if cutlass.const_expr(use_smem_v):
             cute.arch.barrier()
             v_tile_base = i_v * tile_v
@@ -961,6 +1046,8 @@ def run_kda_verify_kernel_mtp_ws(
     k: cute.Tensor,
     v: cute.Tensor,
     b: cute.Tensor,
+    g: cute.Tensor,
+    beta_pre: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
@@ -979,6 +1066,7 @@ def run_kda_verify_kernel_mtp_ws(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    precompute_gating: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
@@ -990,16 +1078,10 @@ def run_kda_verify_kernel_mtp_ws(
     num_v_tiles = cute.ceil_div(v_dim, tile_v)
     grid_size = n_indices * HV * num_v_tiles
 
-    # sQ + sK + sG (all [T, K+8] fp32) + sBeta ([T] fp32) + alignment slack.
-    # When use_smem_v, add sVdata ([T, tile_v] fp32) + sOutput ([T, tile_v] bf16),
-    # matching the kernel's conditional allocation. All ws buffers use 16B
-    # alignment (not Route-2's 128B; see cdf6a89), so the flat +128 slack covers
-    # the cumulative per-tensor padding (every fp32 row here is a 16B multiple;
-    # only sBeta can need <16B of padding) — no per-tensor 128B rounding needed.
     smem_bytes = (
         4 * T * (k_dim + 8)  # sQ
         + 4 * T * (k_dim + 8)  # sK
-        + 4 * T * (k_dim + 8)  # sG (KDA: per-channel; GDN had 4*T scalar)
+        + 4 * T * (k_dim + 8)  # sG (per-channel)
         + 4 * T  # sBeta
         + 128  # alignment slack
     )
@@ -1020,6 +1102,8 @@ def run_kda_verify_kernel_mtp_ws(
         k,
         v,
         b,
+        g,
+        beta_pre,
         o,
         h0_indices,
         softplus_beta,
@@ -1036,6 +1120,7 @@ def run_kda_verify_kernel_mtp_ws(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        precompute_gating,
         fast_math,
     ).launch(
         grid=(grid_size, 1, 1),
@@ -1063,16 +1148,14 @@ def _get_compiled_mtp_ws_kernel(
     use_packed_fma,
     use_smem_v,
     cache_intermediate_states,
+    precompute_gating=True,
     opt_level=1,
     fast_math=False,
 ):
     """Get or lazily compile the warp-spec MTP kernel for one shape/config.
 
-    ``opt_level`` (CuTe DSL ``--opt-level``, NOT a kernel constexpr) and
-    ``fast_math`` (a kernel constexpr threading ``fastmath=`` onto the
-    transcendentals) are both part of the cache key so the same shape can be
-    compiled at distinct compile-knob settings without colliding. Defaults
-    (1, False) preserve the historical no-fastmath / opt-level-1 build.
+    ``opt_level`` (``--opt-level``), ``fast_math``, and ``precompute_gating`` are
+    all part of the cache key.
     """
     key = (
         N,
@@ -1092,6 +1175,7 @@ def _get_compiled_mtp_ws_kernel(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        precompute_gating,
         opt_level,
         fast_math,
     )
@@ -1120,11 +1204,20 @@ def _get_compiled_mtp_ws_kernel(
     else:
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
 
+    if precompute_gating:
+        g = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+        beta_pre = torch.zeros(N, T, HV, dtype=torch.float32, device="cuda")
+    else:
+        g = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
+        beta_pre = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
+
     q_tensor = from_dlpack(q, assumed_align=16)
     k_tensor = from_dlpack(k, assumed_align=16)
     v_tensor = from_dlpack(v, assumed_align=16)
     a_tensor = from_dlpack(a, assumed_align=16)
     b_tensor = from_dlpack(b, assumed_align=16)
+    g_tensor = from_dlpack(g, assumed_align=16)
+    beta_pre_tensor = from_dlpack(beta_pre, assumed_align=16)
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
     dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
     h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
@@ -1145,6 +1238,8 @@ def _get_compiled_mtp_ws_kernel(
         k_tensor,
         v_tensor,
         b_tensor,
+        g_tensor,
+        beta_pre_tensor,
         o_tensor,
         h0_indices_tensor,
         softplus_beta=softplus_beta,
@@ -1163,6 +1258,7 @@ def _get_compiled_mtp_ws_kernel(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        precompute_gating=precompute_gating,
         fast_math=fast_math,
         stream=stream,
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
@@ -1200,62 +1296,11 @@ def kda_decode_mtp_ws(
     use_packed_fma: bool | None = None,
     use_smem_v: bool | None = None,
     intermediate_states_buffer: torch.Tensor | None = None,
+    use_gate_in_kernel: bool = False,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """KDA MTP decode — warp-specialized variant (Route 1).
-
-    Drop-in alternative to ``kda_decode_mtp`` with the same public contract,
-    using FlashInfer's warp-specialized organization (grid = N*HV*num_v_tiles,
-    register-resident state, full-warp shuffle reduction) and per-channel KDA
-    decay. Kept separate so both routes can be benchmarked head-to-head.
-
-    Dense MTP shapes (same as ``kda_decode_mtp``):
-        q/k: (N, T, H, K)   v: (N, T, HV, V)
-        a:   (N, T, HV, K)  b: (N, T, HV)   out: (N, T, HV, V)
-
-    ``ilp_rows`` selects how many V-rows a warp processes together: 2 (any valid
-    ``tile_v``) or 4 (requires ``tile_v % 16 == 0``; steps 1+2 and 4+5 are fused
-    with double accumulators + packed F32x2 FMA on SM100). ``ilp_rows=None``
-    (default) picks it from the ``work_units=N*HV`` heuristic
-    (:func:`_select_mtp_config`), mirroring ``tile_v=None``; an explicit value
-    overrides. If an explicit ``tile_v`` makes the heuristic's ilp=4 illegal
-    (``tile_v % 16 != 0``) the auto path falls back to ilp=2 (an explicit
-    ``ilp_rows=4`` with such a ``tile_v`` still asserts, by design).
-    ``use_packed_fma=None`` auto-detects SM100+ (Blackwell); pass False to force
-    the scalar fallback.
-
-    ``use_smem_v`` (Stage C) preloads the CTA's v-tile into SMEM (one cooperative
-    load instead of a per-token GMEM read) and accumulates outputs in SMEM for a
-    single coalesced merged writeback at kernel end (instead of the per-token
-    lane-0 scatter). ``use_smem_v=None`` (default) takes it from the
-    ``work_units=N*HV`` heuristic (:func:`_select_mtp_config`), which enables it
-    only for the large-batch (tile_v=64) bucket; an explicit bool overrides. It
-    is independent of ``ilp_rows`` and works with any ``tile_v``.
-
-    ``intermediate_states_buffer`` (Stage D, speculative-decoding support): an
-    optional fp32, contiguous tensor of shape ``[N, T, HV, V, K]`` (vk / K-last).
-    When given, the kernel snapshots the post-token state after EVERY token to
-    ``buffer[i_n, i_t, i_hv]`` (indexed by SEQUENCE position, so a serving layer
-    can roll back to the snapshot at the last accepted token); ``buffer[:, T-1]``
-    equals the final state written to the pool. When ``None`` (default) no
-    snapshots are taken. Produce-only — cuLA does NOT implement the rollback;
-    the caller owns the buffer and the rollback policy. The return value is
-    always just ``o`` (the buffer is filled in place).
-
-    ``opt_level`` selects the CuTe DSL ``--opt-level`` (codegen optimization,
-    not a kernel constexpr) and ``fast_math`` toggles ``fastmath=`` on the
-    kernel's exp/log/rsqrt. Both are part of the compile cache key (a new setting
-    triggers a fresh JIT) and are independent. Defaults are the B200-tuned config
-    (issue 17 knob sweep): ``opt_level=3`` (small consistent edge on this kernel,
-    no precision/determinism regression) and ``fast_math=True`` (the warp-spec
-    kernel stages g once so the gain is small but free). Pass ``opt_level=1`` /
-    ``fast_math=False`` to reproduce the original no-fastmath / opt-1 build. NOTE
-    the single-token ``kda_decode`` keeps ``opt_level=1`` (opt-3 regressed it at
-    large N) and has no ``fast_math``.
-
-    Constraints: ``state_layout='vk'`` only; ``ilp_rows in {2, 4}``.
-    """
+    precompute_gating = not use_gate_in_kernel
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -1268,14 +1313,8 @@ def kda_decode_mtp_ws(
     assert K == TILE_K, f"KDA MTP (ws) kernel requires K={TILE_K}, got {K}"
 
     # Resolve tile_v / ilp_rows / use_smem_v from the work_units=N*HV heuristic
-    # where not given explicitly (mirrors kda_decode_mtp). An explicit tile_v can
-    # make the heuristic's ilp=4 illegal (needs tile_v % 16 == 0); in the auto
-    # path we fall back to the universally-legal ilp=2 rather than tripping the
-    # rows_per_group assert below. (When tile_v also came from the heuristic,
-    # _select_mtp_config already applied this backstop, so the guard is a no-op.)
-    # use_smem_v is independent of tile_v legality (preloading v works for any
-    # tile_v); the heuristic turns it on only for the large-batch (tile_v=64)
-    # bucket. An explicit use_smem_v overrides.
+    # where not given explicitly. An explicit tile_v can make the heuristic's ilp=4
+    # illegal (needs tile_v % 16 == 0); the auto path then falls back to ilp=2.
     if tile_v is None or ilp_rows is None or use_smem_v is None:
         sel_tile_v, sel_ilp_rows, sel_use_smem_v = _select_mtp_config(
             N, HV, V, T, disable_state_update=disable_state_update
@@ -1294,8 +1333,8 @@ def kda_decode_mtp_ws(
             f"kda_decode_mtp_ws implements ilp_rows in {{2, 4}}, got {ilp_rows}"
         )
 
-    # packed F32x2 FMA exists only on SM100+ (Blackwell); fall back to scalar
-    # fma_pair elsewhere. None = auto-detect, matching FlashInfer's run_mtp_decode.
+    # packed F32x2 FMA exists only on SM100+ (Blackwell); scalar fma_pair
+    # elsewhere. None = auto-detect by compute capability.
     if use_packed_fma is None:
         major, _ = torch.cuda.get_device_capability(q.device)
         use_packed_fma = major >= 10
@@ -1306,16 +1345,13 @@ def kda_decode_mtp_ws(
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":
         raise NotImplementedError(
-            "kda_decode_mtp_ws only supports state_layout='vk' "
-            f"(FlashInfer is vk-only); got {state_layout!r}"
+            "kda_decode_mtp_ws only supports state_layout='vk'; "
+            f"got {state_layout!r}"
         )
 
     assert tile_v % 4 == 0, f"KDA MTP (ws) requires tile_v % 4 == 0, got tile_v={tile_v}"
     assert V % tile_v == 0, f"KDA MTP (ws) requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
-    # Each warp owns rows_per_group = tile_v/4 V-rows and steps through ilp_rows of
-    # them per iteration, so rows_per_group must be a multiple of ilp_rows — else
-    # the row_pair/row_quad loop count truncates and trailing rows are silently
-    # skipped. ilp=2 -> tile_v % 8 == 0; ilp=4 -> tile_v % 16 == 0.
+
     rows_per_group = tile_v // 4
     assert rows_per_group % ilp_rows == 0, (
         f"ilp_rows={ilp_rows} requires (tile_v//4) divisible by {ilp_rows}, "
@@ -1352,23 +1388,10 @@ def kda_decode_mtp_ws(
         initial_state_indices, N=N, pool_size=pool_size, device=q.device
     )
 
-    # Flatten the VK state pool [pool, HV, V, K] -> [pool*HV, V, K]; the kernel
-    # indexes flat_state_idx = cache_idx*HV + i_hv. .view() shares storage so the
-    # kernel's in-place state writeback lands in the caller's tensor; it raises
-    # (loudly, not a silent copy) if the pool is not contiguous, which would
-    # break the in-place contract anyway.
+    # Flatten the VK state pool [pool, HV, V, K] -> [pool*HV, V, K]
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
 
-    # Stage D: resolve the intermediate-state snapshot cache. A buffer turns
-    # snapshots on (constexpr); flatten [N, T, HV, V, K] -> [N*T*HV, V, K] so the
-    # kernel's flat_idx = i_n*T*HV + i_t*HV + i_hv (indexed by SEQUENCE i_n, NOT
-    # the pool slot cache_idx used for the state writeback) lands in the caller's
-    # tensor. .view() shares storage + raises loudly on a non-contiguous buffer,
-    # keeping the in-place fill contract (cf. h0_source_flat above). Unlike
-    # FlashInfer (which .to(fp32).reshape().contiguous() — silently dropping the
-    # snapshots if the buffer was not already contiguous fp32) we require fp32 +
-    # contiguous up front so the fill is always visible. None -> 1-elem dummy and
-    # the snapshot stores compile out (cache_intermediate_states=False).
+    # Stage D: resolve the snapshot cache. 
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
         if intermediate_states_buffer.dtype != torch.float32:
@@ -1389,6 +1412,28 @@ def kda_decode_mtp_ws(
         )
 
     stream = _get_cached_stream(q.device)
+
+    if precompute_gating:
+        g_buf, beta_buf = _run_mtp_gating_prepass(
+            A_log,
+            a,
+            dt_bias,
+            b,
+            N=N,
+            T=T,
+            HV=HV,
+            K=K,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            opt_level=opt_level,
+            fast_math=fast_math,
+            device=q.device,
+            stream=stream,
+        )
+    else:
+        g_buf = torch.empty(1, 1, 1, 1, dtype=torch.float32, device=q.device)
+        beta_buf = torch.empty(1, 1, 1, dtype=torch.float32, device=q.device)
+
     compiled_kernel = _get_compiled_mtp_ws_kernel(
         N,
         T,
@@ -1407,6 +1452,7 @@ def kda_decode_mtp_ws(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        precompute_gating=precompute_gating,
         opt_level=opt_level,
         fast_math=fast_math,
     )
@@ -1421,52 +1467,14 @@ def kda_decode_mtp_ws(
         k,
         v,
         b,
+        g_buf,
+        beta_buf,
         o,
         initial_state_indices,
         stream,
     )
 
     return o
-
-
-# ============================================================================
-# Inline variant (small batch, work_units <= 128).
-#
-# Ported from FlashInfer ``gdn_verify_kernel_mtp_inline``
-# (``gdn_decode_mtp.py:1438-2110``), Apache-2.0. FlashInfer dispatches to the
-# inline kernel when ``B*HV <= 128`` (BS<=2 at HV=64) and to the warp-spec kernel
-# above when ``> 128`` (``run_mtp_decode:2309``). Both share the exact same
-# grid/CTA decomposition (``N*HV*num_v_tiles``, one (i_n, i_hv, i_v) tile per CTA,
-# vec_size=4 full-warp K-reduce, 4 warps x rows_per_group V-rows) and the same
-# ilp 2/4 axis. The inline variant differs only in how q/k/g/beta are staged:
-#   - NO warp-0 staging / SMEM broadcast (no sQ/sK/sG/sBeta) and NO Phase-1
-#     barrier. Each of the 4 warps computes q/k/g/beta inline, register-resident
-#     — 4x redundant g/beta transcendentals, but at small batch the kernel is
-#     latency-bound, so the warp-spec staging+barrier fixed cost (which has no T
-#     amortization or grid occupancy to hide it there) is the thing to remove.
-#   - DEFERRED L2 norm: q/k stay RAW in registers; the 1/||q||, 1/||k|| factors
-#     are computed inside step 2 / step 5 (sum_sq_k, sum_sq_q piggyback the h@k /
-#     h@q reductions) and applied as SCALARS after the reduction, never
-#     materialized onto the q/k registers. (The warp-spec kernel L2-norms eagerly
-#     in Phase 1.) This is orthogonal to the per-channel decay — the norm acts on
-#     the q/k vectors, the decay on the state S — so it is copied verbatim.
-#   - register-pipelined q/k: the ilp=4 path loads q[0]/k[0] in a prologue and
-#     prefetches q[t+1]/k[t+1] at the end of each timestep; the ilp=2 path
-#     batch-loads all T q/k (and all L2 norms) up front. State is register-
-#     resident across T either way.
-#
-# The ONLY KDA change vs GDN is, again, the decay: GDN's per-(head, token) SCALAR
-# gate register array ``r_g_arr[T]`` becomes the per-channel ``r_g_arr[T, vec_size]``
-# (each lane precomputes g for its own vec_size K-channels, exactly as warp 0
-# stages sG[T, K] in the warp-spec kernel), and the decay step ``r_h[row,i] *= r_g``
-# becomes ``r_h[row,i] *= r_g_arr[i_t, i]``. beta stays a scalar array. The inline
-# ilp=4 path uses plain scalar FMA (no packed-FMA / double-accumulator — matches
-# FlashInfer); ``use_packed_fma`` is accepted for launcher/signature parity but
-# unused in the body. All transcendentals take the same ``fast_math`` constexpr as
-# the warp-spec kernel: default False reproduces the no-fastmath port (g/softplus
-# bit-comparable to ws / ``kda_decode.py``); True enables the FlashInfer-style fast
-# intrinsics (issue 17 compile-knob tuning).
-# ============================================================================
 
 
 @cute.kernel
@@ -1476,13 +1484,15 @@ def kda_verify_kernel_mtp_inline(
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
-    A_log: cute.Tensor,  # [HV] fp32
-    a: cute.Tensor,  # [N, T, HV, K] (KDA: per-channel decay input)
-    dt_bias: cute.Tensor,  # [HV, K] (KDA: per-channel decay bias)
+    A_log: cute.Tensor,  # [HV] fp32 (gating recompute; dummy when precompute_gating)
+    a: cute.Tensor,  # [N, T, HV, K] (per-channel decay input; dummy when precompute)
+    dt_bias: cute.Tensor,  # [HV, K] (per-channel decay bias; dummy when precompute)
     q: cute.Tensor,  # [N, T, H, K]
     k: cute.Tensor,  # [N, T, H, K]
     v: cute.Tensor,  # [N, T, HV, V]
-    b: cute.Tensor,  # [N, T, HV]
+    b: cute.Tensor,  # [N, T, HV] (update-gate logit; dummy when precompute_gating)
+    g: cute.Tensor,  # [N, T, HV, K] fp32 precomputed decay gate (dummy when not)
+    beta_pre: cute.Tensor,  # [N, T, HV] fp32 precomputed sigmoid gate (dummy when not)
     o: cute.Tensor,  # [N, T, HV, V] output
     h0_indices: cute.Tensor,  # [N] int32 (state-pool slot per sequence; <0 = pad)
     softplus_beta: cutlass.Constexpr[float],
@@ -1499,18 +1509,14 @@ def kda_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],  # signature parity; unused (scalar FMA)
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    precompute_gating: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
 ):
     """Inline KDA MTP kernel. One CTA owns one (i_n, i_hv, i_v) tile.
 
-    No warp specialization: all 4 warps run the T-step recurrence with state
-    register-resident, each computing q/k/g/beta inline (deferred L2 norm). g is
-    precomputed per-channel into a register array shared across this lane's V-rows.
-    Best at small batch (work_units = N*HV <= 128), where removing the warp-spec
-    staging + Phase-1 barrier wins over reusing it. ``use_smem_v`` (preload v-tile
-    + coalesced merged output writeback) and ``cache_intermediate_states`` (Stage-D
-    fire-and-forget post-token snapshots, sequence-indexed) work exactly as in the
-    warp-spec kernel.
+    All 4 warps run the T-step recurrence with register-resident state, computing
+    q/k/g/beta inline (deferred L2 norm; g precomputed per-channel into a register
+    array). ``use_smem_v`` and ``cache_intermediate_states`` work as in the ws kernel.
     """
     tidx, _, _ = cute.arch.thread_idx()
     lane_id = tidx % 32
@@ -1534,12 +1540,11 @@ def kda_verify_kernel_mtp_inline(
 
     cache_idx = h0_indices[i_n]
 
-    # exp(A_log) is per-head, shared across all K channels (KDA), hoisted once.
-    r_A_log = cutlass.Float32(A_log[i_hv])
-    r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
+    if cutlass.const_expr(not precompute_gating):
+        r_A_log = cutlass.Float32(A_log[i_hv])
+        r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
 
     # Inline: NO sQ/sK/sG/sBeta. Only sVdata/sOutput, and only under use_smem_v
-    # (allocated conditionally so the off-path footprint is just alignment slack).
     smem = cutlass.utils.SmemAllocator()
     if cutlass.const_expr(use_smem_v):
         sVdata = smem.allocate_tensor(
@@ -1566,8 +1571,6 @@ def kda_verify_kernel_mtp_inline(
         flat_state_idx = cache_idx * HV + i_hv  # row in [pool*HV, V, K]
 
         # use_smem_v: preload this CTA's v-tile into SMEM (all 128 threads, each
-        # writing its tile-local column once: tidx<tile_v). No warp-spec split
-        # here — one cooperative loop, published by the barrier below.
         if cutlass.const_expr(use_smem_v):
             for i_t in cutlass.range_constexpr(T):
                 if tidx < tile_v:
@@ -1578,13 +1581,8 @@ def kda_verify_kernel_mtp_inline(
                         )
             cute.arch.barrier()
 
-        # KDA per-channel decay gate, precomputed for ALL tokens into a register
-        # array shared by this lane's V-rows (avoids recomputing softplus/sigmoid
-        # in every V-row iteration). Unlike GDN's scalar r_g_arr[T], r_g_arr is
-        # [T, vec_size]: each lane fills g for its own vec_size K-channels (k_start
-        # .. k_start+vec_size), so the warp's 32 lanes together cover all K=128
-        # — and the decay step reads r_g_arr[i_t, i] for the channel r_h[row,i]
-        # holds. beta is a per-(head, token) scalar.
+        # Per-channel decay gate precomputed for ALL tokens into a register array
+        # shared by this lane's V-rows. 
         r_g_arr = cute.make_rmem_tensor(
             cute.make_layout((T, vec_size), stride=(vec_size, 1)), cutlass.Float32
         )
@@ -1592,35 +1590,42 @@ def kda_verify_kernel_mtp_inline(
             cute.make_layout((T,), stride=(1,)), cutlass.Float32
         )
         for i_t in cutlass.range_constexpr(T):
-            r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
-            r_beta_arr[i_t] = cutlass.Float32(1.0) / (
-                cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=fast_math)
-            )
-            for i in cutlass.range_constexpr(vec_size):
-                kk = k_start + i
-                x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(
-                    dt_bias[i_hv, kk]
+            if cutlass.const_expr(precompute_gating):
+                # Read this token's g (each lane its vec_size channels) + scalar
+                # beta from the pre-pass GMEM buffers.
+                r_beta_arr[i_t] = cutlass.Float32(beta_pre[i_n, i_t, i_hv])
+                for i in cutlass.range_constexpr(vec_size):
+                    kk = k_start + i
+                    r_g_arr[(i_t, i)] = cutlass.Float32(g[i_n, i_t, i_hv, kk])
+            else:
+                r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
+                r_beta_arr[i_t] = cutlass.Float32(1.0) / (
+                    cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=fast_math)
                 )
-                beta_x = softplus_beta * x
-                exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
-                )
-                use_softplus = (
-                    cutlass.Float32(1.0)
-                    if beta_x <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x = (
-                    use_softplus * softplus_val
-                    + (cutlass.Float32(1.0) - use_softplus) * x
-                )
-                r_g_arr[(i_t, i)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
+                for i in cutlass.range_constexpr(vec_size):
+                    kk = k_start + i
+                    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(
+                        dt_bias[i_hv, kk]
+                    )
+                    beta_x = softplus_beta * x
+                    exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
+                    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
+                    )
+                    use_softplus = (
+                        cutlass.Float32(1.0)
+                        if beta_x <= softplus_threshold
+                        else cutlass.Float32(0.0)
+                    )
+                    softplus_x = (
+                        use_softplus * softplus_val
+                        + (cutlass.Float32(1.0) - use_softplus) * x
+                    )
+                    r_g_arr[(i_t, i)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
 
         # ============ Recurrence: ilp_rows == 4 (process 4 V-rows together) ===
-        # Plain scalar FMA + deferred L2 norm + register-pipelined q/k. KDA change:
-        # per-channel decay r_g_arr[i_t, i] (no scalar r_g). Mirrors FlashInfer
-        # gdn_decode_mtp.py:1594-1902.
+        # Scalar FMA + deferred L2 norm + register-pipelined q/k; per-channel decay
+        # r_g_arr[i_t, i].
         if cutlass.const_expr(ilp_rows == 4):
             quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
 
@@ -1763,7 +1768,7 @@ def kda_verify_kernel_mtp_inline(
                                 r_h[3, i] += r_k[i] * v_new_d
 
                         # Stage D: snapshot post-token state (sequence-indexed),
-                        # fire-and-forget, before step 5 (mirrors gdn_decode_mtp.py:1749).
+                        # fire-and-forget, before step 5.
                         if cutlass.const_expr(cache_intermediate_states):
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_a = cute.local_tile(
@@ -1888,10 +1893,6 @@ def kda_verify_kernel_mtp_inline(
                         )
                         cute.autovec_copy(cute.slice_(r_h, (3, None)), h_tile_out_d)
 
-        # ============ Recurrence: ilp_rows == 2 (process 2 V-rows together) ===
-        # Batch-load all T q/k + precompute all deferred L2 norms up front, then a
-        # fused T-loop (decay+h@k, update+h@q). KDA change: per-channel decay
-        # r_g_arr[i_t, i]. Mirrors FlashInfer gdn_decode_mtp.py:1903-2098.
         elif cutlass.const_expr(ilp_rows == 2):
             half_rows: cutlass.Constexpr[int] = rows_per_group // 2
 
@@ -2067,10 +2068,6 @@ def kda_verify_kernel_mtp_inline(
                         )
                         cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
 
-        # ============ Merged output writeback (use_smem_v only) ============
-        # Same coalesced sOutput -> o flush as the warp-spec kernel: barrier
-        # publishes all groups' lane-0 writes, then all 128 threads flush one
-        # tile-local column each across all T tokens.
         if cutlass.const_expr(use_smem_v):
             cute.arch.barrier()
             v_tile_base = i_v * tile_v
@@ -2092,6 +2089,8 @@ def run_kda_verify_kernel_mtp_inline(
     k: cute.Tensor,
     v: cute.Tensor,
     b: cute.Tensor,
+    g: cute.Tensor,
+    beta_pre: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
@@ -2110,6 +2109,7 @@ def run_kda_verify_kernel_mtp_inline(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
+    precompute_gating: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
@@ -2141,6 +2141,8 @@ def run_kda_verify_kernel_mtp_inline(
         k,
         v,
         b,
+        g,
+        beta_pre,
         o,
         h0_indices,
         softplus_beta,
@@ -2157,6 +2159,7 @@ def run_kda_verify_kernel_mtp_inline(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        precompute_gating,
         fast_math,
     ).launch(
         grid=(grid_size, 1, 1),
@@ -2184,14 +2187,14 @@ def _get_compiled_mtp_inline_kernel(
     use_packed_fma,
     use_smem_v,
     cache_intermediate_states,
+    precompute_gating=True,
     opt_level=1,
     fast_math=False,
 ):
     """Get or lazily compile the inline MTP kernel for one shape/config.
 
-    ``opt_level`` (CuTe DSL ``--opt-level``) and ``fast_math`` (kernel constexpr
-    threading ``fastmath=`` onto the transcendentals) are part of the cache key.
-    Defaults (1, False) preserve the validated no-fastmath / opt-level-1 build.
+    ``opt_level`` (``--opt-level``), ``fast_math``, and ``precompute_gating`` are
+    all part of the cache key.
     """
     key = (
         N,
@@ -2211,6 +2214,7 @@ def _get_compiled_mtp_inline_kernel(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
+        precompute_gating,
         opt_level,
         fast_math,
     )
@@ -2234,11 +2238,22 @@ def _get_compiled_mtp_inline_kernel(
     else:
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
 
+    # Precomputed gating buffers (full-size when precompute_gating, else dummies
+    # the kernel never indexes); ranks kept (4D g, 3D beta).
+    if precompute_gating:
+        g = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+        beta_pre = torch.zeros(N, T, HV, dtype=torch.float32, device="cuda")
+    else:
+        g = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
+        beta_pre = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
+
     q_tensor = from_dlpack(q, assumed_align=16)
     k_tensor = from_dlpack(k, assumed_align=16)
     v_tensor = from_dlpack(v, assumed_align=16)
     a_tensor = from_dlpack(a, assumed_align=16)
     b_tensor = from_dlpack(b, assumed_align=16)
+    g_tensor = from_dlpack(g, assumed_align=16)
+    beta_pre_tensor = from_dlpack(beta_pre, assumed_align=16)
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
     dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
     h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
@@ -2259,6 +2274,8 @@ def _get_compiled_mtp_inline_kernel(
         k_tensor,
         v_tensor,
         b_tensor,
+        g_tensor,
+        beta_pre_tensor,
         o_tensor,
         h0_indices_tensor,
         softplus_beta=softplus_beta,
@@ -2277,6 +2294,7 @@ def _get_compiled_mtp_inline_kernel(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        precompute_gating=precompute_gating,
         fast_math=fast_math,
         stream=stream,
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
@@ -2314,29 +2332,11 @@ def kda_decode_mtp_ws_inline(
     use_packed_fma: bool | None = None,
     use_smem_v: bool | None = None,
     intermediate_states_buffer: torch.Tensor | None = None,
+    use_gate_in_kernel: bool = False,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """KDA MTP decode — INLINE variant (Route 1, small-batch path).
-
-    Same public contract and arguments as :func:`kda_decode_mtp_ws`, but runs the
-    inline kernel (no warp-0 staging / Phase-1 barrier, deferred L2 norm,
-    register-resident q/k/g/beta). FlashInfer routes here at small ``work_units =
-    N*HV`` (<= 128); this entry point is currently standalone (explicit call) for
-    head-to-head validation — the auto inline-vs-warp-spec dispatch is wired in a
-    later step. See :func:`kda_decode_mtp_ws` for the full argument semantics
-    (``ilp_rows``/``tile_v``/``use_smem_v`` resolution from the heuristic,
-    ``intermediate_states_buffer`` snapshots, vk-only state layout).
-
-    The inline ilp=4 path uses scalar FMA (no packed-FMA / double-accumulator), so
-    ``use_packed_fma`` does not affect numerics here; it is accepted only to keep
-    the signature identical to the warp-spec entry point. ``opt_level`` and
-    ``fast_math`` behave exactly as in :func:`kda_decode_mtp_ws` and default to
-    the same B200-tuned config (``opt_level=3``, ``fast_math=True``); fast_math
-    helps the inline kernel most (it recomputes g/beta per V-row, so faster
-    intrinsics save the most here). Pass ``opt_level=1`` / ``fast_math=False`` for
-    the original build.
-    """
+    precompute_gating = not use_gate_in_kernel
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -2379,8 +2379,8 @@ def kda_decode_mtp_ws_inline(
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":
         raise NotImplementedError(
-            "kda_decode_mtp_ws_inline only supports state_layout='vk' "
-            f"(FlashInfer is vk-only); got {state_layout!r}"
+            "kda_decode_mtp_ws_inline only supports state_layout='vk'; "
+            f"got {state_layout!r}"
         )
 
     assert tile_v % 4 == 0, f"KDA MTP (inline) requires tile_v % 4 == 0, got tile_v={tile_v}"
@@ -2442,6 +2442,28 @@ def kda_decode_mtp_ws_inline(
         )
 
     stream = _get_cached_stream(q.device)
+
+    if precompute_gating:
+        g_buf, beta_buf = _run_mtp_gating_prepass(
+            A_log,
+            a,
+            dt_bias,
+            b,
+            N=N,
+            T=T,
+            HV=HV,
+            K=K,
+            softplus_beta=softplus_beta,
+            softplus_threshold=softplus_threshold,
+            opt_level=opt_level,
+            fast_math=fast_math,
+            device=q.device,
+            stream=stream,
+        )
+    else:
+        g_buf = torch.empty(1, 1, 1, 1, dtype=torch.float32, device=q.device)
+        beta_buf = torch.empty(1, 1, 1, dtype=torch.float32, device=q.device)
+
     compiled_kernel = _get_compiled_mtp_inline_kernel(
         N,
         T,
@@ -2460,6 +2482,7 @@ def kda_decode_mtp_ws_inline(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
+        precompute_gating=precompute_gating,
         opt_level=opt_level,
         fast_math=fast_math,
     )
@@ -2474,6 +2497,8 @@ def kda_decode_mtp_ws_inline(
         k,
         v,
         b,
+        g_buf,
+        beta_buf,
         o,
         initial_state_indices,
         stream,

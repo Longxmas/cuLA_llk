@@ -136,7 +136,7 @@ def to_triton_varlen(q, k, v, a, b):
 # 被测 kernel 的调用封装。tile_v=None / ilp_rows=None -> 走 production heuristic。
 # ============================================================================
 def make_cula_call(variant, q, k, v, a, b, A_log, dt_bias, state, indices, scale,
-                   tile_v, ilp_rows, use_smem_v, dsu):
+                   tile_v, ilp_rows, use_smem_v, dsu, precompute_gating=True):
     fn = kda_decode_mtp_ws if variant == "ws" else kda_decode_mtp_ws_inline
 
     def call():
@@ -146,6 +146,7 @@ def make_cula_call(variant, q, k, v, a, b, A_log, dt_bias, state, indices, scale
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
             tile_v=tile_v, ilp_rows=ilp_rows, use_smem_v=use_smem_v,
             disable_state_update=dsu, intermediate_states_buffer=None,
+            use_gate_in_kernel=not precompute_gating,
         )
 
     return call
@@ -437,26 +438,36 @@ def run_part3(args, device):
                 except Exception as e:
                     print(f"{N:>4} {T:>3} | triton graph-capture FAIL: {str(e)[:70]}")
 
-            for variant in ("ws", "inline"):
+            # A/B the structural gating fix in one run: ws+pre (gating pre-pass on)
+            # vs ws-rec (in-kernel recompute = the pre-fix baseline) vs inl+pre.
+            # Same tile_v/ilp so the only delta is precompute_gating.
+            cula_variants = [
+                ("ws+pre", "ws", True),
+                ("ws-rec", "ws", False),
+                ("inl+pre", "inline", True),
+            ]
+            for label, variant, precomp in cula_variants:
                 v_ilp = ilp_rows
                 if v_ilp == 4 and tile_v % 16 != 0:
                     v_ilp = 2
                 fn = make_cula_call(variant, q, k, v, a, b, A_log, dt_bias,
-                                    state0.clone(), indices, scale, tile_v, v_ilp, use_smem_v, True)
+                                    state0.clone(), indices, scale, tile_v, v_ilp, use_smem_v, True,
+                                    precompute_gating=precomp)
                 try:
                     warmup(fn, args.warmup)
                     tp = t_pipe_ms(fn, args.rep)
                     tg = t_graph_ms(fn, 3, args.rep)
                     vs = f"{tri_g / tg:.2f}x" if tri_g else "n/a"
-                    print(f"{N:>4} {T:>3} | {variant:>7} {tile_v:>6} {v_ilp:>3} | "
+                    print(f"{N:>4} {T:>3} | {label:>7} {tile_v:>6} {v_ilp:>3} | "
                           f"{tp * 1e3:>9.1f} {tg * 1e3:>10.1f} {(tp - tg) * 1e3:>9.1f}u | {vs:>12}")
                 except Exception as e:
-                    print(f"{N:>4} {T:>3} | {variant} graph-capture FAIL: {str(e)[:70]}")
+                    print(f"{N:>4} {T:>3} | {label} graph-capture FAIL: {str(e)[:70]}")
             print()
 
     print("解读: t_graph = 纯 device kernel(wrapper+launcher 全移除,= CUDA-graph serving 真实代价)。")
     print("     wrap+lnch = t_pipe - t_graph = eager 下被 wrapper+launcher 吃掉的部分。")
     print("     vs Tri graph >1 = 移除双方 wrapper 后 cuLA kernel 本身更快(这才是算子真实对比)。")
+    print("     ws+pre vs ws-rec = gating 预pass(本次结构改动)的净效果;N=4 区应从 <1 翻到 >=1。")
 
 
 # ============================================================================
