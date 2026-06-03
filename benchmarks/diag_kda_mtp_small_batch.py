@@ -216,6 +216,36 @@ def t_event_ms(fn, rep):
     return _iqr_mean([s.elapsed_time(e) for s, e in zip(starts, ends)])
 
 
+def t_graph_ms(fn, warmup_iters, rep):
+    """Kernel-only via CUDA graph: capture fn() once (wrapper runs once to RECORD),
+    then time graph.replay() = pure device kernel work — BOTH cuLA's and Triton's
+    Python wrapper AND launcher are gone (replay only re-issues the recorded CUDA
+    ops). Also == the real cost under CUDA-graph serving. Raises on capture failure
+    (caller catches -> n/a); dsu MUST be True so replay is idempotent (no state drift
+    across replays writing to the captured state buffer)."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(warmup_iters):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    for _ in range(10):
+        g.replay()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        g.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / rep
+
+
 def measure_all(fn, warmup_iters, rep):
     warmup(fn, warmup_iters)
     # 顺序:先 t_pipe (吞吐),再 t_cpu (隔离),再 t_event (对齐)。各自独立,无残留。
@@ -372,6 +402,64 @@ def run_part2(args, device):
 
 
 # ============================================================================
+# Part 3 — kernel-only (CUDA graph replay):移除 cuLA + Triton 双方 wrapper+launcher
+# ============================================================================
+def run_part3(args, device):
+    print("\n" + "=" * 100)
+    print("Part 3 — kernel-only (CUDA graph replay):移除 cuLA + Triton 双方 wrapper AND launcher,纯 device kernel")
+    print(f"  H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu=True(强制,replay 需状态只读)  "
+          f"warmup={args.warmup} rep={args.rep}  (config=production heuristic)")
+    print("=" * 100)
+    hdr = (f"{'N':>4} {'T':>3} | {'route':>7} {'tile_v':>6} {'ilp':>3} | "
+           f"{'t_pipe us':>9} {'t_graph us':>10} {'wrap+lnch':>10} | {'vs Tri graph':>12}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    for N in args.batch_sizes:
+        for T in args.Ts:
+            q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
+                N, T, args.H, args.HV, args.K, args.V, device)
+            scale = args.K ** -0.5
+            tile_v, ilp_rows, use_smem_v = _select_mtp_config(N, args.HV, args.V, T)
+
+            tri_g = None
+            if _HAVE_TRITON and N * args.HV <= TRITON_MAX_GRID_Z:
+                qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
+                tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
+                                       state0.clone(), indices, scale, True)
+                try:
+                    warmup(tri, args.warmup)
+                    tp = t_pipe_ms(tri, args.rep)
+                    tg = t_graph_ms(tri, 3, args.rep)
+                    tri_g = tg
+                    print(f"{N:>4} {T:>3} | {'triton':>7} {'-':>6} {'-':>3} | "
+                          f"{tp * 1e3:>9.1f} {tg * 1e3:>10.1f} {(tp - tg) * 1e3:>9.1f}u | {'(base)':>12}")
+                except Exception as e:
+                    print(f"{N:>4} {T:>3} | triton graph-capture FAIL: {str(e)[:70]}")
+
+            for variant in ("ws", "inline"):
+                v_ilp = ilp_rows
+                if v_ilp == 4 and tile_v % 16 != 0:
+                    v_ilp = 2
+                fn = make_cula_call(variant, q, k, v, a, b, A_log, dt_bias,
+                                    state0.clone(), indices, scale, tile_v, v_ilp, use_smem_v, True)
+                try:
+                    warmup(fn, args.warmup)
+                    tp = t_pipe_ms(fn, args.rep)
+                    tg = t_graph_ms(fn, 3, args.rep)
+                    vs = f"{tri_g / tg:.2f}x" if tri_g else "n/a"
+                    print(f"{N:>4} {T:>3} | {variant:>7} {tile_v:>6} {v_ilp:>3} | "
+                          f"{tp * 1e3:>9.1f} {tg * 1e3:>10.1f} {(tp - tg) * 1e3:>9.1f}u | {vs:>12}")
+                except Exception as e:
+                    print(f"{N:>4} {T:>3} | {variant} graph-capture FAIL: {str(e)[:70]}")
+            print()
+
+    print("解读: t_graph = 纯 device kernel(wrapper+launcher 全移除,= CUDA-graph serving 真实代价)。")
+    print("     wrap+lnch = t_pipe - t_graph = eager 下被 wrapper+launcher 吃掉的部分。")
+    print("     vs Tri graph >1 = 移除双方 wrapper 后 cuLA kernel 本身更快(这才是算子真实对比)。")
+
+
+# ============================================================================
 # 单 config 长跑,供 nsys/ncu 等外部 profiler 包裹
 # ============================================================================
 def run_profile_config(args, device):
@@ -410,7 +498,8 @@ def main():
     ap.add_argument("--V", type=int, default=128)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--rep", type=int, default=300)
-    ap.add_argument("--part", choices=["1", "2", "all"], default="all")
+    ap.add_argument("--part", choices=["1", "2", "3", "all"], default="all",
+                    help="1=host/device拆分 2=tile_v sweep 3=kernel-only(CUDA graph) all=1+2")
     ap.add_argument("--state-update", dest="dsu", action="store_false",
                     help="计时含状态写回(disable_state_update=False,复现含写回口径);默认 forward-only")
     ap.add_argument("--check", action="store_true", help="计时前先对 Triton 跑一次数值校验")
@@ -451,6 +540,8 @@ def main():
         run_part1(args, device)
     if args.part in ("2", "all"):
         run_part2(args, device)
+    if args.part == "3":
+        run_part3(args, device)
 
 
 if __name__ == "__main__":
