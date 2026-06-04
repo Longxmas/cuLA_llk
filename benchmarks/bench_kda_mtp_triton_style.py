@@ -42,6 +42,11 @@ from diag_kda_mtp_small_batch import (  # noqa: E402  复用 diag 基建
 )
 
 
+# tsl 的 opt_level / fast_math,由 main() 从 CLI 设置(供 register/spill 调优 A/B)。
+_TSL_OPT_LEVEL = 3
+_TSL_FAST_MATH = True
+
+
 def make_triton_style_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
     def call():
         return kda_decode_mtp_triton_style(
@@ -49,6 +54,7 @@ def make_triton_style_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale,
             initial_state_source=state, initial_state_indices=indices, scale=scale,
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
             disable_state_update=dsu,
+            opt_level=_TSL_OPT_LEVEL, fast_math=_TSL_FAST_MATH,
         )
 
     return call
@@ -86,7 +92,15 @@ def main():
     ap.add_argument("--profile-iters", type=int, default=50)
     ap.add_argument("--profile-variant", choices=["tsl", "triton", "ws"], default="tsl",
                     help="--profile 跑哪个变体(默认 triton-style)")
+    ap.add_argument("--tsl-opt-level", type=int, default=3, choices=[0, 1, 2, 3],
+                    help="tsl 的 --opt-level(调 ptxas 流水深度/寄存器 A/B)")
+    ap.add_argument("--tsl-fast-math", type=int, default=1, choices=[0, 1],
+                    help="tsl 的 fast_math(0/1)")
     args = ap.parse_args()
+
+    global _TSL_OPT_LEVEL, _TSL_FAST_MATH
+    _TSL_OPT_LEVEL = args.tsl_opt_level
+    _TSL_FAST_MATH = bool(args.tsl_fast_math)
 
     if not torch.cuda.is_available():
         sys.exit("需要 CUDA GPU(B200 等);Mac 无法跑。")
