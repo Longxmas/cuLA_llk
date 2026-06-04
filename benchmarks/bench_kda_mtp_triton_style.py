@@ -227,10 +227,6 @@ def main():
             print(f"{N:>4} {T:>3} | {us(tg_tri):>9} {us(tg_ws)} {us(tg_tsl)} | "
                   f"{r_tsl:>8} {r_ws:>7} | {r_tw:>9}")
 
-    print("\n解读: tsl/tri>1 = triton-style 比 triton 快(复刻还更优);ws/tri 是现状对照。")
-    print("     tsl vs ws>1 = triton-style 比 ws 的 32:4 快 → 1-warp layout 在该点更优。")
-    print("     重点看 N=4: 若 tsl 追平/超过 triton(tsl/tri≈1.0) → 瘦 CTA 补回了 wave 缺口。")
-
 
 if __name__ == "__main__":
     main()
