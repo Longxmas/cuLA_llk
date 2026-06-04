@@ -608,8 +608,11 @@ def kda_decode_mtp_triton_style(
 # ----------------------------------------------------------------------------
 # 上面的 lane=V 版(每 lane 1 个 V 列、独扛 128 K 进寄存器、线程内 128-FMA、零 shuffle)
 # 在 vk 下 load 按 lane=V → 512B-strided uncoalesced。本变体改成 triton 的做法:
-#   - lane t 沿 K interleaved 持 vec_size 个 K(k = c*32 + lane, c=0..vec_size-1)× 全
-#     BV 个 V 列(r_h[BV*vec_size])。固定 (v,c) 跨 lane 地址连续 → scalar load 即 coalesced。
+#   - lane t 沿 K 连续块 持 vec_size 个 K(k = vec_size*lane + c, = K[4t:4t+4])× 全
+#     BV 个 V 列(r_h[BV*vec_size])。复刻 triton sizePerThread=[4,1]:每 lane 的 vec_size 个 K
+#     连续 → local_tile + autovec_copy 发 float4(LDG.128),既 coalesced 又向量化。
+#     (历史:曾用 interleaved k=c*32+lane → 虽 coalesced 但每 lane 4 个 K 跨 stride32 不连续
+#      → 只能 scalar load、指令 4×,实测 0.71–0.92x 慢过 triton;见 FINDINGS §8.3。已改连续块。)
 #   - reduce-over-K = 线程内 vec_size + 32-lane 5 步 butterfly shuffle(= triton
 #     tl.sum(axis=0) 的展开,也是 ws 的结构);q/k/g 各 lane 只算自己 vec_size 个 K、留
 #     寄存器,不再走 SMEM 广播。
@@ -658,32 +661,42 @@ def kda_mtp_triton_aligned_kernel(
     cache_idx = h0_indices[i_n]
     r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
 
-    # lane t 沿 K interleaved 持 vec_size 个 K(k = c*32 + lane)× 全 BV 个 V 列。
-    # r_h[vv*vec_size + c] = state[i_v*BV+vv, c*32+lane]。
+    # lane t 沿 K 连续块 持 vec_size 个 K(k = vec_size*lane + c, = K[4t:4t+4])× 全 BV 个 V 列。
+    # 复刻 triton 的 sizePerThread=[4,1](连续块),让 GMEM load 能 float4 向量化(autovec_copy)。
+    # r_h[vv*vec_size + c] = state[i_v*BV+vv, vec_size*lane+c]。
     r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_bv = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)
+    # float4 临时缓冲 + bf16 q/k 载入缓冲(与 tsl 同 idiom)。
+    r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
 
-    # ===== state 载入(scalar interleaved → 固定 (v,c) 跨 lane 连续 = coalesced) =====
+    # ===== state 载入(连续块 + float4:lane t 取 K[4t:4t+4],跨 lane 拼成连续 512B = coalesced+向量化) =====
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
         for vv in cutlass.range_constexpr(BV):
             v_global = i_v * BV + vv
+            # local_tile 第三坐标 lane、tile=vec_size → K[lane*vec_size : +vec_size] 连续块 → autovec float4
+            h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_global, lane))
+            cute.autovec_copy(h_tile, r_h4)
             for c in cutlass.range_constexpr(vec_size):
-                r_h[vv * vec_size + c] = cutlass.Float32(
-                    h0_source[flat_state_idx, v_global, c * 32 + lane]
-                )
+                r_h[vv * vec_size + c] = r_h4[c]
     else:
         for j in cutlass.range_constexpr(BV * vec_size):
             r_h[j] = cutlass.Float32(0.0)
 
     for i_t in cutlass.range_constexpr(T):
-        # ===== prep:本 lane 自己 vec_size 个 K 的 q/k(l2norm)/g,留寄存器(无 SMEM 广播) =====
+        # ===== prep:本 lane 自己 vec_size 个 K(连续块 K[4t:4t+4]) 的 q/k(l2norm)/g,留寄存器 =====
+        q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
+        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
+        cute.autovec_copy(q_tile, r_q_bf16)
+        cute.autovec_copy(k_tile, r_k_bf16)
         for c in cutlass.range_constexpr(vec_size):
-            r_q[c] = cutlass.Float32(q[i_n, i_t, i_h, c * 32 + lane])
-            r_k[c] = cutlass.Float32(k[i_n, i_t, i_h, c * 32 + lane])
+            r_q[c] = cutlass.Float32(r_q_bf16[c])
+            r_k[c] = cutlass.Float32(r_k_bf16[c])
 
         if cutlass.const_expr(use_qk_l2norm):
             sum_q = cutlass.Float32(0.0)
@@ -704,7 +717,7 @@ def kda_mtp_triton_aligned_kernel(
                 r_q[c] = r_q[c] * scale
 
         for c in cutlass.range_constexpr(vec_size):
-            kk = c * 32 + lane
+            kk = vec_size * lane + c  # 连续块:与 r_h/r_q/r_k 的 K 映射一致(reduce 才对齐)
             x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
             beta_x = softplus_beta * x
             exp_bx = cute.exp(beta_x, fastmath=fast_math)
@@ -754,14 +767,16 @@ def kda_mtp_triton_aligned_kernel(
                 ov += cute.arch.shuffle_sync_bfly(ov, offset=off, mask=-1, mask_and_clamp=31)
             o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(ov)
 
-    # ===== epilogue:回写 state(scalar interleaved coalesced) =====
+    # ===== epilogue:回写 state(连续块 + float4,与载入对称) =====
     if cache_idx >= 0:
         if cutlass.const_expr(not disable_state_update):
             flat_state_idx = cache_idx * HV + i_hv
             for vv in cutlass.range_constexpr(BV):
                 v_global = i_v * BV + vv
                 for c in cutlass.range_constexpr(vec_size):
-                    h0_source[(flat_state_idx, v_global, c * 32 + lane)] = r_h[vv * vec_size + c]
+                    r_h4[c] = r_h[vv * vec_size + c]
+                h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_global, lane))
+                cute.autovec_copy(r_h4, h_out)
 
 
 @cute.jit
