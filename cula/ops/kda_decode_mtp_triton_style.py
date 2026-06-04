@@ -110,6 +110,10 @@ def kda_mtp_triton_style_kernel(
     sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
     sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
+    # ks=1 的 coalesced state-load 转置缓冲:8 V列 × K = 4KB,4 组间复用(见下方 state 载入)。
+    # 仅 ks=1 分配(N≥4 的档);+4KB → 总 5.5KB SMEM,仍 8 blk/SM、不掉 occupancy。
+    if cutlass.const_expr(k_split == 1):
+        sH = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8 * smem_k,), stride=(1,)), 16)
 
     # k_split:每个 V 列由 k_split 个 lane 分摊 K(各持 k_per_lane = K//k_split),reduce 后
     # 蝶形 shuffle 合并部分和。k_split=1 → 退化为原 tsl(lane=V 列,独扛 128 K,无 shuffle)。
@@ -129,13 +133,37 @@ def kda_mtp_triton_style_kernel(
     v_global = i_v * BV + v_local  # 本 lane 服务的全局 V 列
     k_start = lane * vec_size  # prep:全 warp 32 lane × vec_size=4 覆盖全 128 K(与 k_split 无关)
 
-    # state 初始化 0;若该序列有 pool slot 则覆盖载入本 lane 的 k_per_lane 段(K[k_off:k_off+k_per_lane])。
-    for j in cutlass.range_constexpr(k_per_lane):
-        r_h[j] = cutlass.Float32(0.0)
+    # ===== state 载入 =====
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
-        h_tile = cute.local_tile(h0_source, (1, 1, k_per_lane), (flat_state_idx, v_global, k_part))
-        cute.autovec_copy(h_tile, r_h)
+        if cutlass.const_expr(k_split == 1):
+            # lane=V列 直读 = 512B-strided uncoalesced(实测 ~6us 拖死 N≥4)。改「分块 coalesced
+            # 读 + SMEM 转置」:本 CTA 的 state 块 h0[flat, i_v*32:+32, 0:K] 是 32 V列×K 连续 4096
+            # fp32。分 NGRP=4 组 × VPG=8 V列(sH 仅 4KB、组间复用)。每组:32 lane coalesced 读
+            # VPG*K 连续元素(相邻 lane 相邻地址)写 sH(XOR swizzle k^v 避 bank 冲突),barrier,
+            # 本组 8 个 lane 取自己 V 列的 128 K 进 r_h。
+            VPG = 8
+            NGRP = BV // VPG
+            my_grp = lane // VPG
+            my_vig = lane % VPG
+            for g in cutlass.range_constexpr(NGRP):
+                for s in cutlass.range_constexpr((VPG * K) // 32):
+                    e = s * 32 + lane
+                    vig = e // K
+                    kk2 = e % K
+                    gv = i_v * BV + g * VPG + vig  # 全局 V 列;GMEM 地址 = C + s*32 + lane → coalesced
+                    sH[vig * K + (kk2 ^ vig)] = cutlass.Float32(h0_source[flat_state_idx, gv, kk2])
+                cute.arch.barrier()
+                if my_grp == g:
+                    for j in cutlass.range_constexpr(K):
+                        r_h[j] = sH[my_vig * K + (j ^ my_vig)]
+                cute.arch.barrier()  # 复用 sH 前同步
+        else:
+            h_tile = cute.local_tile(h0_source, (1, 1, k_per_lane), (flat_state_idx, v_global, k_part))
+            cute.autovec_copy(h_tile, r_h)
+    else:
+        for j in cutlass.range_constexpr(k_per_lane):
+            r_h[j] = cutlass.Float32(0.0)
 
     for i_t in cutlass.range_constexpr(T):
         # ===== prep:warp 协作算 q/k l2norm + per-channel g,写入 SMEM 广播 =====
@@ -259,7 +287,8 @@ def run_kda_mtp_triton_style_kernel(
     num_v_tiles = cute.ceil_div(v_dim, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    smem_bytes = 3 * K * 4 + 128  # sQ + sK + sG (fp32, XOR swizzle 无 padding) + 对齐余量
+    # sQ + sK + sG (3*K) + ks=1 的 coalesced-load 转置缓冲 sH (8*K) + 对齐余量。
+    smem_bytes = 3 * K * 4 + (8 * K * 4 if k_split == 1 else 0) + 256
 
     kda_mtp_triton_style_kernel(
         h0_source,
