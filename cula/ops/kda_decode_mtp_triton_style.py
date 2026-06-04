@@ -24,12 +24,8 @@ Math per token (decay-first,与 ws/Triton 完全一致):
     S    += k_norm (x) v_new                              # rank-1
     o_t   = S @ (l2norm(q_t) * scale)                     # reduce K (本文:线程内)
 
-deferred l2norm:SMEM 存 raw q/k,Σq²/Σk² 与 scale 折进 recurrence 的两趟 reduction
-(ks=1 时纯线程内、零额外 shuffle),省掉 prep 的 2×5-step shuffle + fp32 副本以压寄存器/消 spill。
-s = inv_k·(S·k_raw),rank-1 把 inv_k 折进 v_new;o = inv_q·scale·(S·q_raw)。
-
-bf16 累加阶不同于 ws(reduce 顺序不同;deferred norm 又把 Σ² 挪到 recurrence,顺序再变),
-数值仍对齐 fp32 torch / Triton 口径(atol 3e-2 / rtol 2e-2)。仅支持 ``state_layout='vk'``。
+bf16 累加阶不同于 ws(reduce 顺序不同),数值对齐 fp32 torch / Triton 口径
+(atol 3e-2 / rtol 2e-2)。仅支持 ``state_layout='vk'``、K=V//? 约束见 entry。
 """
 
 import logging
@@ -125,8 +121,8 @@ def kda_mtp_triton_style_kernel(
 
     # 本 lane 只持有自己 V 列的 k_per_lane 个 K state 分量常驻寄存器。
     r_h = cute.make_rmem_tensor(cute.make_layout((k_per_lane,), stride=(1,)), cutlass.Float32)
-    # deferred l2norm:不再保留 fp32 normalized q/k 副本(原 r_q/r_k 已删)。prep 只把
-    # raw q/k 从 bf16 直写 SMEM;归一化(Σq²/Σk² + scale)折进 recurrence 的 reduction。
+    r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
 
@@ -142,18 +138,37 @@ def kda_mtp_triton_style_kernel(
         cute.autovec_copy(h_tile, r_h)
 
     for i_t in cutlass.range_constexpr(T):
-        # ===== prep:把 raw q/k + per-channel g 写入 SMEM 广播 =====
-        # deferred l2norm:存 raw q/k(此处不归一化),Σq²/Σk² + scale 折进 recurrence
-        # 的两趟 reduction —— 砍掉 prep 的 2×5-step shuffle + inv 计算 + fp32 副本。
+        # ===== prep:warp 协作算 q/k l2norm + per-channel g,写入 SMEM 广播 =====
         q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
         k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
         cute.autovec_copy(q_tile, r_q_bf16)
         cute.autovec_copy(k_tile, r_k_bf16)
+        for i in cutlass.range_constexpr(vec_size):
+            r_q[i] = cutlass.Float32(r_q_bf16[i])
+            r_k[i] = cutlass.Float32(r_k_bf16[i])
+
+        if cutlass.const_expr(use_qk_l2norm):
+            sum_q = cutlass.Float32(0.0)
+            sum_k = cutlass.Float32(0.0)
+            for i in cutlass.range_constexpr(vec_size):
+                sum_q += r_q[i] * r_q[i]
+                sum_k += r_k[i] * r_k[i]
+            # 全 warp reduce (32 lane × vec_size=4 = 全部 128 K)。本 kernel 仅有的 shuffle。
+            for offset in [16, 8, 4, 2, 1]:
+                sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=-1, mask_and_clamp=31)
+                sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=-1, mask_and_clamp=31)
+            inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+            inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+            for i in cutlass.range_constexpr(vec_size):
+                r_q[i] = r_q[i] * inv_q
+                r_k[i] = r_k[i] * inv_k
+        else:
+            for i in cutlass.range_constexpr(vec_size):
+                r_q[i] = r_q[i] * scale
 
         for i in cutlass.range_constexpr(vec_size):
             kk = k_start + i
-            # ks=1 时 swz 恒等:显式 const_expr 折掉 kk//k_per_lane 的整数运算。
-            sw = kk if k_split == 1 else kk ^ (kk // k_per_lane)
+            sw = kk ^ (kk // k_per_lane)  # XOR swizzle SMEM 写位置(a/dt_bias 仍用原 kk 读 GMEM)
             x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
             beta_x = softplus_beta * x
             exp_bx = cute.exp(beta_x, fastmath=fast_math)
@@ -167,8 +182,8 @@ def kda_mtp_triton_style_kernel(
             )
             sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
             sG[sw] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
-            sQ[sw] = cutlass.Float32(r_q_bf16[i])  # raw q(归一化推迟到 recurrence)
-            sK[sw] = cutlass.Float32(r_k_bf16[i])  # raw k
+            sQ[sw] = r_q[i]
+            sK[sw] = r_k[i]
 
         # beta 是 per-(i_n,i_t,i_hv) 标量,各 lane 各算一份(便宜,无需广播)。
         r_beta = cutlass.Float32(1.0) / (
@@ -181,49 +196,23 @@ def kda_mtp_triton_style_kernel(
         # ===== recurrence:本 lane 算自己 k_per_lane 段 K 的部分和,再蝶形 shuffle 合并 k_split 个 lane =====
         # (k_split=1 → kk 是 constexpr、butterfly 0 步,与原 tsl 完全一致。)
         r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_global])
-        # decay + s=S·k_raw 部分和;同趟累 Σk_raw²(deferred k-norm,ks=1 时纯线程内零 shuffle)。
+        # 融合 decay + s 部分和。
         s = cutlass.Float32(0.0)
-        sum_sq_k = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
             sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle 读位置(= swz(k_off+j))
-            kf = sK[sw]  # raw k
             r_h[j] = r_h[j] * sG[sw]
-            s += r_h[j] * kf
-            if cutlass.const_expr(use_qk_l2norm):
-                sum_sq_k += kf * kf
+            s += r_h[j] * sK[sw]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
             s += cute.arch.shuffle_sync_bfly(s, offset=BV << st, mask=-1, mask_and_clamp=31)
-            if cutlass.const_expr(use_qk_l2norm):
-                sum_sq_k += cute.arch.shuffle_sync_bfly(sum_sq_k, offset=BV << st, mask=-1, mask_and_clamp=31)
-        # 归一化下沉到标量:s = inv_k·(S·k_raw) = S·k_norm;rank-1 的 k_norm 把 inv_k 折进 v_new。
-        if cutlass.const_expr(use_qk_l2norm):
-            inv_k = cute.rsqrt(sum_sq_k + 1e-6, fastmath=fast_math)
-            s = s * inv_k
-            v_new = (r_v - s) * r_beta
-            vk = v_new * inv_k  # r_h += k_raw·vk = (k_raw·inv_k)·v_new = k_norm·v_new
-        else:
-            v_new = (r_v - s) * r_beta
-            vk = v_new
-        # rank-1 + o=S·q_raw 部分和;同趟累 Σq_raw²(deferred q-norm)。
+        v_new = (r_v - s) * r_beta
+        # 融合 rank-1 + o 部分和,同样蝶形合并。
         o_val = cutlass.Float32(0.0)
-        sum_sq_q = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
             sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle 读位置
-            r_h[j] = r_h[j] + sK[sw] * vk
-            qf = sQ[sw]  # raw q
-            o_val += r_h[j] * qf
-            if cutlass.const_expr(use_qk_l2norm):
-                sum_sq_q += qf * qf
+            r_h[j] = r_h[j] + sK[sw] * v_new
+            o_val += r_h[j] * sQ[sw]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
             o_val += cute.arch.shuffle_sync_bfly(o_val, offset=BV << st, mask=-1, mask_and_clamp=31)
-            if cutlass.const_expr(use_qk_l2norm):
-                sum_sq_q += cute.arch.shuffle_sync_bfly(sum_sq_q, offset=BV << st, mask=-1, mask_and_clamp=31)
-        # o = S·(q_norm·scale) = inv_q·scale·(S·q_raw);非 l2norm 时只乘 scale。
-        if cutlass.const_expr(use_qk_l2norm):
-            inv_q = cute.rsqrt(sum_sq_q + 1e-6, fastmath=fast_math) * scale
-            o_val = o_val * inv_q
-        else:
-            o_val = o_val * scale
         o[(i_n, i_t, i_hv, v_global)] = cutlass.BFloat16(o_val)
 
         cute.arch.barrier()  # 确保各 lane 读完 sQ/sK/sG,下个 token 的 prep 才能覆盖
