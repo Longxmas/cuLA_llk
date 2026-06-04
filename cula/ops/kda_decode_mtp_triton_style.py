@@ -85,6 +85,7 @@ def kda_mtp_triton_style_kernel(
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
+    state_is_kv: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
     lane = tidx  # block 恒 32 = 1 warp;tidx == lane ∈ [0,32)
@@ -111,8 +112,9 @@ def kda_mtp_triton_style_kernel(
     sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
     # ks=1 的 coalesced state-load 转置缓冲:8 V列 × K = 4KB,4 组间复用(见下方 state 载入)。
-    # 仅 ks=1 分配(N≥4 的档);+4KB → 总 5.5KB SMEM,仍 8 blk/SM、不掉 occupancy。
-    if cutlass.const_expr(k_split == 1):
+    # 仅 vk+ks=1 分配(N≥4 的档);+4KB → 总 5.5KB SMEM,仍 8 blk/SM、不掉 occupancy。
+    # kv 布局 V 连续、直读已 coalesced,无需 sH 转置。
+    if cutlass.const_expr(k_split == 1 and not state_is_kv):
         sH = smem.allocate_tensor(cutlass.Float32, cute.make_layout((8 * smem_k,), stride=(1,)), 16)
 
     # k_split:每个 V 列由 k_split 个 lane 分摊 K(各持 k_per_lane = K//k_split),reduce 后
@@ -136,7 +138,12 @@ def kda_mtp_triton_style_kernel(
     # ===== state 载入 =====
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
-        if cutlass.const_expr(k_split == 1):
+        if cutlass.const_expr(state_is_kv):
+            # kv 布局 [.., K, V]:V 连续,lane=v_global 固定 k 跨 lane 地址连续 → 直接 coalesced,
+            # 零 SMEM/barrier/divergence(ks>1 时按 k_part 分 ks 段,段内 BV 个 lane 仍连续)。
+            for j in cutlass.range_constexpr(k_per_lane):
+                r_h[j] = cutlass.Float32(h0_source[flat_state_idx, k_off + j, v_global])
+        elif cutlass.const_expr(k_split == 1):
             # lane=V列 直读 = 512B-strided uncoalesced(实测 ~6us 拖死 N≥4)。改「分块 coalesced
             # 读 + SMEM 转置」:本 CTA 的 state 块 h0[flat, i_v*32:+32, 0:K] 是 32 V列×K 连续 4096
             # fp32。分 NGRP=4 组 × VPG=8 V列(sH 仅 4KB、组间复用)。每组:32 lane coalesced 读
@@ -248,8 +255,13 @@ def kda_mtp_triton_style_kernel(
     if cache_idx >= 0:
         if cutlass.const_expr(not disable_state_update):
             flat_state_idx = cache_idx * HV + i_hv
-            h_out = cute.local_tile(h0_source, (1, 1, k_per_lane), (flat_state_idx, v_global, k_part))
-            cute.autovec_copy(r_h, h_out)
+            if cutlass.const_expr(state_is_kv):
+                # kv:V 连续 → 回写同样 coalesced。
+                for j in cutlass.range_constexpr(k_per_lane):
+                    h0_source[(flat_state_idx, k_off + j, v_global)] = r_h[j]
+            else:
+                h_out = cute.local_tile(h0_source, (1, 1, k_per_lane), (flat_state_idx, v_global, k_part))
+                cute.autovec_copy(r_h, h_out)
 
 
 @cute.jit
@@ -278,17 +290,18 @@ def run_kda_mtp_triton_style_kernel(
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
+    state_is_kv: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Host-side launcher: grid = N * HV * (V//BV), block = 32 (恒 1 warp)。
     BV = 32//k_split = 每 program 的 V 列数;k_split 个 lane 分摊一个 V 列的 K。"""
     n_indices = h0_indices.layout.shape[0]
-    v_dim = h0_source.layout.shape[1]
-    num_v_tiles = cute.ceil_div(v_dim, BV)
+    # kv 布局时 h0_source.shape[1]=K,不能用来推 V;统一用 V 常量算 num_v_tiles。
+    num_v_tiles = cute.ceil_div(V, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    # sQ + sK + sG (3*K) + ks=1 的 coalesced-load 转置缓冲 sH (8*K) + 对齐余量。
-    smem_bytes = 3 * K * 4 + (8 * K * 4 if k_split == 1 else 0) + 256
+    # sQ + sK + sG (3*K) + vk&ks=1 的 coalesced-load 转置缓冲 sH (8*K) + 对齐余量。
+    smem_bytes = 3 * K * 4 + (8 * K * 4 if (k_split == 1 and not state_is_kv) else 0) + 256
 
     kda_mtp_triton_style_kernel(
         h0_source,
@@ -316,6 +329,7 @@ def run_kda_mtp_triton_style_kernel(
         use_qk_l2norm,
         disable_state_update,
         fast_math,
+        state_is_kv,
     ).launch(
         grid=(grid_size, 1, 1),
         block=[32, 1, 1],
@@ -341,6 +355,7 @@ def _get_compiled_mtp_triton_kernel(
     softplus_threshold,
     opt_level=3,
     fast_math=True,
+    state_is_kv=False,
 ):
     key = (
         N,
@@ -359,6 +374,7 @@ def _get_compiled_mtp_triton_kernel(
         softplus_threshold,
         opt_level,
         fast_math,
+        state_is_kv,
     )
     if key in _compiled_mtp_triton_kernels:
         return _compiled_mtp_triton_kernels[key]
@@ -371,7 +387,10 @@ def _get_compiled_mtp_triton_kernel(
     o = torch.zeros(N, T, HV, V, dtype=torch.bfloat16, device="cuda")
     A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
     dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
-    h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
+    if state_is_kv:
+        h0_source = torch.zeros(pool_size * HV, K, V, dtype=torch.float32, device="cuda")
+    else:
+        h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
 
     q_t = from_dlpack(q, assumed_align=16)
@@ -413,6 +432,7 @@ def _get_compiled_mtp_triton_kernel(
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=disable_state_update,
         fast_math=fast_math,
+        state_is_kv=state_is_kv,
         stream=stream,
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
@@ -505,9 +525,9 @@ def kda_decode_mtp_triton_style(
     assert V % vcols == 0, f"triton-style requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
 
     state_layout = _canonicalize_state_layout(state_layout)
-    if state_layout != "vk":
+    if state_layout not in ("vk", "kv"):
         raise NotImplementedError(
-            f"kda_decode_mtp_triton_style only supports state_layout='vk'; got {state_layout!r}"
+            f"kda_decode_mtp_triton_style supports state_layout in ('vk', 'kv'); got {state_layout!r}"
         )
 
     h0_source, pool_size, state_layout_is_kv = _normalize_state_source(
@@ -519,7 +539,7 @@ def kda_decode_mtp_triton_style(
         device=q.device,
         state_layout=state_layout,
     )
-    assert not state_layout_is_kv  # vk-only
+    # state_layout_is_kv=True: kv 布局让 lane=V列 的 state load/store 直接 coalesced(见 kernel)。
 
     a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
     if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
@@ -539,7 +559,10 @@ def kda_decode_mtp_triton_style(
         initial_state_indices, N=N, pool_size=pool_size, device=q.device
     )
 
-    h0_source_flat = h0_source.view(pool_size * HV, V, K)
+    if state_layout_is_kv:
+        h0_source_flat = h0_source.view(pool_size * HV, K, V)
+    else:
+        h0_source_flat = h0_source.view(pool_size * HV, V, K)
 
     stream = _get_cached_stream(q.device)
 
@@ -560,6 +583,7 @@ def kda_decode_mtp_triton_style(
         softplus_threshold=softplus_threshold,
         opt_level=opt_level,
         fast_math=fast_math,
+        state_is_kv=state_layout_is_kv,
     )
 
     compiled_kernel(
