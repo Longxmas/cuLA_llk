@@ -46,9 +46,12 @@ from diag_kda_mtp_small_batch import (  # noqa: E402  复用 diag 基建
 _TSL_OPT_LEVEL = 3
 _TSL_FAST_MATH = True
 _TSL_K_SPLIT = 1
+_TSL_SKIP_LOAD = False  # ablation:tsl 传 -1 indices 跳过 state load,只测 perf(定位 fixed deficit 是否=state load)
 
 
 def make_triton_style_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
+    if _TSL_SKIP_LOAD:
+        indices = torch.full_like(indices, -1)  # ablation:cache_idx<0 → kernel 跳过 state load 这一步
     def call():
         return kda_decode_mtp_triton_style(
             A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
@@ -99,12 +102,17 @@ def main():
                     help="tsl 的 fast_math(0/1)")
     ap.add_argument("--tsl-k-split", type=int, default=1, choices=[-1, 1, 2, 4],
                     help="tsl 的 k_split:每 V 列由 k_split 个 lane 分摊 K(降寄存器/提 occupancy);-1=auto(按 work_units wave 适配)")
+    ap.add_argument("--tsl-skip-load", action="store_true",
+                    help="ablation:tsl 传 -1 indices 跳过 state load(只测 perf,正确性必错)——定位 fixed deficit 是否来自 state load")
     args = ap.parse_args()
 
-    global _TSL_OPT_LEVEL, _TSL_FAST_MATH, _TSL_K_SPLIT
+    global _TSL_OPT_LEVEL, _TSL_FAST_MATH, _TSL_K_SPLIT, _TSL_SKIP_LOAD
     _TSL_OPT_LEVEL = args.tsl_opt_level
     _TSL_FAST_MATH = bool(args.tsl_fast_math)
     _TSL_K_SPLIT = args.tsl_k_split
+    _TSL_SKIP_LOAD = args.tsl_skip_load
+    if _TSL_SKIP_LOAD:
+        print("[--tsl-skip-load] tsl 跳过 state load:数值校验对 tsl 必报 DIFF(预期);只看下面 perf 的 tg_tsl vs 有 load 基准。")
 
     if not torch.cuda.is_available():
         sys.exit("需要 CUDA GPU(B200 等);Mac 无法跑。")
@@ -167,7 +175,7 @@ def main():
             print(f"{N:>4} {T:>3} | {d_tri:>16.2e} | {d_ws:>12.2e} | {flag}")
     print("数值校验:", "全部 OK" if ok_all else "有 DIFF,先查正确性再看性能!")
 
-    if args.check or not ok_all:
+    if args.check or (not ok_all and not _TSL_SKIP_LOAD):
         return
 
     # ---------------- 性能 (t_graph, kernel-only) ----------------
