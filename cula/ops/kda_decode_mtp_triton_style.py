@@ -29,6 +29,7 @@ bf16 累加阶不同于 ws(reduce 顺序不同),数值对齐 fp32 torch / Triton
 """
 
 import logging
+import math
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -103,9 +104,9 @@ def kda_mtp_triton_style_kernel(
     r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
 
     # SMEM:列间共享的 K 维向量 (q_scaled / k_norm / g),由本 warp 协作算一次后广播。
-    # swizzle:每个 K 段间塞 1 padding(共 k_split 个) → 存储位置 swz(kk)=kk+kk//k_per_lane,
-    # 让 k_split 个段落在不同 SMEM bank,消掉拆分读的 bank conflict(k_split=1 时 swz 恒等)。
-    smem_k = K + k_split
+    # XOR swizzle:存储位置 swz(kk)=kk ^ (kk//k_per_lane) —— 把第 k_part 段按 k_part 异或重排
+    # bank,让 k_split 个段错开到不同 bank(零 padding、双射无碰撞;k_split=1 时 swz 恒等)。
+    smem_k = K
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
     sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
@@ -168,7 +169,7 @@ def kda_mtp_triton_style_kernel(
 
         for i in cutlass.range_constexpr(vec_size):
             kk = k_start + i
-            sw = kk + kk // k_per_lane  # swizzle SMEM 写位置(a/dt_bias 仍用原 kk 读 GMEM)
+            sw = kk ^ (kk // k_per_lane)  # XOR swizzle SMEM 写位置(a/dt_bias 仍用原 kk 读 GMEM)
             x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
             beta_x = softplus_beta * x
             exp_bx = cute.exp(beta_x, fastmath=fast_math)
@@ -199,7 +200,7 @@ def kda_mtp_triton_style_kernel(
         # 融合 decay + s 部分和。
         s = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
-            sw = j if k_split == 1 else k_off + j + k_part  # swizzle 读位置(= swz(k_off+j))
+            sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle 读位置(= swz(k_off+j))
             r_h[j] = r_h[j] * sG[sw]
             s += r_h[j] * sK[sw]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
@@ -208,7 +209,7 @@ def kda_mtp_triton_style_kernel(
         # 融合 rank-1 + o 部分和,同样蝶形合并。
         o_val = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
-            sw = j if k_split == 1 else k_off + j + k_part
+            sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle 读位置
             r_h[j] = r_h[j] + sK[sw] * v_new
             o_val += r_h[j] * sQ[sw]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
@@ -259,7 +260,7 @@ def run_kda_mtp_triton_style_kernel(
     num_v_tiles = cute.ceil_div(v_dim, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    smem_bytes = 3 * (K + k_split) * 4 + 128  # sQ + sK + sG (fp32, 含 swizzle padding) + 对齐余量
+    smem_bytes = 3 * K * 4 + 128  # sQ + sK + sG (fp32, XOR swizzle 无 padding) + 对齐余量
 
     kda_mtp_triton_style_kernel(
         h0_source,
@@ -397,6 +398,32 @@ def _get_compiled_mtp_triton_kernel(
     return compiled_kernel
 
 
+# B200(GB200)ncu 实测:k_split 对应的 register-limited occupancy(CTAs/SM)。
+# r_h 地板 = 128//k_split fp32 → reg 255/166/111 → Block Limit Registers 8/12/16。
+_TSL_CTAS_PER_SM = {1: 8, 2: 12, 4: 16}
+
+
+def _select_tsl_k_split(work_units, V, num_sms):
+    """按 wave 适配自动挑 k_split(work_units = N*HV)。
+
+    grid(ks)=work_units*(V//(32//ks)),cap(ks)=num_sms*CTAs_per_SM(ks),
+    waves=grid/cap;跑完要 ceil(waves) 轮、每轮时长~1/occupancy → cost=ceil(waves)/CTAs_per_SM。
+    取 cost 最小(平局取小 ks 保守)。目的:躲开 wave 刚越整数的量化坑(如 N=4 的 1.12 波)。
+    """
+    best_ks, best_cost = 1, float("inf")
+    for ks in (1, 2, 4):
+        vcols = 32 // ks
+        if V % vcols != 0:
+            continue
+        grid = work_units * (V // vcols)
+        cap = num_sms * _TSL_CTAS_PER_SM[ks]
+        waves = grid / cap
+        cost = math.ceil(waves) / _TSL_CTAS_PER_SM[ks]
+        if cost < best_cost - 1e-9:
+            best_ks, best_cost = ks, cost
+    return best_ks
+
+
 def kda_decode_mtp_triton_style(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -439,7 +466,10 @@ def kda_decode_mtp_triton_style(
         f"triton-style 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
     )
     assert bv == TRITON_BV, f"triton-style 固定 1 warp,bv 必须为 {TRITON_BV},got {bv}"
-    assert k_split in (1, 2, 4), f"k_split 仅支持 1/2/4,got {k_split}"
+    if k_split <= 0:  # auto:按 work_units(N*HV) 的 wave 适配挑 k_split
+        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        k_split = _select_tsl_k_split(N * HV, V, num_sms)
+    assert k_split in (1, 2, 4), f"k_split 仅支持 1/2/4 或 <=0(auto),got {k_split}"
     assert bv % k_split == 0 and K % k_split == 0, (
         f"需 bv%k_split==0 且 K%k_split==0,got bv={bv}, K={K}, k_split={k_split}"
     )

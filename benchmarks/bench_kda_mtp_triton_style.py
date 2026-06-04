@@ -97,8 +97,8 @@ def main():
                     help="tsl 的 --opt-level(调 ptxas 流水深度/寄存器 A/B)")
     ap.add_argument("--tsl-fast-math", type=int, default=1, choices=[0, 1],
                     help="tsl 的 fast_math(0/1)")
-    ap.add_argument("--tsl-k-split", type=int, default=1, choices=[1, 2, 4],
-                    help="tsl 的 k_split:每 V 列由 k_split 个 lane 分摊 K(降寄存器/提 occupancy)")
+    ap.add_argument("--tsl-k-split", type=int, default=1, choices=[-1, 1, 2, 4],
+                    help="tsl 的 k_split:每 V 列由 k_split 个 lane 分摊 K(降寄存器/提 occupancy);-1=auto(按 work_units wave 适配)")
     args = ap.parse_args()
 
     global _TSL_OPT_LEVEL, _TSL_FAST_MATH, _TSL_K_SPLIT
