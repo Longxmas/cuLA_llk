@@ -81,6 +81,11 @@ def main():
     ap.add_argument("--ws-tile-v", type=int, default=32, help="ws baseline 的 tile_v")
     ap.add_argument("--ws-ilp", type=int, default=4, help="ws baseline 的 ilp_rows")
     ap.add_argument("--check", action="store_true", help="只数值校验,不计时")
+    ap.add_argument("--profile", nargs=2, type=int, metavar=("N", "T"), default=None,
+                    help="单 (N,T) 长跑某变体 profile_iters 次,供 ncu/nsys 包裹(只 forward,不计时)")
+    ap.add_argument("--profile-iters", type=int, default=50)
+    ap.add_argument("--profile-variant", choices=["tsl", "triton", "ws"], default="tsl",
+                    help="--profile 跑哪个变体(默认 triton-style)")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -91,6 +96,32 @@ def main():
     device = "cuda"
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"形状 H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu=True(forward-only)")
+
+    # ---------------- 单 config 长跑(供 ncu/nsys 外部 profiler) ----------------
+    if args.profile is not None:
+        N, T = args.profile
+        q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
+            N, T, args.H, args.HV, args.K, args.V, device)
+        scale = args.K ** -0.5
+        if args.profile_variant == "triton":
+            qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
+            fn = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
+                                  state0.clone(), indices, scale, True)
+        elif args.profile_variant == "ws":
+            fn = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
+                              scale, True, args.ws_tile_v, args.ws_ilp)
+        else:
+            fn = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
+                                        state0.clone(), indices, scale, True)
+        warmup(fn, args.warmup)
+        print(f"[profile] variant={args.profile_variant} N={N} T={T}: "
+              f"{args.profile_iters} forward iters(供外部 profiler 包裹)")
+        torch.cuda.synchronize()
+        for _ in range(args.profile_iters):
+            fn()
+        torch.cuda.synchronize()
+        print("[profile] done.")
+        return
 
     # ---------------- 数值校验 ----------------
     print("\n=== 数值校验 (max|Δ|, 阈值 5e-2) ===")
