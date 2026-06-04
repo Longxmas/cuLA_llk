@@ -103,10 +103,13 @@ def kda_mtp_triton_style_kernel(
     r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
 
     # SMEM:列间共享的 K 维向量 (q_scaled / k_norm / g),由本 warp 协作算一次后广播。
+    # swizzle:每个 K 段间塞 1 padding(共 k_split 个) → 存储位置 swz(kk)=kk+kk//k_per_lane,
+    # 让 k_split 个段落在不同 SMEM bank,消掉拆分读的 bank conflict(k_split=1 时 swz 恒等)。
+    smem_k = K + k_split
     smem = cutlass.utils.SmemAllocator()
-    sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,), stride=(1,)), 16)
-    sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,), stride=(1,)), 16)
-    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,), stride=(1,)), 16)
+    sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
+    sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
+    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
 
     # k_split:每个 V 列由 k_split 个 lane 分摊 K(各持 k_per_lane = K//k_split),reduce 后
     # 蝶形 shuffle 合并部分和。k_split=1 → 退化为原 tsl(lane=V 列,独扛 128 K,无 shuffle)。
@@ -165,6 +168,7 @@ def kda_mtp_triton_style_kernel(
 
         for i in cutlass.range_constexpr(vec_size):
             kk = k_start + i
+            sw = kk + kk // k_per_lane  # swizzle SMEM 写位置(a/dt_bias 仍用原 kk 读 GMEM)
             x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
             beta_x = softplus_beta * x
             exp_bx = cute.exp(beta_x, fastmath=fast_math)
@@ -177,9 +181,9 @@ def kda_mtp_triton_style_kernel(
                 else cutlass.Float32(0.0)
             )
             sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-            sG[kk] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
-            sQ[kk] = r_q[i]
-            sK[kk] = r_k[i]
+            sG[sw] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+            sQ[sw] = r_q[i]
+            sK[sw] = r_k[i]
 
         # beta 是 per-(i_n,i_t,i_hv) 标量,各 lane 各算一份(便宜,无需广播)。
         r_beta = cutlass.Float32(1.0) / (
@@ -195,18 +199,18 @@ def kda_mtp_triton_style_kernel(
         # 融合 decay + s 部分和。
         s = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
-            kk = j if k_split == 1 else k_off + j
-            r_h[j] = r_h[j] * sG[kk]
-            s += r_h[j] * sK[kk]
+            sw = j if k_split == 1 else k_off + j + k_part  # swizzle 读位置(= swz(k_off+j))
+            r_h[j] = r_h[j] * sG[sw]
+            s += r_h[j] * sK[sw]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
             s += cute.arch.shuffle_sync_bfly(s, offset=BV << st, mask=-1, mask_and_clamp=31)
         v_new = (r_v - s) * r_beta
         # 融合 rank-1 + o 部分和,同样蝶形合并。
         o_val = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
-            kk = j if k_split == 1 else k_off + j
-            r_h[j] = r_h[j] + sK[kk] * v_new
-            o_val += r_h[j] * sQ[kk]
+            sw = j if k_split == 1 else k_off + j + k_part
+            r_h[j] = r_h[j] + sK[sw] * v_new
+            o_val += r_h[j] * sQ[sw]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
             o_val += cute.arch.shuffle_sync_bfly(o_val, offset=BV << st, mask=-1, mask_and_clamp=31)
         o[(i_n, i_t, i_hv, v_global)] = cutlass.BFloat16(o_val)
@@ -255,7 +259,7 @@ def run_kda_mtp_triton_style_kernel(
     num_v_tiles = cute.ceil_div(v_dim, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    smem_bytes = 3 * K * 4 + 128  # sQ + sK + sG (fp32) + 对齐余量
+    smem_bytes = 3 * (K + k_split) * 4 + 128  # sQ + sK + sG (fp32, 含 swizzle padding) + 对齐余量
 
     kda_mtp_triton_style_kernel(
         h0_source,
