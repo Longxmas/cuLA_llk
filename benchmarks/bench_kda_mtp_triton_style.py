@@ -114,6 +114,9 @@ def main():
     ap.add_argument("--ws-tile-v", type=int, default=32, help="ws baseline 的 tile_v")
     ap.add_argument("--ws-ilp", type=int, default=4, help="ws baseline 的 ilp_rows")
     ap.add_argument("--check", action="store_true", help="只数值校验,不计时")
+    ap.add_argument("--check-cases", type=str, nargs="+", default=["1:2", "4:4"],
+                    help="精度校验只跑这些 N:T 样例(默认 2 个角点,覆盖最小/最大 T 的累加深度;"
+                         "精度对 N 不敏感)。'all'=用 --batch-sizes×--Ts 全网格。大幅提速验证。")
     ap.add_argument("--profile", nargs=2, type=int, metavar=("N", "T"), default=None,
                     help="单 (N,T) 长跑某变体 profile_iters 次,供 ncu/nsys 包裹(只 forward,不计时)")
     ap.add_argument("--profile-iters", type=int, default=50)
@@ -182,33 +185,36 @@ def main():
     print("\n=== 数值校验 (max|Δ|, 阈值 5e-2) ===")
     print(f"{'N':>4} {'T':>3} | {'Δ tsl-vs-tri':>13} | {'Δ tslkv-vs-tri':>14} | {'Δ tslK-vs-tri':>13} | {'Δ tsl-vs-ws':>12} | flag")
     print("-" * 82)
+    if len(args.check_cases) == 1 and args.check_cases[0].lower() == "all":
+        check_cases = [(N, T) for N in args.batch_sizes for T in args.Ts]
+    else:
+        check_cases = [tuple(int(x) for x in c.split(":")) for c in args.check_cases]
     ok_all = True
-    for N in args.batch_sizes:
-        for T in args.Ts:
-            q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
-                N, T, args.H, args.HV, args.K, args.V, device)
-            qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
-            scale = args.K ** -0.5
-            o_tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
-                                     state0.clone(), indices, scale, True)()
-            o_tri = o_tri.reshape(N, T, args.HV, args.V).float()
-            o_tsl = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
-                                           state0.clone(), indices, scale, True)().float()
-            o_tsl_kv = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
-                                              state0.clone(), indices, scale, True,
-                                              state_layout="kv")().float()
-            o_tslK = make_triton_aligned_call(q, k, v, a, b, A_log, dt_bias,
-                                              state0.clone(), indices, scale, True)().float()
-            o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                                scale, True, args.ws_tile_v, args.ws_ilp)().float()
-            d_tri = (o_tsl - o_tri).abs().max().item()
-            d_kv = (o_tsl_kv - o_tri).abs().max().item()
-            d_K = (o_tslK - o_tri).abs().max().item()
-            d_ws = (o_tsl - o_ws).abs().max().item()
-            flag = "OK" if (d_tri < 5e-2 and d_kv < 5e-2 and d_K < 5e-2 and d_ws < 5e-2) else "DIFF!"
-            if flag != "OK":
-                ok_all = False
-            print(f"{N:>4} {T:>3} | {d_tri:>13.2e} | {d_kv:>14.2e} | {d_K:>13.2e} | {d_ws:>12.2e} | {flag}")
+    for N, T in check_cases:
+        q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
+            N, T, args.H, args.HV, args.K, args.V, device)
+        qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
+        scale = args.K ** -0.5
+        o_tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
+                                 state0.clone(), indices, scale, True)()
+        o_tri = o_tri.reshape(N, T, args.HV, args.V).float()
+        o_tsl = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
+                                       state0.clone(), indices, scale, True)().float()
+        o_tsl_kv = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
+                                          state0.clone(), indices, scale, True,
+                                          state_layout="kv")().float()
+        o_tslK = make_triton_aligned_call(q, k, v, a, b, A_log, dt_bias,
+                                          state0.clone(), indices, scale, True)().float()
+        o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
+                            scale, True, args.ws_tile_v, args.ws_ilp)().float()
+        d_tri = (o_tsl - o_tri).abs().max().item()
+        d_kv = (o_tsl_kv - o_tri).abs().max().item()
+        d_K = (o_tslK - o_tri).abs().max().item()
+        d_ws = (o_tsl - o_ws).abs().max().item()
+        flag = "OK" if (d_tri < 5e-2 and d_kv < 5e-2 and d_K < 5e-2 and d_ws < 5e-2) else "DIFF!"
+        if flag != "OK":
+            ok_all = False
+        print(f"{N:>4} {T:>3} | {d_tri:>13.2e} | {d_kv:>14.2e} | {d_K:>13.2e} | {d_ws:>12.2e} | {flag}")
     print("数值校验:", "全部 OK" if ok_all else "有 DIFF,先查正确性再看性能!")
 
     if args.check or (not ok_all and not _TSL_SKIP_LOAD):
