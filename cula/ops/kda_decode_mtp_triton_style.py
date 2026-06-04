@@ -601,3 +601,447 @@ def kda_decode_mtp_triton_style(
     )
 
     return o
+
+
+# ============================================================================
+# 变体 B:lane=K + warp-shuffle reduce —— 完全对齐 triton 的 thread→data 映射
+# ----------------------------------------------------------------------------
+# 上面的 lane=V 版(每 lane 1 个 V 列、独扛 128 K 进寄存器、线程内 128-FMA、零 shuffle)
+# 在 vk 下 load 按 lane=V → 512B-strided uncoalesced。本变体改成 triton 的做法:
+#   - lane t 沿 K interleaved 持 vec_size 个 K(k = c*32 + lane, c=0..vec_size-1)× 全
+#     BV 个 V 列(r_h[BV*vec_size])。固定 (v,c) 跨 lane 地址连续 → scalar load 即 coalesced。
+#   - reduce-over-K = 线程内 vec_size + 32-lane 5 步 butterfly shuffle(= triton
+#     tl.sum(axis=0) 的展开,也是 ws 的结构);q/k/g 各 lane 只算自己 vec_size 个 K、留
+#     寄存器,不再走 SMEM 广播。
+#   - s[v]/o[v] all-reduce 后每 lane 都有全 BV 个;o 用「32 lane 同址同值幂等写」落盘。
+# 数学与 lane=V 版完全一致(都已对齐 triton/torch);差别纯在 thread 映射,用于验证
+# 「lane=V 才是 vk uncoalesced 的病根」。预期 ≈ triton-parity(它就是 triton 的 CuTe 复刻)。
+# 仅 vk、单 warp(K//vec_size==32)、不 split。
+# ============================================================================
+@cute.kernel
+def kda_mtp_triton_aligned_kernel(
+    h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    BV: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    lane = tidx  # 1 warp = 32 lane
+
+    bidx, _, _ = cute.arch.block_idx()
+    i_v = bidx % num_v_tiles
+    tmp = bidx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+    r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
+
+    # lane t 沿 K interleaved 持 vec_size 个 K(k = c*32 + lane)× 全 BV 个 V 列。
+    # r_h[vv*vec_size + c] = state[i_v*BV+vv, c*32+lane]。
+    r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
+    r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_bv = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)
+
+    # ===== state 载入(scalar interleaved → 固定 (v,c) 跨 lane 连续 = coalesced) =====
+    if cache_idx >= 0:
+        flat_state_idx = cache_idx * HV + i_hv
+        for vv in cutlass.range_constexpr(BV):
+            v_global = i_v * BV + vv
+            for c in cutlass.range_constexpr(vec_size):
+                r_h[vv * vec_size + c] = cutlass.Float32(
+                    h0_source[flat_state_idx, v_global, c * 32 + lane]
+                )
+    else:
+        for j in cutlass.range_constexpr(BV * vec_size):
+            r_h[j] = cutlass.Float32(0.0)
+
+    for i_t in cutlass.range_constexpr(T):
+        # ===== prep:本 lane 自己 vec_size 个 K 的 q/k(l2norm)/g,留寄存器(无 SMEM 广播) =====
+        for c in cutlass.range_constexpr(vec_size):
+            r_q[c] = cutlass.Float32(q[i_n, i_t, i_h, c * 32 + lane])
+            r_k[c] = cutlass.Float32(k[i_n, i_t, i_h, c * 32 + lane])
+
+        if cutlass.const_expr(use_qk_l2norm):
+            sum_q = cutlass.Float32(0.0)
+            sum_k = cutlass.Float32(0.0)
+            for c in cutlass.range_constexpr(vec_size):
+                sum_q += r_q[c] * r_q[c]
+                sum_k += r_k[c] * r_k[c]
+            for off in [16, 8, 4, 2, 1]:
+                sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
+                sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
+            inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+            inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+            for c in cutlass.range_constexpr(vec_size):
+                r_q[c] = r_q[c] * inv_q
+                r_k[c] = r_k[c] * inv_k
+        else:
+            for c in cutlass.range_constexpr(vec_size):
+                r_q[c] = r_q[c] * scale
+
+        for c in cutlass.range_constexpr(vec_size):
+            kk = c * 32 + lane
+            x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
+            beta_x = softplus_beta * x
+            exp_bx = cute.exp(beta_x, fastmath=fast_math)
+            sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+            )
+            use_sp = (
+                cutlass.Float32(1.0)
+                if beta_x <= softplus_threshold
+                else cutlass.Float32(0.0)
+            )
+            sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+            r_g[c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+
+        r_beta = cutlass.Float32(1.0) / (
+            cutlass.Float32(1.0)
+            + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
+        )
+
+        # 本 lane 载入全 BV 个 V 的 v_t(各 v 同地址、全 warp 广播,便宜)
+        for vv in cutlass.range_constexpr(BV):
+            r_bv[vv] = cutlass.Float32(v[i_n, i_t, i_hv, i_v * BV + vv])
+
+        # ===== recurrence =====
+        # decay:h *= exp(g)(per K)
+        for vv in cutlass.range_constexpr(BV):
+            for c in cutlass.range_constexpr(vec_size):
+                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] * r_g[c]
+
+        # s[v]=Σ_k h·k_norm(线程内 vec_size + 32-lane butterfly)→ v_new=beta*(v_t-s)→ rank-1
+        for vv in cutlass.range_constexpr(BV):
+            s = cutlass.Float32(0.0)
+            for c in cutlass.range_constexpr(vec_size):
+                s += r_h[vv * vec_size + c] * r_k[c]
+            for off in [16, 8, 4, 2, 1]:
+                s += cute.arch.shuffle_sync_bfly(s, offset=off, mask=-1, mask_and_clamp=31)
+            v_new = (r_bv[vv] - s) * r_beta
+            for c in cutlass.range_constexpr(vec_size):
+                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] + r_k[c] * v_new
+
+        # o[v]=Σ_k h·q_scaled(同 reduce)→ all-reduce 后每 lane 同值 → 32 lane 同址幂等写
+        for vv in cutlass.range_constexpr(BV):
+            ov = cutlass.Float32(0.0)
+            for c in cutlass.range_constexpr(vec_size):
+                ov += r_h[vv * vec_size + c] * r_q[c]
+            for off in [16, 8, 4, 2, 1]:
+                ov += cute.arch.shuffle_sync_bfly(ov, offset=off, mask=-1, mask_and_clamp=31)
+            o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(ov)
+
+    # ===== epilogue:回写 state(scalar interleaved coalesced) =====
+    if cache_idx >= 0:
+        if cutlass.const_expr(not disable_state_update):
+            flat_state_idx = cache_idx * HV + i_hv
+            for vv in cutlass.range_constexpr(BV):
+                v_global = i_v * BV + vv
+                for c in cutlass.range_constexpr(vec_size):
+                    h0_source[(flat_state_idx, v_global, c * 32 + lane)] = r_h[vv * vec_size + c]
+
+
+@cute.jit
+def run_kda_mtp_triton_aligned_kernel(
+    h0_source: cute.Tensor,
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    BV: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    """lane=K aligned launcher:grid = N*HV*(V//BV),block = 32(1 warp)。无 SMEM。"""
+    n_indices = h0_indices.layout.shape[0]
+    num_v_tiles = cute.ceil_div(V, BV)
+    grid_size = n_indices * HV * num_v_tiles
+
+    kda_mtp_triton_aligned_kernel(
+        h0_source,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        h0_indices,
+        vec_size,
+        num_v_tiles,
+        BV,
+        softplus_beta,
+        softplus_threshold,
+        scale,
+        HV,
+        T,
+        H,
+        K,
+        V,
+        use_qk_l2norm,
+        disable_state_update,
+        fast_math,
+    ).launch(
+        grid=(grid_size, 1, 1),
+        block=[32, 1, 1],
+        smem=0,
+        stream=stream,
+    )
+
+
+_compiled_mtp_aligned_kernels: dict[tuple, object] = {}
+
+
+def _get_compiled_mtp_aligned_kernel(
+    N,
+    T,
+    H,
+    HV,
+    K,
+    V,
+    pool_size,
+    BV,
+    scale,
+    use_qk_l2norm,
+    disable_state_update,
+    softplus_beta,
+    softplus_threshold,
+    opt_level=3,
+    fast_math=True,
+):
+    key = (
+        N,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        BV,
+        scale,
+        use_qk_l2norm,
+        disable_state_update,
+        softplus_beta,
+        softplus_threshold,
+        opt_level,
+        fast_math,
+    )
+    if key in _compiled_mtp_aligned_kernels:
+        return _compiled_mtp_aligned_kernels[key]
+
+    q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
+    v = torch.zeros(N, T, HV, V, dtype=torch.bfloat16, device="cuda")
+    a = torch.zeros(N, T, HV, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(N, T, HV, dtype=torch.bfloat16, device="cuda")
+    o = torch.zeros(N, T, HV, V, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
+    h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
+    h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+
+    q_t = from_dlpack(q, assumed_align=16)
+    k_t = from_dlpack(k, assumed_align=16)
+    v_t = from_dlpack(v, assumed_align=16)
+    a_t = from_dlpack(a, assumed_align=16)
+    b_t = from_dlpack(b, assumed_align=16)
+    o_t = from_dlpack(o, assumed_align=16)
+    A_log_t = from_dlpack(A_log, assumed_align=16)
+    dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
+    h0_source_t = from_dlpack(h0_source, assumed_align=16)
+    h0_indices_t = from_dlpack(h0_indices, assumed_align=16)
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    compiled_kernel = cute.compile(
+        run_kda_mtp_triton_aligned_kernel,
+        h0_source_t,
+        A_log_t,
+        a_t,
+        dt_bias_t,
+        q_t,
+        k_t,
+        v_t,
+        b_t,
+        o_t,
+        h0_indices_t,
+        vec_size=VEC_SIZE,
+        BV=BV,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        HV=HV,
+        T=T,
+        H=H,
+        K=K,
+        V=V,
+        use_qk_l2norm=use_qk_l2norm,
+        disable_state_update=disable_state_update,
+        fast_math=fast_math,
+        stream=stream,
+        options=f"--enable-tvm-ffi --opt-level {opt_level}",
+    )
+
+    _compiled_mtp_aligned_kernels[key] = compiled_kernel
+    logger.info(
+        "CuTe DSL KDA MTP triton-ALIGNED(lane=K) kernel compiled: "
+        f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, BV={BV}, "
+        f"opt_level={opt_level}, fast_math={fast_math}"
+    )
+    return compiled_kernel
+
+
+def kda_decode_mtp_triton_aligned(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    out: torch.Tensor | None = None,
+    state_layout: str = "vk",
+    disable_state_update: bool = False,
+    bv: int = TRITON_BV,
+    opt_level: int = 3,
+    fast_math: bool = True,
+) -> torch.Tensor:
+    """KDA MTP decode,lane=K + warp-shuffle reduce(完全对齐 triton 的 thread→data 映射)。
+
+    仅 vk;用于对照 lane=V 版(``kda_decode_mtp_triton_style``)——验证 lane=K 在 vk 下能否
+    靠 coalesced load 追平 triton(预期 ≈ parity,它就是 triton 的 CuTe 复刻)。无 k_split。
+    """
+    N, T, H, K = q.shape
+    HV = v.shape[2]
+    V = v.shape[3]
+
+    if scale is None:
+        scale = K**-0.5
+    else:
+        assert scale > 0, f"scale must be positive, got {scale}"
+
+    assert K == TILE_K, f"KDA MTP (aligned) requires K={TILE_K}, got {K}"
+    assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
+        f"aligned 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
+    )
+    assert bv == TRITON_BV, f"aligned 固定 1 warp,bv 必须为 {TRITON_BV},got {bv}"
+    assert V % bv == 0, f"aligned requires V % {bv} == 0, got V={V}"
+
+    state_layout = _canonicalize_state_layout(state_layout)
+    if state_layout != "vk":
+        raise NotImplementedError(
+            f"kda_decode_mtp_triton_aligned only supports state_layout='vk'; got {state_layout!r}"
+        )
+
+    h0_source, pool_size, state_layout_is_kv = _normalize_state_source(
+        initial_state_source,
+        N=N,
+        HV=HV,
+        K=K,
+        V=V,
+        device=q.device,
+        state_layout=state_layout,
+    )
+    assert not state_layout_is_kv
+
+    a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
+    if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
+        raise ValueError(f"Unexpected b shape for MTP dense: {tuple(b.shape)}; expected {(N, T, HV)}")
+
+    o = _prepare_output_tensor(q, out, (N, T, HV, V))
+
+    q = q if q.is_contiguous() else q.contiguous()
+    k = k if k.is_contiguous() else k.contiguous()
+    v = v if v.is_contiguous() else v.contiguous()
+    a = a if a.is_contiguous() else a.contiguous()
+    b = b if b.is_contiguous() else b.contiguous()
+
+    A_log = _normalize_A_log(A_log, HV)
+    dt_bias = _normalize_dt_bias(dt_bias, HV, K)
+    initial_state_indices = _normalize_state_indices(
+        initial_state_indices, N=N, pool_size=pool_size, device=q.device
+    )
+
+    h0_source_flat = h0_source.view(pool_size * HV, V, K)
+
+    stream = _get_cached_stream(q.device)
+
+    compiled_kernel = _get_compiled_mtp_aligned_kernel(
+        N,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        bv,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm_in_kernel,
+        disable_state_update=disable_state_update,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        opt_level=opt_level,
+        fast_math=fast_math,
+    )
+
+    compiled_kernel(
+        h0_source_flat,
+        A_log,
+        a,
+        dt_bias,
+        q,
+        k,
+        v,
+        b,
+        o,
+        initial_state_indices,
+        stream,
+    )
+
+    return o

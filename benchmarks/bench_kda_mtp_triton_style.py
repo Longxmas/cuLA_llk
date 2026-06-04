@@ -29,7 +29,10 @@ sys.path.insert(0, str(_here.parent))  # cuLA/
 sys.path.insert(0, str(_here))  # benchmarks/ (for diag helpers)
 
 from cula.kda import kda_decode_mtp_ws
-from cula.ops.kda_decode_mtp_triton_style import kda_decode_mtp_triton_style
+from cula.ops.kda_decode_mtp_triton_style import (
+    kda_decode_mtp_triton_aligned,
+    kda_decode_mtp_triton_style,
+)
 
 from diag_kda_mtp_small_batch import (  # noqa: E402  复用 diag 基建
     TRITON_MAX_GRID_Z,
@@ -69,6 +72,21 @@ def make_triton_style_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale,
     return call
 
 
+def make_triton_aligned_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
+    if _TSL_SKIP_LOAD:
+        indices = torch.full_like(indices, -1)
+    def call():
+        return kda_decode_mtp_triton_aligned(
+            A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+            initial_state_source=state, initial_state_indices=indices, scale=scale,
+            use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
+            disable_state_update=dsu,
+            opt_level=_TSL_OPT_LEVEL, fast_math=_TSL_FAST_MATH,
+        )
+
+    return call
+
+
 def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, tile_v, ilp):
     def call():
         return kda_decode_mtp_ws(
@@ -99,8 +117,8 @@ def main():
     ap.add_argument("--profile", nargs=2, type=int, metavar=("N", "T"), default=None,
                     help="单 (N,T) 长跑某变体 profile_iters 次,供 ncu/nsys 包裹(只 forward,不计时)")
     ap.add_argument("--profile-iters", type=int, default=50)
-    ap.add_argument("--profile-variant", choices=["tsl", "tsl_kv", "triton", "ws"], default="tsl",
-                    help="--profile 跑哪个变体(默认 triton-style;tsl_kv = tsl 用 kv 布局)")
+    ap.add_argument("--profile-variant", choices=["tsl", "tsl_kv", "tsl_aligned", "triton", "ws"], default="tsl",
+                    help="--profile 跑哪个变体(tsl_kv=kv 布局;tsl_aligned=lane=K+shuffle 对齐 triton)")
     ap.add_argument("--tsl-opt-level", type=int, default=3, choices=[0, 1, 2, 3],
                     help="tsl 的 --opt-level(调 ptxas 流水深度/寄存器 A/B)")
     ap.add_argument("--tsl-fast-math", type=int, default=1, choices=[0, 1],
@@ -144,6 +162,9 @@ def main():
         elif args.profile_variant == "tsl_kv":
             fn = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
                                         state0.clone(), indices, scale, True, state_layout="kv")
+        elif args.profile_variant == "tsl_aligned":
+            fn = make_triton_aligned_call(q, k, v, a, b, A_log, dt_bias,
+                                          state0.clone(), indices, scale, True)
         else:
             fn = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
                                         state0.clone(), indices, scale, True)
@@ -159,8 +180,8 @@ def main():
 
     # ---------------- 数值校验 ----------------
     print("\n=== 数值校验 (max|Δ|, 阈值 5e-2) ===")
-    print(f"{'N':>4} {'T':>3} | {'Δ tsl-vs-triton':>16} | {'Δ tslkv-vs-tri':>14} | {'Δ tsl-vs-ws':>12} | flag")
-    print("-" * 70)
+    print(f"{'N':>4} {'T':>3} | {'Δ tsl-vs-tri':>13} | {'Δ tslkv-vs-tri':>14} | {'Δ tslK-vs-tri':>13} | {'Δ tsl-vs-ws':>12} | flag")
+    print("-" * 82)
     ok_all = True
     for N in args.batch_sizes:
         for T in args.Ts:
@@ -176,15 +197,18 @@ def main():
             o_tsl_kv = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
                                               state0.clone(), indices, scale, True,
                                               state_layout="kv")().float()
+            o_tslK = make_triton_aligned_call(q, k, v, a, b, A_log, dt_bias,
+                                              state0.clone(), indices, scale, True)().float()
             o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
                                 scale, True, args.ws_tile_v, args.ws_ilp)().float()
             d_tri = (o_tsl - o_tri).abs().max().item()
             d_kv = (o_tsl_kv - o_tri).abs().max().item()
+            d_K = (o_tslK - o_tri).abs().max().item()
             d_ws = (o_tsl - o_ws).abs().max().item()
-            flag = "OK" if (d_tri < 5e-2 and d_kv < 5e-2 and d_ws < 5e-2) else "DIFF!"
+            flag = "OK" if (d_tri < 5e-2 and d_kv < 5e-2 and d_K < 5e-2 and d_ws < 5e-2) else "DIFF!"
             if flag != "OK":
                 ok_all = False
-            print(f"{N:>4} {T:>3} | {d_tri:>16.2e} | {d_kv:>14.2e} | {d_ws:>12.2e} | {flag}")
+            print(f"{N:>4} {T:>3} | {d_tri:>13.2e} | {d_kv:>14.2e} | {d_K:>13.2e} | {d_ws:>12.2e} | {flag}")
     print("数值校验:", "全部 OK" if ok_all else "有 DIFF,先查正确性再看性能!")
 
     if args.check or (not ok_all and not _TSL_SKIP_LOAD):
@@ -194,8 +218,8 @@ def main():
     print("\n=== 性能 t_graph (CUDA graph replay,纯 device kernel) ===")
     print(f"  ws baseline = tile_v={args.ws_tile_v} ilp={args.ws_ilp} (recompute);"
           f" triton-style = 1-warp/BV=32  warmup={args.warmup} rep={args.rep}")
-    hdr = (f"{'N':>4} {'T':>3} | {'tg_triton':>9} {'tg_ws':>8} {'tg_tsl':>8} {'tg_tslkv':>9} | "
-           f"{'tslkv/tri':>9} {'tsl/tri':>8} {'ws/tri':>7} | {'tslkv vs ws':>11}")
+    hdr = (f"{'N':>4} {'T':>3} | {'tg_triton':>9} {'tg_ws':>8} {'tg_tsl':>8} {'tg_tslkv':>9} {'tg_tslK':>9} | "
+           f"{'tslK/tri':>8} {'tslkv/tri':>9} {'tsl/tri':>8} {'ws/tri':>7}")
     print(hdr)
     print("-" * len(hdr))
     for N in args.batch_sizes:
@@ -204,7 +228,7 @@ def main():
                 N, T, args.H, args.HV, args.K, args.V, device)
             scale = args.K ** -0.5
 
-            tg_tri = tg_ws = tg_tsl = tg_tslkv = None
+            tg_tri = tg_ws = tg_tsl = tg_tslkv = tg_tslK = None
             if N * args.HV <= TRITON_MAX_GRID_Z:
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
@@ -222,6 +246,8 @@ def main():
             tsl_kv = make_triton_style_call(q, k, v, a, b, A_log, dt_bias,
                                             state0.clone(), indices, scale, True,
                                             state_layout="kv")
+            tslK = make_triton_aligned_call(q, k, v, a, b, A_log, dt_bias,
+                                            state0.clone(), indices, scale, True)
             try:
                 warmup(ws, args.warmup)
                 tg_ws = t_graph_ms(ws, 3, args.rep)
@@ -237,16 +263,21 @@ def main():
                 tg_tslkv = t_graph_ms(tsl_kv, 3, args.rep)
             except Exception as e:
                 print(f"{N:>4} {T:>3} | tsl_kv FAIL: {str(e)[:50]}")
+            try:
+                warmup(tslK, args.warmup)
+                tg_tslK = t_graph_ms(tslK, 3, args.rep)
+            except Exception as e:
+                print(f"{N:>4} {T:>3} | tsl_aligned FAIL: {str(e)[:50]}")
 
             def us(x):
                 return f"{x * 1e3:>8.1f}" if x else f"{'n/a':>8}"
 
+            r_K = f"{tg_tri / tg_tslK:.2f}x" if (tg_tri and tg_tslK) else "n/a"
             r_kv = f"{tg_tri / tg_tslkv:.2f}x" if (tg_tri and tg_tslkv) else "n/a"
             r_tsl = f"{tg_tri / tg_tsl:.2f}x" if (tg_tri and tg_tsl) else "n/a"
             r_ws = f"{tg_tri / tg_ws:.2f}x" if (tg_tri and tg_ws) else "n/a"
-            r_kw = f"{tg_ws / tg_tslkv:.2f}x" if (tg_ws and tg_tslkv) else "n/a"
-            print(f"{N:>4} {T:>3} | {us(tg_tri):>9} {us(tg_ws)} {us(tg_tsl)} {us(tg_tslkv):>9} | "
-                  f"{r_kv:>9} {r_tsl:>8} {r_ws:>7} | {r_kw:>11}")
+            print(f"{N:>4} {T:>3} | {us(tg_tri):>9} {us(tg_ws)} {us(tg_tsl)} {us(tg_tslkv):>9} {us(tg_tslK):>9} | "
+                  f"{r_K:>8} {r_kv:>9} {r_tsl:>8} {r_ws:>7}")
 
 
 if __name__ == "__main__":
