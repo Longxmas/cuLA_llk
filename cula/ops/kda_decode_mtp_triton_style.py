@@ -669,10 +669,16 @@ def kda_mtp_triton_aligned_kernel(
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_bv = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)
-    # float4 临时缓冲 + bf16 q/k 载入缓冲(与 tsl 同 idiom)。
+    # float4 临时缓冲(state load/store)。
     r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    # ===== 软件流水双缓冲(对齐 triton num_stages):算 token t 时预取 t+1 的 q/k/a/b 输入 =====
+    # 只双缓冲前端关键路径输入(q/k/a/b,小);v 迭代内载入(延迟 overlap 进 gate)。+~18 reg(168→~186<255)。
+    r_qbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
+    r_kbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
+    r_abf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32) for _ in range(2)]
+    r_bbf = [cute.make_rmem_tensor(cute.make_layout((1,), stride=(1,)), cutlass.Float32) for _ in range(2)]
+    # dt_bias 与 token 无关,循环外载一次。
+    r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
 
     # ===== state 载入(连续块 + float4:lane t 取 K[4t:4t+4],跨 lane 拼成连续 512B = coalesced+向量化) =====
     if cache_idx >= 0:
@@ -688,15 +694,36 @@ def kda_mtp_triton_aligned_kernel(
         for j in cutlass.range_constexpr(BV * vec_size):
             r_h[j] = cutlass.Float32(0.0)
 
+    # dt_bias 与 token 无关,循环外载一次(连续块 K[4t:4t+4])。
+    for c in cutlass.range_constexpr(vec_size):
+        r_dtb[c] = cutlass.Float32(dt_bias[i_hv, vec_size * lane + c])
+
+    # 预取 token 0 的 q/k/a/b 到 stage 0(流水填充)。
+    q_t0 = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
+    k_t0 = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
+    cute.autovec_copy(q_t0, r_qbf[0])
+    cute.autovec_copy(k_t0, r_kbf[0])
+    for c in cutlass.range_constexpr(vec_size):
+        r_abf[0][c] = cutlass.Float32(a[i_n, 0, i_hv, vec_size * lane + c])
+    r_bbf[0][0] = cutlass.Float32(b[i_n, 0, i_hv])
+
     for i_t in cutlass.range_constexpr(T):
-        # ===== prep:本 lane 自己 vec_size 个 K(连续块 K[4t:4t+4]) 的 q/k(l2norm)/g,留寄存器 =====
-        q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
-        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
-        cute.autovec_copy(q_tile, r_q_bf16)
-        cute.autovec_copy(k_tile, r_k_bf16)
+        cur = i_t % 2
+        # ===== 预取 t+1 的 q/k/a/b(LDG 提前发,延迟 overlap 进本 token 的 l2norm/gate/recurrence)=====
+        if cutlass.const_expr(i_t + 1 < T):
+            nxt = (i_t + 1) % 2
+            q_tn = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
+            k_tn = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
+            cute.autovec_copy(q_tn, r_qbf[nxt])
+            cute.autovec_copy(k_tn, r_kbf[nxt])
+            for c in cutlass.range_constexpr(vec_size):
+                r_abf[nxt][c] = cutlass.Float32(a[i_n, i_t + 1, i_hv, vec_size * lane + c])
+            r_bbf[nxt][0] = cutlass.Float32(b[i_n, i_t + 1, i_hv])
+
+        # ===== prep:从 cur 缓冲读 q/k(已在寄存器,无 LDG 阻塞),l2norm + g =====
         for c in cutlass.range_constexpr(vec_size):
-            r_q[c] = cutlass.Float32(r_q_bf16[c])
-            r_k[c] = cutlass.Float32(r_k_bf16[c])
+            r_q[c] = cutlass.Float32(r_qbf[cur][c])
+            r_k[c] = cutlass.Float32(r_kbf[cur][c])
 
         if cutlass.const_expr(use_qk_l2norm):
             sum_q = cutlass.Float32(0.0)
@@ -717,8 +744,7 @@ def kda_mtp_triton_aligned_kernel(
                 r_q[c] = r_q[c] * scale
 
         for c in cutlass.range_constexpr(vec_size):
-            kk = vec_size * lane + c  # 连续块:与 r_h/r_q/r_k 的 K 映射一致(reduce 才对齐)
-            x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
+            x = r_abf[cur][c] + r_dtb[c]  # a 已预取、dt_bias 循环外载
             beta_x = softplus_beta * x
             exp_bx = cute.exp(beta_x, fastmath=fast_math)
             sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
@@ -734,10 +760,10 @@ def kda_mtp_triton_aligned_kernel(
 
         r_beta = cutlass.Float32(1.0) / (
             cutlass.Float32(1.0)
-            + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
+            + cute.exp(-r_bbf[cur][0], fastmath=fast_math)
         )
 
-        # 本 lane 载入全 BV 个 V 的 v_t(各 v 同地址、全 warp 广播,便宜)
+        # v_t 迭代内载入(延迟 overlap 进上面的 l2norm/gate;各 v 同址广播,便宜)
         for vv in cutlass.range_constexpr(BV):
             r_bv[vv] = cutlass.Float32(v[i_n, i_t, i_hv, i_v * BV + vv])
 
