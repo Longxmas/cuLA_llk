@@ -73,6 +73,7 @@ def kda_mtp_triton_style_kernel(
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
+    k_split: cutlass.Constexpr[int],
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -86,7 +87,7 @@ def kda_mtp_triton_style_kernel(
     fast_math: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    lane = tidx  # block = BV = 32 = 1 warp ⇒ tidx == lane == 本 program 的 V 列下标
+    lane = tidx  # block 恒 32 = 1 warp;tidx == lane ∈ [0,32)
 
     bidx, _, _ = cute.arch.block_idx()
     # 与 ws 同序解码 flat CTA index → (i_n, i_hv, i_v V-block)。
@@ -107,22 +108,30 @@ def kda_mtp_triton_style_kernel(
     sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,), stride=(1,)), 16)
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,), stride=(1,)), 16)
 
-    # 本 lane 拥有一个 V 列,把它整列的 K=BK 个 state 分量常驻寄存器。
-    r_h = cute.make_rmem_tensor(cute.make_layout((K,), stride=(1,)), cutlass.Float32)
+    # k_split:每个 V 列由 k_split 个 lane 分摊 K(各持 k_per_lane = K//k_split),reduce 后
+    # 蝶形 shuffle 合并部分和。k_split=1 → 退化为原 tsl(lane=V 列,独扛 128 K,无 shuffle)。
+    # BV = 32//k_split = 本 program 的 V 列数;block 恒 32 线程(1 warp)。
+    k_per_lane = K // k_split    # 本 lane 常驻的 state 分量数(寄存器地板)
+    v_local = lane % BV          # 本 lane 服务的 V 列(program 内)
+    k_part = lane // BV          # 本 lane 管 K 的第几段(0..k_split-1)
+    k_off = k_part * k_per_lane  # r_h[j] 对应全局 K[k_off + j]
+
+    # 本 lane 只持有自己 V 列的 k_per_lane 个 K state 分量常驻寄存器。
+    r_h = cute.make_rmem_tensor(cute.make_layout((k_per_lane,), stride=(1,)), cutlass.Float32)
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_q_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_k_bf16 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
 
-    v_global = i_v * BV + lane  # 本 lane 的全局 V 列;BV|V 保证 < V
-    k_start = lane * vec_size  # 本 lane 在 prep 阶段负责的首个 K channel
+    v_global = i_v * BV + v_local  # 本 lane 服务的全局 V 列
+    k_start = lane * vec_size  # prep:全 warp 32 lane × vec_size=4 覆盖全 128 K(与 k_split 无关)
 
-    # state 初始化 0;若该序列有 pool slot 则覆盖载入(否则按 Triton 语义从 0 态算)。
-    for kk in cutlass.range_constexpr(K):
-        r_h[kk] = cutlass.Float32(0.0)
+    # state 初始化 0;若该序列有 pool slot 则覆盖载入本 lane 的 k_per_lane 段(K[k_off:k_off+k_per_lane])。
+    for j in cutlass.range_constexpr(k_per_lane):
+        r_h[j] = cutlass.Float32(0.0)
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
-        h_tile = cute.local_tile(h0_source, (1, 1, K), (flat_state_idx, v_global, 0))
+        h_tile = cute.local_tile(h0_source, (1, 1, k_per_lane), (flat_state_idx, v_global, k_part))
         cute.autovec_copy(h_tile, r_h)
 
     for i_t in cutlass.range_constexpr(T):
@@ -180,19 +189,26 @@ def kda_mtp_triton_style_kernel(
 
         cute.arch.barrier()  # 发布 prep 的 SMEM 写,recurrence 才能读
 
-        # ===== recurrence:本 lane 的 V 列;reduce over K 纯线程内(无 shuffle) =====
+        # ===== recurrence:本 lane 算自己 k_per_lane 段 K 的部分和,再蝶形 shuffle 合并 k_split 个 lane =====
+        # (k_split=1 → kk 是 constexpr、butterfly 0 步,与原 tsl 完全一致。)
         r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_global])
-        # 融合 decay + s = (decayed S) @ k_norm。
+        # 融合 decay + s 部分和。
         s = cutlass.Float32(0.0)
-        for kk in cutlass.range_constexpr(K):
-            r_h[kk] = r_h[kk] * sG[kk]
-            s += r_h[kk] * sK[kk]
+        for j in cutlass.range_constexpr(k_per_lane):
+            kk = j if k_split == 1 else k_off + j
+            r_h[j] = r_h[j] * sG[kk]
+            s += r_h[j] * sK[kk]
+        for st in cutlass.range_constexpr(k_split.bit_length() - 1):
+            s += cute.arch.shuffle_sync_bfly(s, offset=BV << st, mask=-1, mask_and_clamp=31)
         v_new = (r_v - s) * r_beta
-        # 融合 rank-1(raw/normalized k) + o = S_new @ q_scaled。
+        # 融合 rank-1 + o 部分和,同样蝶形合并。
         o_val = cutlass.Float32(0.0)
-        for kk in cutlass.range_constexpr(K):
-            r_h[kk] = r_h[kk] + sK[kk] * v_new
-            o_val += r_h[kk] * sQ[kk]
+        for j in cutlass.range_constexpr(k_per_lane):
+            kk = j if k_split == 1 else k_off + j
+            r_h[j] = r_h[j] + sK[kk] * v_new
+            o_val += r_h[j] * sQ[kk]
+        for st in cutlass.range_constexpr(k_split.bit_length() - 1):
+            o_val += cute.arch.shuffle_sync_bfly(o_val, offset=BV << st, mask=-1, mask_and_clamp=31)
         o[(i_n, i_t, i_hv, v_global)] = cutlass.BFloat16(o_val)
 
         cute.arch.barrier()  # 确保各 lane 读完 sQ/sK/sG,下个 token 的 prep 才能覆盖
@@ -200,7 +216,7 @@ def kda_mtp_triton_style_kernel(
     if cache_idx >= 0:
         if cutlass.const_expr(not disable_state_update):
             flat_state_idx = cache_idx * HV + i_hv
-            h_out = cute.local_tile(h0_source, (1, 1, K), (flat_state_idx, v_global, 0))
+            h_out = cute.local_tile(h0_source, (1, 1, k_per_lane), (flat_state_idx, v_global, k_part))
             cute.autovec_copy(r_h, h_out)
 
 
@@ -218,6 +234,7 @@ def run_kda_mtp_triton_style_kernel(
     h0_indices: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
+    k_split: cutlass.Constexpr[int],
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -231,7 +248,8 @@ def run_kda_mtp_triton_style_kernel(
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    """Host-side launcher: grid = N * HV * (V//BV), block = BV (1 warp)。"""
+    """Host-side launcher: grid = N * HV * (V//BV), block = 32 (恒 1 warp)。
+    BV = 32//k_split = 每 program 的 V 列数;k_split 个 lane 分摊一个 V 列的 K。"""
     n_indices = h0_indices.layout.shape[0]
     v_dim = h0_source.layout.shape[1]
     num_v_tiles = cute.ceil_div(v_dim, BV)
@@ -253,6 +271,7 @@ def run_kda_mtp_triton_style_kernel(
         vec_size,
         num_v_tiles,
         BV,
+        k_split,
         softplus_beta,
         softplus_threshold,
         scale,
@@ -266,7 +285,7 @@ def run_kda_mtp_triton_style_kernel(
         fast_math,
     ).launch(
         grid=(grid_size, 1, 1),
-        block=[BV, 1, 1],
+        block=[32, 1, 1],
         smem=smem_bytes,
         stream=stream,
     )
@@ -281,6 +300,7 @@ def _get_compiled_mtp_triton_kernel(
     V,
     pool_size,
     BV,
+    k_split,
     scale,
     use_qk_l2norm,
     disable_state_update,
@@ -298,6 +318,7 @@ def _get_compiled_mtp_triton_kernel(
         V,
         pool_size,
         BV,
+        k_split,
         scale,
         use_qk_l2norm,
         disable_state_update,
@@ -347,6 +368,7 @@ def _get_compiled_mtp_triton_kernel(
         h0_indices_t,
         vec_size=VEC_SIZE,
         BV=BV,
+        k_split=k_split,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
         scale=scale,
@@ -366,7 +388,7 @@ def _get_compiled_mtp_triton_kernel(
     logger.info(
         "CuTe DSL KDA MTP triton-style kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, BV={BV}, "
-        f"opt_level={opt_level}, fast_math={fast_math}"
+        f"k_split={k_split}, opt_level={opt_level}, fast_math={fast_math}"
     )
     return compiled_kernel
 
@@ -389,6 +411,7 @@ def kda_decode_mtp_triton_style(
     state_layout: str = "vk",
     disable_state_update: bool = False,
     bv: int = TRITON_BV,
+    k_split: int = 1,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
@@ -411,7 +434,13 @@ def kda_decode_mtp_triton_style(
     assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
         f"triton-style 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
     )
-    assert V % bv == 0, f"triton-style requires V % bv == 0, got V={V}, bv={bv}"
+    assert bv == TRITON_BV, f"triton-style 固定 1 warp,bv 必须为 {TRITON_BV},got {bv}"
+    assert k_split in (1, 2, 4), f"k_split 仅支持 1/2/4,got {k_split}"
+    assert bv % k_split == 0 and K % k_split == 0, (
+        f"需 bv%k_split==0 且 K%k_split==0,got bv={bv}, K={K}, k_split={k_split}"
+    )
+    vcols = bv // k_split  # 每 program 的 V 列数(= kernel 内 BV);k_split 个 lane 分摊一个 V 列
+    assert V % vcols == 0, f"triton-style requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
 
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":
@@ -460,7 +489,8 @@ def kda_decode_mtp_triton_style(
         K,
         V,
         pool_size,
-        bv,
+        vcols,
+        k_split,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm_in_kernel,
         disable_state_update=disable_state_update,
