@@ -55,24 +55,7 @@ TRITON_BV = 32
 # 每 lane 在 prep 阶段负责的 K channel 数:K / warp_size = 128 / 32 = 4。
 VEC_SIZE = 4
 
-# reduce-over-K 的累加器个数。朴素的 `s += r_h[kk]*sK[kk]` 是 K=128 深的串行 FP 链
-# (FP 加法无结合律,无 reassoc → 编译器拆不开),关键路径 ~128*FMA延迟,正是本 1-warp
-# 复刻慢于 Triton(tl.sum 树规约,关键路径 ~log2 K)的主因。拆成 NACC 条独立子链
-# (各 K/NACC 深)+ 平衡树合并 → 关键路径降到 ~(K/NACC + log2 NACC),并喂满 FP 管线。
-# 需 K % _REDUCE_NACC == 0;8 → 16 深子链,ILP 足够且寄存器开销小(+8 fp32)。
-_REDUCE_NACC = 8
-
 _compiled_mtp_triton_kernels: dict[tuple, object] = {}
-
-
-def _tree_reduce_add(vals):
-    """编译期(trace 时)把一串 traced Float32 做平衡树相加 → 打破串行依赖链。"""
-    while len(vals) > 1:
-        nxt = [vals[i] + vals[i + 1] for i in range(0, len(vals) - 1, 2)]
-        if len(vals) % 2 == 1:
-            nxt.append(vals[-1])
-        vals = nxt
-    return vals[0]
 
 
 @cute.kernel
@@ -200,22 +183,16 @@ def kda_mtp_triton_style_kernel(
         # ===== recurrence:本 lane 的 V 列;reduce over K 纯线程内(无 shuffle) =====
         r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_global])
         # 融合 decay + s = (decayed S) @ k_norm。
-        # s 用 _REDUCE_NACC 个独立累加器打破 128 深串行 FP 链(对齐 Triton tl.sum 的树规约
-        # 关键路径)。decay(r_h[kk]*=sG[kk])本身各 kk 独立,只有 s 的累加是串行链。
-        s_acc = [cutlass.Float32(0.0) for _ in range(_REDUCE_NACC)]
+        s = cutlass.Float32(0.0)
         for kk in cutlass.range_constexpr(K):
             r_h[kk] = r_h[kk] * sG[kk]
-            j = kk % _REDUCE_NACC
-            s_acc[j] = s_acc[j] + r_h[kk] * sK[kk]
-        s = _tree_reduce_add(s_acc)
+            s += r_h[kk] * sK[kk]
         v_new = (r_v - s) * r_beta
-        # 融合 rank-1(raw/normalized k) + o = S_new @ q_scaled(同样多累加器拆链)。
-        o_acc = [cutlass.Float32(0.0) for _ in range(_REDUCE_NACC)]
+        # 融合 rank-1(raw/normalized k) + o = S_new @ q_scaled。
+        o_val = cutlass.Float32(0.0)
         for kk in cutlass.range_constexpr(K):
             r_h[kk] = r_h[kk] + sK[kk] * v_new
-            j = kk % _REDUCE_NACC
-            o_acc[j] = o_acc[j] + r_h[kk] * sQ[kk]
-        o_val = _tree_reduce_add(o_acc)
+            o_val += r_h[kk] * sQ[kk]
         o[(i_n, i_t, i_hv, v_global)] = cutlass.BFloat16(o_val)
 
         cute.arch.barrier()  # 确保各 lane 读完 sQ/sK/sG,下个 token 的 prep 才能覆盖
