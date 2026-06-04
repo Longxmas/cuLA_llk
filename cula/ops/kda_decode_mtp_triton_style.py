@@ -24,6 +24,11 @@ Math per token (decay-first,与 ws/Triton 完全一致):
     S    += k_norm (x) v_new                              # rank-1
     o_t   = S @ (l2norm(q_t) * scale)                     # reduce K (本文:线程内)
 
+软件流水:prep 与 recurrence 分两阶段 —— Phase 1 把全 T 的 q/k-norm + g 一次算完写满
+[T][K] SMEM,Phase 2 再统一跑 recurrence。这样开头 state load(GMEM→r_h 的 LDG)的延迟
+被整段 Phase 1 计算掩盖(补上 tsl 缺失的 prologue 流水,= triton num_stages 同效),
+且每 token 间的 barrier 全省掉,只剩 Phase 1→2 之间 1 个。
+
 bf16 累加阶不同于 ws(reduce 顺序不同),数值对齐 fp32 torch / Triton 口径
 (atol 3e-2 / rtol 2e-2)。仅支持 ``state_layout='vk'``、K=V//? 约束见 entry。
 """
@@ -102,14 +107,17 @@ def kda_mtp_triton_style_kernel(
     # exp(A_log) per-head,T 个 token 共用,hoist 一次。
     r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
 
-    # SMEM:列间共享的 K 维向量 (q_scaled / k_norm / g),由本 warp 协作算一次后广播。
-    # XOR swizzle:存储位置 swz(kk)=kk ^ (kk//k_per_lane) —— 把第 k_part 段按 k_part 异或重排
-    # bank,让 k_split 个段错开到不同 bank(零 padding、双射无碰撞;k_split=1 时 swz 恒等)。
+    # SMEM:列间共享的 K 维向量 (q_scaled / k_norm / g),多缓冲成 [T][K]。
+    # 软件流水:Phase 1 把「全 T」的 prep 一次算完写满 [T][K],Phase 2 再统一跑 recurrence。
+    # 好处 (a):state load(autovec_copy→r_h)是非阻塞 LDG、r_h 要到 Phase 2 才用 → 其 GMEM
+    # 延迟被整段 Phase 1 的 SFU 计算掩盖(补上 tsl 缺失的 prologue 流水,= triton num_stages 同效);
+    # (b) 每 token 之间的 barrier 全部省掉,整个 kernel 只剩 Phase 1→2 之间 1 个 barrier。
+    # XOR swizzle:写位置 swz(kk)=kk ^ (kk//k_per_lane),k_split 个段错开 bank(k_split=1 时恒等)。
     smem_k = K
     smem = cutlass.utils.SmemAllocator()
-    sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
-    sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
-    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((smem_k,), stride=(1,)), 16)
+    sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, smem_k), stride=(smem_k, 1)), 16)
+    sK = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, smem_k), stride=(smem_k, 1)), 16)
+    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, smem_k), stride=(smem_k, 1)), 16)
 
     # k_split:每个 V 列由 k_split 个 lane 分摊 K(各持 k_per_lane = K//k_split),reduce 后
     # 蝶形 shuffle 合并部分和。k_split=1 → 退化为原 tsl(lane=V 列,独扛 128 K,无 shuffle)。
@@ -129,16 +137,20 @@ def kda_mtp_triton_style_kernel(
     v_global = i_v * BV + v_local  # 本 lane 服务的全局 V 列
     k_start = lane * vec_size  # prep:全 warp 32 lane × vec_size=4 覆盖全 128 K(与 k_split 无关)
 
-    # state 初始化 0;若该序列有 pool slot 则覆盖载入本 lane 的 k_per_lane 段(K[k_off:k_off+k_per_lane])。
-    for j in cutlass.range_constexpr(k_per_lane):
-        r_h[j] = cutlass.Float32(0.0)
+    # state:有 pool slot 则载入本 lane 的 k_per_lane 段(K[k_off:k_off+k_per_lane]);否则清零。
+    # 这个 LDG 非阻塞,r_h 要到 Phase 2 才用 → 延迟被下面整段 Phase 1 prep 掩盖。
+    # 清零只在无 state 时做(有 state 时 autovec_copy 全覆盖,原来的无条件清零是 dead store)。
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
         h_tile = cute.local_tile(h0_source, (1, 1, k_per_lane), (flat_state_idx, v_global, k_part))
         cute.autovec_copy(h_tile, r_h)
+    else:
+        for j in cutlass.range_constexpr(k_per_lane):
+            r_h[j] = cutlass.Float32(0.0)
 
+    # ===== Phase 1:全 T 的 prep(q/k l2norm + per-channel g)写满 [T][K] SMEM。 =====
+    # 此段是纯 SFU/shuffle 计算 + 小 GMEM load,与上面 state load 的 LDG 重叠 → 掩盖其延迟。
     for i_t in cutlass.range_constexpr(T):
-        # ===== prep:warp 协作算 q/k l2norm + per-channel g,写入 SMEM 广播 =====
         q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
         k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
         cute.autovec_copy(q_tile, r_q_bf16)
@@ -181,27 +193,27 @@ def kda_mtp_triton_style_kernel(
                 else cutlass.Float32(0.0)
             )
             sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-            sG[sw] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
-            sQ[sw] = r_q[i]
-            sK[sw] = r_k[i]
+            sG[(i_t, sw)] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+            sQ[(i_t, sw)] = r_q[i]
+            sK[(i_t, sw)] = r_k[i]
 
-        # beta 是 per-(i_n,i_t,i_hv) 标量,各 lane 各算一份(便宜,无需广播)。
+    cute.arch.barrier()  # 唯一的 barrier:发布全部 prep 写;state load 延迟已被上面整段掩盖
+
+    # ===== Phase 2:全 T recurrence。读 [i_t] 那一份 prep;beta 在此重算(省寄存器)。 =====
+    # (k_split=1 → kk 是 constexpr、butterfly 0 步,与原 tsl 完全一致。)
+    for i_t in cutlass.range_constexpr(T):
+        # beta 是 per-(i_n,i_t,i_hv) 标量,recurrence 内重算(不占跨阶段寄存器)。
         r_beta = cutlass.Float32(1.0) / (
             cutlass.Float32(1.0)
             + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
         )
-
-        cute.arch.barrier()  # 发布 prep 的 SMEM 写,recurrence 才能读
-
-        # ===== recurrence:本 lane 算自己 k_per_lane 段 K 的部分和,再蝶形 shuffle 合并 k_split 个 lane =====
-        # (k_split=1 → kk 是 constexpr、butterfly 0 步,与原 tsl 完全一致。)
         r_v = cutlass.Float32(v[i_n, i_t, i_hv, v_global])
         # 融合 decay + s 部分和。
         s = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
             sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle 读位置(= swz(k_off+j))
-            r_h[j] = r_h[j] * sG[sw]
-            s += r_h[j] * sK[sw]
+            r_h[j] = r_h[j] * sG[(i_t, sw)]
+            s += r_h[j] * sK[(i_t, sw)]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
             s += cute.arch.shuffle_sync_bfly(s, offset=BV << st, mask=-1, mask_and_clamp=31)
         v_new = (r_v - s) * r_beta
@@ -209,13 +221,11 @@ def kda_mtp_triton_style_kernel(
         o_val = cutlass.Float32(0.0)
         for j in cutlass.range_constexpr(k_per_lane):
             sw = j if k_split == 1 else (k_off + j) ^ k_part  # XOR swizzle 读位置
-            r_h[j] = r_h[j] + sK[sw] * v_new
-            o_val += r_h[j] * sQ[sw]
+            r_h[j] = r_h[j] + sK[(i_t, sw)] * v_new
+            o_val += r_h[j] * sQ[(i_t, sw)]
         for st in cutlass.range_constexpr(k_split.bit_length() - 1):
             o_val += cute.arch.shuffle_sync_bfly(o_val, offset=BV << st, mask=-1, mask_and_clamp=31)
         o[(i_n, i_t, i_hv, v_global)] = cutlass.BFloat16(o_val)
-
-        cute.arch.barrier()  # 确保各 lane 读完 sQ/sK/sG,下个 token 的 prep 才能覆盖
 
     if cache_idx >= 0:
         if cutlass.const_expr(not disable_state_update):
@@ -259,7 +269,8 @@ def run_kda_mtp_triton_style_kernel(
     num_v_tiles = cute.ceil_div(v_dim, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    smem_bytes = 3 * K * 4 + 128  # sQ + sK + sG (fp32, XOR swizzle 无 padding) + 对齐余量
+    # sQ + sK + sG 各 [T][K] fp32(软件流水多缓冲;XOR swizzle 无 padding)+ 每个 16B 对齐余量。
+    smem_bytes = 3 * T * K * 4 + 256
 
     kda_mtp_triton_style_kernel(
         h0_source,
