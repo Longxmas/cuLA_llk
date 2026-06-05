@@ -14,7 +14,7 @@ os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))
 _here = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_here.parent))  # cuLA/
 
-from cula.kda import kda_decode_mtp_ws
+from cula.kda import kda_decode_mtp, kda_decode_mtp_ws
 from cula.ops.kda_decode_mtp import kda_decode_mtp_small_batch
 
 # CUDA gridDim.z 上限。Triton 把 N*HV 放 z 轴,超过即 launch 失败(cuLA 不受此限)。
@@ -143,14 +143,28 @@ def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, 
     return call
 
 
-def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, tile_v, ilp):
+def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
+    """wsAuto:不锁 tile_v/ilp/use_smem_v,由 ws 的 work_units heuristic 自动选。"""
     def call():
         return kda_decode_mtp_ws(
             A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
             initial_state_source=state, initial_state_indices=indices, scale=scale,
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
-            tile_v=tile_v, ilp_rows=ilp, use_smem_v=False,
             disable_state_update=dsu,
+        )
+
+    return call
+
+
+def make_auto_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
+    """auto:dispatch 入口 kda_decode_mtp(state_layout='vk'),按 work_units=N*HV 自适应选
+    small_batch vk(<=512)或 ws(>512)——看它能否选出最优。"""
+    def call():
+        return kda_decode_mtp(
+            A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+            initial_state_source=state, initial_state_indices=indices, scale=scale,
+            use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
+            disable_state_update=dsu, state_layout="vk",
         )
 
     return call
@@ -167,8 +181,6 @@ def main():
     ap.add_argument("--V", type=int, default=128)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--rep", type=int, default=300)
-    ap.add_argument("--ws-tile-v", type=int, default=32, help="ws baseline 的 tile_v")
-    ap.add_argument("--ws-ilp", type=int, default=4, help="ws baseline 的 ilp_rows")
     ap.add_argument("--check", action="store_true", help="只数值校验,不计时")
     ap.add_argument("--check-cases", type=str, nargs="+", default=["1:2", "4:4"],
                     help="精度校验只跑这些 N:T 样例(默认 2 个角点,覆盖最小/最大 T 的累加深度;"
@@ -176,8 +188,8 @@ def main():
     ap.add_argument("--profile", nargs=2, type=int, metavar=("N", "T"), default=None,
                     help="单 (N,T) 长跑某变体 profile_iters 次,供 ncu/nsys 包裹(只 forward,不计时)")
     ap.add_argument("--profile-iters", type=int, default=50)
-    ap.add_argument("--profile-variant", choices=["sbkv", "sbvk", "triton", "ws"], default="sbkv",
-                    help="--profile 跑哪个变体(sbkv=kv 布局;sbvk=lane=K vk)")
+    ap.add_argument("--profile-variant", choices=["sbkv", "sbvk", "triton", "ws", "auto"], default="sbkv",
+                    help="--profile 跑哪个变体(sbkv=kv;sbvk=vk;ws=wsAuto;auto=dispatch 入口)")
     ap.add_argument("--sb-opt-level", type=int, default=3, choices=[0, 1, 2, 3],
                     help="small_batch 的 --opt-level(调 ptxas 流水深度/寄存器 A/B)")
     ap.add_argument("--sb-fast-math", type=int, default=1, choices=[0, 1],
@@ -213,7 +225,10 @@ def main():
                                   state0.clone(), indices, scale, True)
         elif args.profile_variant == "ws":
             fn = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                              scale, True, args.ws_tile_v, args.ws_ilp)
+                              scale, True)
+        elif args.profile_variant == "auto":
+            fn = make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
+                                scale, True)
         elif args.profile_variant == "sbkv":
             fn = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
                                        state0.clone(), indices, scale, True, variant="kv")
@@ -232,8 +247,8 @@ def main():
 
     # ---------------- 数值校验 ----------------
     print("\n=== 数值校验 (max|Δ|, 阈值 5e-2) ===")
-    print(f"{'N':>4} {'T':>3} | {'Δ sbkv-vs-tri':>14} | {'Δ sbvk-vs-tri':>14} | {'Δ sbkv-vs-ws':>14} | flag")
-    print("-" * 70)
+    print(f"{'N':>4} {'T':>3} | {'Δ sbkv-tri':>12} | {'Δ sbvk-tri':>12} | {'Δ auto-tri':>12} | flag")
+    print("-" * 64)
     if len(args.check_cases) == 1 and args.check_cases[0].lower() == "all":
         check_cases = [(N, T) for N in args.batch_sizes for T in args.Ts]
     else:
@@ -251,15 +266,15 @@ def main():
                                        state0.clone(), indices, scale, True, variant="kv")().float()
         o_sbvk = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
                                         state0.clone(), indices, scale, True, variant="vk")().float()
-        o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                            scale, True, args.ws_tile_v, args.ws_ilp)().float()
+        o_auto = make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
+                                scale, True)().float()
         d_sbkv = (o_sbkv - o_tri).abs().max().item()
         d_sbvk = (o_sbvk - o_tri).abs().max().item()
-        d_ws = (o_sbkv - o_ws).abs().max().item()
-        flag = "OK" if (d_sbkv < 5e-2 and d_sbvk < 5e-2 and d_ws < 5e-2) else "DIFF!"
+        d_auto = (o_auto - o_tri).abs().max().item()
+        flag = "OK" if (d_sbkv < 5e-2 and d_sbvk < 5e-2 and d_auto < 5e-2) else "DIFF!"
         if flag != "OK":
             ok_all = False
-        print(f"{N:>4} {T:>3} | {d_sbkv:>14.2e} | {d_sbvk:>14.2e} | {d_ws:>14.2e} | {flag}")
+        print(f"{N:>4} {T:>3} | {d_sbkv:>12.2e} | {d_sbvk:>12.2e} | {d_auto:>12.2e} | {flag}")
     print("数值校验:", "全部 OK" if ok_all else "有 DIFF,先查正确性再看性能!")
 
     if args.check or not ok_all:
@@ -267,10 +282,10 @@ def main():
 
     # ---------------- 性能 (t_graph, kernel-only) ----------------
     print("\n=== 性能 t_graph (CUDA graph replay,纯 device kernel) ===")
-    print(f"  ws baseline = tile_v={args.ws_tile_v} ilp={args.ws_ilp} (recompute);"
-          f" small_batch = 1-warp/BV=32  warmup={args.warmup} rep={args.rep}")
-    hdr = (f"{'N':>4} {'T':>3} | {'tg_triton':>9} {'tg_ws':>8} {'tg_sbkv':>9} {'tg_sbvk':>9} | "
-           f"{'sbvk/tri':>9} {'sbkv/tri':>9} {'ws/tri':>7}")
+    print(f"  wsAuto = ws heuristic 自选 tile_v/ilp; small_batch = 1-warp;"
+          f" auto = dispatch(vk: wu<=512→sbvk / 否则 ws)  warmup={args.warmup} rep={args.rep}")
+    hdr = (f"{'N':>4} {'T':>3} | {'tg_tri':>7} {'tg_wsAuto':>9} {'tg_sbkv':>9} {'tg_sbvk':>9} {'tg_auto':>9} | "
+           f"{'sbvk/tri':>9} {'sbkv/tri':>9} {'wsA/tri':>8} {'auto/tri':>9} | {'pick':>5} {'best':>5}")
     print(hdr)
     print("-" * len(hdr))
     for N in args.batch_sizes:
@@ -279,7 +294,7 @@ def main():
                 N, T, args.H, args.HV, args.K, args.V, device)
             scale = args.K ** -0.5
 
-            tg_tri = tg_ws = tg_sbkv = tg_sbvk = None
+            tg_tri = None
             if N * args.HV <= TRITON_MAX_GRID_Z:
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
@@ -290,36 +305,37 @@ def main():
                 except Exception as e:
                     print(f"{N:>4} {T:>3} | triton FAIL: {str(e)[:50]}")
 
-            ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                              scale, True, args.ws_tile_v, args.ws_ilp)
-            sbkv = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                         state0.clone(), indices, scale, True, variant="kv")
-            sbvk = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                          state0.clone(), indices, scale, True, variant="vk")
-            try:
-                warmup(ws, args.warmup)
-                tg_ws = t_graph_ms(ws, 3, args.rep)
-            except Exception as e:
-                print(f"{N:>4} {T:>3} | ws FAIL: {str(e)[:50]}")
-            try:
-                warmup(sbkv, args.warmup)
-                tg_sbkv = t_graph_ms(sbkv, 3, args.rep)
-            except Exception as e:
-                print(f"{N:>4} {T:>3} | sbkv FAIL: {str(e)[:50]}")
-            try:
-                warmup(sbvk, args.warmup)
-                tg_sbvk = t_graph_ms(sbvk, 3, args.rep)
-            except Exception as e:
-                print(f"{N:>4} {T:>3} | sbvk FAIL: {str(e)[:50]}")
+            makers = {
+                "ws": make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True),
+                "sbkv": make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
+                                              state0.clone(), indices, scale, True, variant="kv"),
+                "sbvk": make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
+                                              state0.clone(), indices, scale, True, variant="vk"),
+                "auto": make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True),
+            }
+            tg = {}
+            for name, fn_obj in makers.items():
+                try:
+                    warmup(fn_obj, args.warmup)
+                    tg[name] = t_graph_ms(fn_obj, 3, args.rep)
+                except Exception as e:
+                    tg[name] = None
+                    print(f"{N:>4} {T:>3} | {name} FAIL: {str(e)[:50]}")
 
             def us(x):
-                return f"{x * 1e3:>8.1f}" if x else f"{'n/a':>8}"
+                return f"{x * 1e3:.1f}" if x else "n/a"
 
-            r_sbvk = f"{tg_tri / tg_sbvk:.2f}x" if (tg_tri and tg_sbvk) else "n/a"
-            r_sbkv = f"{tg_tri / tg_sbkv:.2f}x" if (tg_tri and tg_sbkv) else "n/a"
-            r_ws = f"{tg_tri / tg_ws:.2f}x" if (tg_tri and tg_ws) else "n/a"
-            print(f"{N:>4} {T:>3} | {us(tg_tri):>9} {us(tg_ws)} {us(tg_sbkv):>9} {us(tg_sbvk):>9} | "
-                  f"{r_sbvk:>9} {r_sbkv:>9} {r_ws:>7}")
+            def r(x):
+                return f"{tg_tri / x:.2f}x" if (tg_tri and x) else "n/a"
+
+            # pick = dispatch 在 vk path 的选择(threshold 512);best = 实测最快(含 kv,全局最优)
+            pick = "sbvk" if N * args.HV <= 512 else "ws"
+            cands = {nm: t for nm, t in tg.items() if t}
+            best = min(cands, key=cands.get) if cands else "-"
+            print(f"{N:>4} {T:>3} | {us(tg_tri):>7} {us(tg.get('ws')):>9} {us(tg.get('sbkv')):>9} "
+                  f"{us(tg.get('sbvk')):>9} {us(tg.get('auto')):>9} | "
+                  f"{r(tg.get('sbvk')):>9} {r(tg.get('sbkv')):>9} {r(tg.get('ws')):>8} {r(tg.get('auto')):>9} | "
+                  f"{pick:>5} {best:>5}")
 
 
 if __name__ == "__main__":
