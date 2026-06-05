@@ -2103,8 +2103,8 @@ def kda_decode_mtp(
         out=out, disable_state_update=disable_state_update,
     )
     if state_layout == "kv":
-        return kda_decode_mtp_small_batch(**common, variant="kv")
+        return kda_decode_mtp_small_batch(**common, variant="kv", k_split=-1)  # k_split auto
     work_units = q.shape[0] * v.shape[2]  # N * HV
     if work_units <= 512:
-        return kda_decode_mtp_small_batch(**common, variant="vk")
+        return kda_decode_mtp_small_batch(**common, variant="vk", bv=-1)  # bv auto(小批选 8)
     return kda_decode_mtp_ws(**common, state_layout="vk")
