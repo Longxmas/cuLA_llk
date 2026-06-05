@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
 """对照测试 kda_decode_mtp_small_batch(kv 布局)与 aligned/triton/ws。
 数值校验(max|Δ| 阈值 5e-2)+ 性能(kernel-only CUDA graph t_graph)。
-自包含(原 diag_kda_mtp_small_batch 基建已内联);需 CUDA 机器(B200),Mac 不能跑。
 用法:python benchmarks/bench_kda_mtp_small_batch.py [--batch-sizes ... --Ts ... --check]
 """
 
@@ -22,30 +20,19 @@ from cula.ops.kda_decode_mtp_small_batch import (
     kda_decode_mtp_small_batch_aligned,
 )
 
-
-# ============================================================================
-# 共享测试基建(原 diag_kda_mtp_small_batch,已内联以使本脚本自包含)
-# ============================================================================
 # CUDA gridDim.z 上限。Triton 把 N*HV 放 z 轴,超过即 launch 失败(cuLA 不受此限)。
 TRITON_MAX_GRID_Z = 65535
 
-# Triton 基线:优先用独立文件(零 sglang 依赖;KDA_TRITON_FILE 最高优先,再 benchmarks/
-# 同目录、repo 内/外的 Issue 17/),都没有则退回 sglang 包导入。
+# Triton 基线:KDA_TRITON_FILE 指定基线文件则从该文件加载,否则退回 sglang 包。
 _HAVE_TRITON = True
 _TRITON_ERR = ""
 fused_sigmoid_gating_delta_rule_update = None
 try:
-    import importlib.util
+    _triton_file = os.environ.get("KDA_TRITON_FILE", "")
+    if _triton_file and os.path.exists(_triton_file):
+        import importlib.util
 
-    _candidates = [
-        os.environ.get("KDA_TRITON_FILE", ""),
-        str(_here / "fused_sigmoid_gating_recurrent.py"),
-        str(_here.parent / "Issue 17" / "fused_sigmoid_gating_recurrent.py"),
-        str(_here.parent.parent / "Issue 17" / "fused_sigmoid_gating_recurrent.py"),
-    ]
-    _triton_path = next((p for p in _candidates if p and os.path.exists(p)), None)
-    if _triton_path is not None:
-        _spec = importlib.util.spec_from_file_location("_kda_triton_standalone", _triton_path)
+        _spec = importlib.util.spec_from_file_location("_kda_triton_standalone", _triton_file)
         _mod = importlib.util.module_from_spec(_spec)
         _spec.loader.exec_module(_mod)
         fused_sigmoid_gating_delta_rule_update = _mod.fused_sigmoid_gating_delta_rule_update
@@ -59,7 +46,7 @@ except Exception as e:  # pragma: no cover
 
 
 def make_dense_inputs(N, T, H, HV, K, V, device, seed=42):
-    """dense (N,T,...) KDA 输入(与 ws-vs-triton bench 对齐)。"""
+    """dense (N,T,...) KDA 输入。"""
     g = torch.Generator(device=device).manual_seed(seed)
     bf16 = torch.bfloat16
     q = torch.randn(N, T, H, K, device=device, dtype=bf16, generator=g)
@@ -108,10 +95,7 @@ def warmup(fn, n):
 
 
 def t_graph_ms(fn, warmup_iters, rep):
-    """Kernel-only via CUDA graph:capture fn() 一次(wrapper 只在录制时跑),再计
-    graph.replay() = 纯 device kernel(cuLA/Triton 的 Python wrapper 与 launcher 全移除,
-    == CUDA-graph serving 真实代价)。capture 失败则抛(调用方捕获 -> n/a);dsu 须 True
-    以保证 replay 幂等(状态只读,多次 replay 不漂移)。"""
+    """Kernel-only 计时:CUDA graph capture + replay,纯 device kernel(wrapper/launcher 全移除);dsu 须 True 保证 replay 幂等。"""
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -135,44 +119,29 @@ def t_graph_ms(fn, warmup_iters, rep):
     return start.elapsed_time(end) / rep
 
 
-# small_batch 的 opt_level / fast_math / k_split,由 main() 从 CLI 设置(供 register/spill 调优 A/B)。
+# small_batch 的 opt_level / fast_math / k_split,由 main() 从 CLI 设置。
 _SB_OPT_LEVEL = 3
 _SB_FAST_MATH = True
 _SB_K_SPLIT = 1
-_SB_SKIP_LOAD = False  # ablation:传 -1 indices 跳过 state load,只测 perf(定位 fixed deficit 是否=state load)
 _ALIGNED_BV = -1  # aligned 的 BV(每 program V 列数);-1=auto(按 work_units 挑 8/16/32 提 occupancy)
 
 
-def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu,
-                          state_layout="kv"):
-    """small_batch kv(KV-only)封装;state_layout 须为 'kv'。"""
-    if _SB_SKIP_LOAD:
-        indices = torch.full_like(indices, -1)  # ablation:cache_idx<0 跳过 state load
-    if state_layout == "kv":
+def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, variant="kv"):
+    """small_batch 封装;variant='kv'(lane=V/kv 布局)或 'aligned'(lane=K/vk 布局)。"""
+    if variant == "kv":
         state = state.transpose(-2, -1).contiguous()  # vk→kv 预转置(计时外一次,coalesced)
-    def call():
-        return kda_decode_mtp_small_batch(
-            A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
-            initial_state_source=state, initial_state_indices=indices, scale=scale,
-            use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
-            disable_state_update=dsu, state_layout=state_layout,
-            opt_level=_SB_OPT_LEVEL, fast_math=_SB_FAST_MATH, k_split=_SB_K_SPLIT,
-        )
-
-    return call
-
-
-def make_small_batch_aligned_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
-    if _SB_SKIP_LOAD:
-        indices = torch.full_like(indices, -1)
-    def call():
-        return kda_decode_mtp_small_batch_aligned(
-            A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
-            initial_state_source=state, initial_state_indices=indices, scale=scale,
-            use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
-            disable_state_update=dsu, bv=_ALIGNED_BV,
-            opt_level=_SB_OPT_LEVEL, fast_math=_SB_FAST_MATH,
-        )
+    common = dict(
+        A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+        initial_state_source=state, initial_state_indices=indices, scale=scale,
+        use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
+        disable_state_update=dsu, opt_level=_SB_OPT_LEVEL, fast_math=_SB_FAST_MATH,
+    )
+    if variant == "kv":
+        def call():
+            return kda_decode_mtp_small_batch(**common, state_layout="kv", k_split=_SB_K_SPLIT)
+    else:
+        def call():
+            return kda_decode_mtp_small_batch_aligned(**common, bv=_ALIGNED_BV)
 
     return call
 
@@ -218,23 +187,16 @@ def main():
                     help="small_batch 的 fast_math(0/1)")
     ap.add_argument("--sb-k-split", type=int, default=1, choices=[-1, 1, 2, 4],
                     help="small_batch 的 k_split:每 V 列由 k_split 个 lane 分摊 K(降寄存器/提 occupancy);-1=auto(按 work_units wave 适配)")
-    ap.add_argument("--sb-skip-load", action="store_true",
-                    help="ablation:传 -1 indices 跳过 state load(只测 perf,正确性必错)——定位 fixed deficit 是否来自 state load")
     ap.add_argument("--aligned-bv", type=int, default=-1, choices=[-1, 8, 16, 32],
                     help="aligned 的 BV(每 program V 列数);-1=auto(小批降 BV 提 occupancy 填 wave),或 8/16/32 扫")
     args = ap.parse_args()
 
-    global _SB_OPT_LEVEL, _SB_FAST_MATH, _SB_K_SPLIT, _SB_SKIP_LOAD, _ALIGNED_BV
+    global _SB_OPT_LEVEL, _SB_FAST_MATH, _SB_K_SPLIT, _ALIGNED_BV
     _ALIGNED_BV = args.aligned_bv
     _SB_OPT_LEVEL = args.sb_opt_level
     _SB_FAST_MATH = bool(args.sb_fast_math)
     _SB_K_SPLIT = args.sb_k_split
-    _SB_SKIP_LOAD = args.sb_skip_load
-    if _SB_SKIP_LOAD:
-        print("[--sb-skip-load] 跳过 state load:数值校验对 sbkv 必报 DIFF(预期);只看下面 perf vs 有 load 基准。")
 
-    if not torch.cuda.is_available():
-        sys.exit("需要 CUDA GPU(B200 等);Mac 无法跑。")
     if not _HAVE_TRITON:
         sys.exit(f"Triton 不可用,本对照脚本需要 Triton 作基准:{_TRITON_ERR}")
     assert args.HV % args.H == 0
@@ -257,10 +219,10 @@ def main():
                               scale, True, args.ws_tile_v, args.ws_ilp)
         elif args.profile_variant == "sbkv":
             fn = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                       state0.clone(), indices, scale, True, state_layout="kv")
+                                       state0.clone(), indices, scale, True, variant="kv")
         else:  # sbaln
-            fn = make_small_batch_aligned_call(q, k, v, a, b, A_log, dt_bias,
-                                               state0.clone(), indices, scale, True)
+            fn = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
+                                       state0.clone(), indices, scale, True, variant="aligned")
         warmup(fn, args.warmup)
         print(f"[profile] variant={args.profile_variant} N={N} T={T}: "
               f"{args.profile_iters} forward iters(供外部 profiler 包裹)")
@@ -289,10 +251,9 @@ def main():
                                  state0.clone(), indices, scale, True)()
         o_tri = o_tri.reshape(N, T, args.HV, args.V).float()
         o_sbkv = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                       state0.clone(), indices, scale, True,
-                                       state_layout="kv")().float()
-        o_sbaln = make_small_batch_aligned_call(q, k, v, a, b, A_log, dt_bias,
-                                                state0.clone(), indices, scale, True)().float()
+                                       state0.clone(), indices, scale, True, variant="kv")().float()
+        o_sbaln = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
+                                        state0.clone(), indices, scale, True, variant="aligned")().float()
         o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
                             scale, True, args.ws_tile_v, args.ws_ilp)().float()
         d_sbkv = (o_sbkv - o_tri).abs().max().item()
@@ -304,7 +265,7 @@ def main():
         print(f"{N:>4} {T:>3} | {d_sbkv:>14.2e} | {d_sbaln:>14.2e} | {d_ws:>14.2e} | {flag}")
     print("数值校验:", "全部 OK" if ok_all else "有 DIFF,先查正确性再看性能!")
 
-    if args.check or (not ok_all and not _SB_SKIP_LOAD):
+    if args.check or not ok_all:
         return
 
     # ---------------- 性能 (t_graph, kernel-only) ----------------
@@ -335,10 +296,9 @@ def main():
             ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
                               scale, True, args.ws_tile_v, args.ws_ilp)
             sbkv = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                         state0.clone(), indices, scale, True,
-                                         state_layout="kv")
-            sbaln = make_small_batch_aligned_call(q, k, v, a, b, A_log, dt_bias,
-                                                  state0.clone(), indices, scale, True)
+                                         state0.clone(), indices, scale, True, variant="kv")
+            sbaln = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
+                                          state0.clone(), indices, scale, True, variant="aligned")
             try:
                 warmup(ws, args.warmup)
                 tg_ws = t_graph_ms(ws, 3, args.rep)
