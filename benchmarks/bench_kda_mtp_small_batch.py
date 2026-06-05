@@ -1,4 +1,4 @@
-"""对照测试 kda_decode_mtp_small_batch(kv 布局)与 aligned/triton/ws。
+"""对照测试 kda_decode_mtp_small_batch(kv 布局)与 vk/triton/ws。
 数值校验(max|Δ| 阈值 5e-2)+ 性能(kernel-only CUDA graph t_graph)。
 用法:python benchmarks/bench_kda_mtp_small_batch.py [--batch-sizes ... --Ts ... --check]
 """
@@ -15,10 +15,7 @@ _here = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_here.parent))  # cuLA/
 
 from cula.kda import kda_decode_mtp_ws
-from cula.ops.kda_decode_mtp_small_batch import (
-    kda_decode_mtp_small_batch,
-    kda_decode_mtp_small_batch_aligned,
-)
+from cula.ops.kda_decode_mtp_small_batch import kda_decode_mtp_small_batch
 
 # CUDA gridDim.z 上限。Triton 把 N*HV 放 z 轴,超过即 launch 失败(cuLA 不受此限)。
 TRITON_MAX_GRID_Z = 65535
@@ -123,11 +120,11 @@ def t_graph_ms(fn, warmup_iters, rep):
 _SB_OPT_LEVEL = 3
 _SB_FAST_MATH = True
 _SB_K_SPLIT = 1
-_ALIGNED_BV = -1  # aligned 的 BV(每 program V 列数);-1=auto(按 work_units 挑 8/16/32 提 occupancy)
+_VK_BV = -1  # vk 的 BV(每 program V 列数);-1=auto(按 work_units 挑 8/16/32 提 occupancy)
 
 
 def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, variant="kv"):
-    """small_batch 封装;variant='kv'(lane=V/kv 布局)或 'aligned'(lane=K/vk 布局)。"""
+    """small_batch 封装;variant='kv'(lane=V/kv 布局)或 'vk'(lane=K/vk 布局)。"""
     if variant == "kv":
         state = state.transpose(-2, -1).contiguous()  # vk→kv 预转置(计时外一次,coalesced)
     common = dict(
@@ -138,10 +135,10 @@ def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, 
     )
     if variant == "kv":
         def call():
-            return kda_decode_mtp_small_batch(**common, state_layout="kv", k_split=_SB_K_SPLIT)
+            return kda_decode_mtp_small_batch(**common, variant="kv", k_split=_SB_K_SPLIT)
     else:
         def call():
-            return kda_decode_mtp_small_batch_aligned(**common, bv=_ALIGNED_BV)
+            return kda_decode_mtp_small_batch(**common, variant="vk", bv=_VK_BV)
 
     return call
 
@@ -179,20 +176,20 @@ def main():
     ap.add_argument("--profile", nargs=2, type=int, metavar=("N", "T"), default=None,
                     help="单 (N,T) 长跑某变体 profile_iters 次,供 ncu/nsys 包裹(只 forward,不计时)")
     ap.add_argument("--profile-iters", type=int, default=50)
-    ap.add_argument("--profile-variant", choices=["sbkv", "sbaln", "triton", "ws"], default="sbkv",
-                    help="--profile 跑哪个变体(sbkv=kv 布局;sbaln=lane=K aligned)")
+    ap.add_argument("--profile-variant", choices=["sbkv", "sbvk", "triton", "ws"], default="sbkv",
+                    help="--profile 跑哪个变体(sbkv=kv 布局;sbvk=lane=K vk)")
     ap.add_argument("--sb-opt-level", type=int, default=3, choices=[0, 1, 2, 3],
                     help="small_batch 的 --opt-level(调 ptxas 流水深度/寄存器 A/B)")
     ap.add_argument("--sb-fast-math", type=int, default=1, choices=[0, 1],
                     help="small_batch 的 fast_math(0/1)")
     ap.add_argument("--sb-k-split", type=int, default=1, choices=[-1, 1, 2, 4],
                     help="small_batch 的 k_split:每 V 列由 k_split 个 lane 分摊 K(降寄存器/提 occupancy);-1=auto(按 work_units wave 适配)")
-    ap.add_argument("--aligned-bv", type=int, default=-1, choices=[-1, 8, 16, 32],
-                    help="aligned 的 BV(每 program V 列数);-1=auto(小批降 BV 提 occupancy 填 wave),或 8/16/32 扫")
+    ap.add_argument("--vk-bv", type=int, default=-1, choices=[-1, 8, 16, 32],
+                    help="vk 的 BV(每 program V 列数);-1=auto(小批降 BV 提 occupancy 填 wave),或 8/16/32 扫")
     args = ap.parse_args()
 
-    global _SB_OPT_LEVEL, _SB_FAST_MATH, _SB_K_SPLIT, _ALIGNED_BV
-    _ALIGNED_BV = args.aligned_bv
+    global _SB_OPT_LEVEL, _SB_FAST_MATH, _SB_K_SPLIT, _VK_BV
+    _VK_BV = args.vk_bv
     _SB_OPT_LEVEL = args.sb_opt_level
     _SB_FAST_MATH = bool(args.sb_fast_math)
     _SB_K_SPLIT = args.sb_k_split
@@ -220,9 +217,9 @@ def main():
         elif args.profile_variant == "sbkv":
             fn = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
                                        state0.clone(), indices, scale, True, variant="kv")
-        else:  # sbaln
+        else:  # sbvk
             fn = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                       state0.clone(), indices, scale, True, variant="aligned")
+                                       state0.clone(), indices, scale, True, variant="vk")
         warmup(fn, args.warmup)
         print(f"[profile] variant={args.profile_variant} N={N} T={T}: "
               f"{args.profile_iters} forward iters(供外部 profiler 包裹)")
@@ -235,7 +232,7 @@ def main():
 
     # ---------------- 数值校验 ----------------
     print("\n=== 数值校验 (max|Δ|, 阈值 5e-2) ===")
-    print(f"{'N':>4} {'T':>3} | {'Δ sbkv-vs-tri':>14} | {'Δ sbaln-vs-tri':>14} | {'Δ sbkv-vs-ws':>14} | flag")
+    print(f"{'N':>4} {'T':>3} | {'Δ sbkv-vs-tri':>14} | {'Δ sbvk-vs-tri':>14} | {'Δ sbkv-vs-ws':>14} | flag")
     print("-" * 70)
     if len(args.check_cases) == 1 and args.check_cases[0].lower() == "all":
         check_cases = [(N, T) for N in args.batch_sizes for T in args.Ts]
@@ -252,17 +249,17 @@ def main():
         o_tri = o_tri.reshape(N, T, args.HV, args.V).float()
         o_sbkv = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
                                        state0.clone(), indices, scale, True, variant="kv")().float()
-        o_sbaln = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                        state0.clone(), indices, scale, True, variant="aligned")().float()
+        o_sbvk = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
+                                        state0.clone(), indices, scale, True, variant="vk")().float()
         o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
                             scale, True, args.ws_tile_v, args.ws_ilp)().float()
         d_sbkv = (o_sbkv - o_tri).abs().max().item()
-        d_sbaln = (o_sbaln - o_tri).abs().max().item()
+        d_sbvk = (o_sbvk - o_tri).abs().max().item()
         d_ws = (o_sbkv - o_ws).abs().max().item()
-        flag = "OK" if (d_sbkv < 5e-2 and d_sbaln < 5e-2 and d_ws < 5e-2) else "DIFF!"
+        flag = "OK" if (d_sbkv < 5e-2 and d_sbvk < 5e-2 and d_ws < 5e-2) else "DIFF!"
         if flag != "OK":
             ok_all = False
-        print(f"{N:>4} {T:>3} | {d_sbkv:>14.2e} | {d_sbaln:>14.2e} | {d_ws:>14.2e} | {flag}")
+        print(f"{N:>4} {T:>3} | {d_sbkv:>14.2e} | {d_sbvk:>14.2e} | {d_ws:>14.2e} | {flag}")
     print("数值校验:", "全部 OK" if ok_all else "有 DIFF,先查正确性再看性能!")
 
     if args.check or not ok_all:
@@ -272,8 +269,8 @@ def main():
     print("\n=== 性能 t_graph (CUDA graph replay,纯 device kernel) ===")
     print(f"  ws baseline = tile_v={args.ws_tile_v} ilp={args.ws_ilp} (recompute);"
           f" small_batch = 1-warp/BV=32  warmup={args.warmup} rep={args.rep}")
-    hdr = (f"{'N':>4} {'T':>3} | {'tg_triton':>9} {'tg_ws':>8} {'tg_sbkv':>9} {'tg_sbaln':>9} | "
-           f"{'sbaln/tri':>9} {'sbkv/tri':>9} {'ws/tri':>7}")
+    hdr = (f"{'N':>4} {'T':>3} | {'tg_triton':>9} {'tg_ws':>8} {'tg_sbkv':>9} {'tg_sbvk':>9} | "
+           f"{'sbvk/tri':>9} {'sbkv/tri':>9} {'ws/tri':>7}")
     print(hdr)
     print("-" * len(hdr))
     for N in args.batch_sizes:
@@ -282,7 +279,7 @@ def main():
                 N, T, args.H, args.HV, args.K, args.V, device)
             scale = args.K ** -0.5
 
-            tg_tri = tg_ws = tg_sbkv = tg_sbaln = None
+            tg_tri = tg_ws = tg_sbkv = tg_sbvk = None
             if N * args.HV <= TRITON_MAX_GRID_Z:
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
@@ -297,8 +294,8 @@ def main():
                               scale, True, args.ws_tile_v, args.ws_ilp)
             sbkv = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
                                          state0.clone(), indices, scale, True, variant="kv")
-            sbaln = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                          state0.clone(), indices, scale, True, variant="aligned")
+            sbvk = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
+                                          state0.clone(), indices, scale, True, variant="vk")
             try:
                 warmup(ws, args.warmup)
                 tg_ws = t_graph_ms(ws, 3, args.rep)
@@ -310,19 +307,19 @@ def main():
             except Exception as e:
                 print(f"{N:>4} {T:>3} | sbkv FAIL: {str(e)[:50]}")
             try:
-                warmup(sbaln, args.warmup)
-                tg_sbaln = t_graph_ms(sbaln, 3, args.rep)
+                warmup(sbvk, args.warmup)
+                tg_sbvk = t_graph_ms(sbvk, 3, args.rep)
             except Exception as e:
-                print(f"{N:>4} {T:>3} | sbaln FAIL: {str(e)[:50]}")
+                print(f"{N:>4} {T:>3} | sbvk FAIL: {str(e)[:50]}")
 
             def us(x):
                 return f"{x * 1e3:>8.1f}" if x else f"{'n/a':>8}"
 
-            r_sbaln = f"{tg_tri / tg_sbaln:.2f}x" if (tg_tri and tg_sbaln) else "n/a"
+            r_sbvk = f"{tg_tri / tg_sbvk:.2f}x" if (tg_tri and tg_sbvk) else "n/a"
             r_sbkv = f"{tg_tri / tg_sbkv:.2f}x" if (tg_tri and tg_sbkv) else "n/a"
             r_ws = f"{tg_tri / tg_ws:.2f}x" if (tg_tri and tg_ws) else "n/a"
-            print(f"{N:>4} {T:>3} | {us(tg_tri):>9} {us(tg_ws)} {us(tg_sbkv):>9} {us(tg_sbaln):>9} | "
-                  f"{r_sbaln:>9} {r_sbkv:>9} {r_ws:>7}")
+            print(f"{N:>4} {T:>3} | {us(tg_tri):>9} {us(tg_ws)} {us(tg_sbkv):>9} {us(tg_sbvk):>9} | "
+                  f"{r_sbvk:>9} {r_sbkv:>9} {r_ws:>7}")
 
 
 if __name__ == "__main__":

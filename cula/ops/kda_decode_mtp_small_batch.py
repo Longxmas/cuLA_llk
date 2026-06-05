@@ -1,6 +1,6 @@
-"""CuTe DSL KDA MTP decode (KDA/topk=1/decode-only),两个 1-warp 算子:
-(1) kda_decode_mtp_small_batch:lane=V + kv 布局(V 连续 coalesced)+ 线程内零-shuffle reduce + k_split 可调。
-(2) kda_decode_mtp_small_batch_aligned:lane=K + vk 布局 + float4 连续块 load + 2-stage 软件流水 + BV 可调。
+"""CuTe DSL KDA MTP decode (KDA/topk=1/decode-only),统一入口 kda_decode_mtp_small_batch(variant=),1-warp/program:
+variant='kv':lane=V + kv 布局(V 连续 coalesced)+ 线程内零-shuffle reduce + k_split 可调。
+variant='vk':lane=K + vk 布局 + float4 连续块 load + 2-stage 软件流水 + bv 可调。
 数学(decay-first)对齐 fp32 torch 参考口径(atol 3e-2 / rtol 2e-2)。
 """
 
@@ -14,7 +14,6 @@ from cutlass.cute.runtime import from_dlpack
 
 from cula.ops.kda_decode import (
     TILE_K,
-    _canonicalize_state_layout,
     _get_cached_stream,
     _normalize_A_log,
     _normalize_dt_bias,
@@ -395,15 +394,17 @@ def kda_decode_mtp_small_batch(
     softplus_beta: float = 1.0,
     softplus_threshold: float = 20.0,
     out: torch.Tensor | None = None,
-    state_layout: str = "kv",
     disable_state_update: bool = False,
+    variant: str = "kv",
     bv: int = WARP_BV,
     k_split: int = 1,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """lane=V + kv 布局(V 连续 → coalesced)+ 线程内零-shuffle reduce。
-    仅 KDA/topk=1/decode;kv-only(state 全程 kv,不和 vk 的 ws 共享)。"""
+    """KDA MTP decode(KDA/topk=1/decode-only),1 warp/program。布局由 variant 决定:
+    variant='kv':lane=V + kv 布局(V 连续 coalesced)+ 线程内零-shuffle reduce;k_split 可调(1/2/4 或 <=0 auto)。
+    variant='vk':lane=K + vk 布局 + float4 连续块 load + 2-stage 软件流水;bv 可调(8/16/32 或 <=0 auto,k_split 忽略)。"""
+    assert variant in ("kv", "vk"), f"variant 仅支持 'kv'/'vk',got {variant!r}"
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -417,20 +418,27 @@ def kda_decode_mtp_small_batch(
     assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
         f"small_batch 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
     )
-    assert bv == WARP_BV, f"small_batch 固定 1 warp,bv 必须为 {WARP_BV},got {bv}"
-    if k_split <= 0:  # auto:按 work_units(N*HV)的 wave 适配挑 k_split
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        k_split = _select_k_split(N * HV, V, num_sms)
-    assert k_split in (1, 2, 4), f"k_split 仅支持 1/2/4 或 <=0(auto),got {k_split}"
-    assert bv % k_split == 0 and K % k_split == 0, (
-        f"需 bv%k_split==0 且 K%k_split==0,got bv={bv}, K={K}, k_split={k_split}"
-    )
-    vcols = bv // k_split  # 每 program 的 V 列数(= kernel 内 BV)
-    assert V % vcols == 0, f"small_batch requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
 
-    state_layout = _canonicalize_state_layout(state_layout)
-    if state_layout != "kv":
-        raise NotImplementedError(f"small_batch is kv-only; got state_layout={state_layout!r}")
+    # variant 决定 state 布局与 config 旋钮(kv→k_split 可调/bv 固定;vk→bv 可调/不 split)。
+    if variant == "kv":
+        state_layout = "kv"
+        assert bv == WARP_BV, f"small_batch(kv) 固定 1 warp,bv 必须为 {WARP_BV},got {bv}"
+        if k_split <= 0:  # auto:按 work_units(N*HV)的 wave 适配挑 k_split
+            num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+            k_split = _select_k_split(N * HV, V, num_sms)
+        assert k_split in (1, 2, 4), f"k_split 仅支持 1/2/4 或 <=0(auto),got {k_split}"
+        assert bv % k_split == 0 and K % k_split == 0, (
+            f"需 bv%k_split==0 且 K%k_split==0,got bv={bv}, K={K}, k_split={k_split}"
+        )
+        vcols = bv // k_split  # 每 program 的 V 列数(= kernel 内 BV)
+        assert V % vcols == 0, f"small_batch(kv) requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
+    else:  # vk
+        state_layout = "vk"
+        if bv <= 0:  # auto:按 work_units(N*HV)的 wave 占用挑 BV(小批降 BV 填 grid)
+            num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+            bv = _select_vk_bv(N * HV, V, num_sms)
+        assert bv in (8, 16, 32), f"vk bv 仅支持 8/16/32 或 <=0(auto),got {bv}"
+        assert V % bv == 0, f"vk requires V % bv == 0, got V={V}, bv={bv}"
 
     h0_source, pool_size, _ = _normalize_state_source(
         initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout=state_layout,
@@ -454,28 +462,27 @@ def kda_decode_mtp_small_batch(
         initial_state_indices, N=N, pool_size=pool_size, device=q.device
     )
 
-    h0_source_flat = h0_source.view(pool_size * HV, K, V)  # kv
-
     stream = _get_cached_stream(q.device)
 
-    compiled_kernel = _get_compiled_mtp_small_batch_kernel(
-        N,
-        T,
-        H,
-        HV,
-        K,
-        V,
-        pool_size,
-        vcols,
-        k_split,
-        scale=scale,
-        use_qk_l2norm=use_qk_l2norm_in_kernel,
-        disable_state_update=disable_state_update,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        opt_level=opt_level,
-        fast_math=fast_math,
-    )
+    # variant 决定 state view 形状与编译 kernel。
+    if variant == "kv":
+        h0_source_flat = h0_source.view(pool_size * HV, K, V)  # kv
+        compiled_kernel = _get_compiled_mtp_small_batch_kernel(
+            N, T, H, HV, K, V, pool_size, vcols, k_split,
+            scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
+            disable_state_update=disable_state_update,
+            softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
+            opt_level=opt_level, fast_math=fast_math,
+        )
+    else:  # vk
+        h0_source_flat = h0_source.view(pool_size * HV, V, K)  # vk
+        compiled_kernel = _get_compiled_mtp_vk_kernel(
+            N, T, H, HV, K, V, pool_size, bv,
+            scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
+            disable_state_update=disable_state_update,
+            softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
+            opt_level=opt_level, fast_math=fast_math,
+        )
 
     compiled_kernel(
         h0_source_flat,
@@ -495,13 +502,13 @@ def kda_decode_mtp_small_batch(
 
 
 # ============================================================================
-# aligned:lane=K + warp-shuffle reduce —— lane t 沿 K 连续块映射(仅 vk、单 warp、不 split)。
+# vk:lane=K + warp-shuffle reduce —— lane t 沿 K 连续块映射(仅 vk、单 warp、不 split)。
 # lane t 沿 K 连续块持 vec_size 个 K × 全 BV 个 V 列(float4 load,coalesced+向量化);
 # reduce-over-K = 线程内 vec_size + 32-lane 5 步 butterfly;o 用 32 lane 同址幂等写落盘。
 # 数学与 kv 布局变体完全一致(对齐 fp32 torch 参考)。
 # ============================================================================
 @cute.kernel
-def kda_mtp_small_batch_aligned_kernel(
+def kda_mtp_small_batch_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -679,7 +686,7 @@ def kda_mtp_small_batch_aligned_kernel(
 
 
 @cute.jit
-def run_kda_mtp_small_batch_aligned_kernel(
+def run_kda_mtp_small_batch_vk_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -705,12 +712,12 @@ def run_kda_mtp_small_batch_aligned_kernel(
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    """lane=K aligned launcher:grid = N*HV*(V//BV),block = 32(1 warp)。无 SMEM。"""
+    """lane=K vk launcher:grid = N*HV*(V//BV),block = 32(1 warp)。无 SMEM。"""
     n_indices = h0_indices.layout.shape[0]
     num_v_tiles = cute.ceil_div(V, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    kda_mtp_small_batch_aligned_kernel(
+    kda_mtp_small_batch_vk_kernel(
         h0_source,
         A_log,
         a,
@@ -743,10 +750,10 @@ def run_kda_mtp_small_batch_aligned_kernel(
     )
 
 
-_compiled_mtp_aligned_kernels: dict[tuple, object] = {}
+_compiled_mtp_vk_kernels: dict[tuple, object] = {}
 
 
-def _get_compiled_mtp_aligned_kernel(
+def _get_compiled_mtp_vk_kernel(
     N,
     T,
     H,
@@ -780,8 +787,8 @@ def _get_compiled_mtp_aligned_kernel(
         opt_level,
         fast_math,
     )
-    if key in _compiled_mtp_aligned_kernels:
-        return _compiled_mtp_aligned_kernels[key]
+    if key in _compiled_mtp_vk_kernels:
+        return _compiled_mtp_vk_kernels[key]
 
     q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
@@ -808,7 +815,7 @@ def _get_compiled_mtp_aligned_kernel(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = cute.compile(
-        run_kda_mtp_small_batch_aligned_kernel,
+        run_kda_mtp_small_batch_vk_kernel,
         h0_source_t,
         A_log_t,
         a_t,
@@ -836,138 +843,21 @@ def _get_compiled_mtp_aligned_kernel(
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
 
-    _compiled_mtp_aligned_kernels[key] = compiled_kernel
+    _compiled_mtp_vk_kernels[key] = compiled_kernel
     logger.info(
-        "CuTe DSL KDA MTP small-batch ALIGNED(lane=K) kernel compiled: "
+        "CuTe DSL KDA MTP small-batch VK(lane=K) kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, BV={BV}, "
         f"opt_level={opt_level}, fast_math={fast_math}"
     )
     return compiled_kernel
 
 
-# B200 ncu:aligned BV=32 时 168 reg → Block Limit Registers ≈12。
-def _select_aligned_bv(work_units, V, num_sms):
-    """aligned split 轴是 V(BV)= 每 program 处理的 V 列数:降 BV → 寄存器↓ occupancy↑ grid↑,小批填 wave、藏 shuffle 延迟。
+# B200 ncu:vk BV=32 时 168 reg → Block Limit Registers ≈12。
+def _select_vk_bv(work_units, V, num_sms):
+    """vk split 轴是 V(BV)= 每 program 处理的 V 列数:降 BV → 寄存器↓ occupancy↑ grid↑,小批填 wave、藏 shuffle 延迟。
     B200 实测(N≤16,T≤8)BV=8 全程碾压 BV=32(0.92–1.15x vs 0.64–0.99x);N≥32 未测,保守回 BV=32。"""
     waves32 = work_units * (V // 32) / (num_sms * 12)  # BV=32 的波数(Block Limit Reg≈12)
     # waves32: N1=0.14 N2=0.28 N4=0.56 N8=1.12 N16=2.25 N32=4.5 → 阈值 3.0 覆盖 N≤16。
     if V % 8 == 0 and waves32 < 3.0:
         return 8
     return 32
-
-
-def kda_decode_mtp_small_batch_aligned(
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    initial_state_source: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    scale: float | None = None,
-    use_qk_l2norm_in_kernel: bool = True,
-    softplus_beta: float = 1.0,
-    softplus_threshold: float = 20.0,
-    out: torch.Tensor | None = None,
-    state_layout: str = "vk",
-    disable_state_update: bool = False,
-    bv: int = WARP_BV,
-    opt_level: int = 3,
-    fast_math: bool = True,
-) -> torch.Tensor:
-    """aligned:lane=K + warp-shuffle reduce + 连续块 float4 load + 2-stage 软件流水;仅 vk。
-    ``bv`` = 每 program 的 V 列数,可调({8,16,32} 或 <=0 auto,见 ``_select_aligned_bv``)。"""
-    N, T, H, K = q.shape
-    HV = v.shape[2]
-    V = v.shape[3]
-
-    if scale is None:
-        scale = K**-0.5
-    else:
-        assert scale > 0, f"scale must be positive, got {scale}"
-
-    assert K == TILE_K, f"KDA MTP (aligned) requires K={TILE_K}, got {K}"
-    assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
-        f"aligned 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
-    )
-    if bv <= 0:  # auto:按 work_units(N*HV)的 wave 占用挑 BV(小批降 BV 填 grid 提 occupancy)
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        bv = _select_aligned_bv(N * HV, V, num_sms)
-    # block 恒 32(=K//vec_size=1 warp),与 BV 无关;BV 只是每 program 的 V 列数。
-    assert bv in (8, 16, 32), f"aligned BV 仅支持 8/16/32 或 <=0(auto),got {bv}"
-    assert V % bv == 0, f"aligned requires V % bv == 0, got V={V}, bv={bv}"
-
-    state_layout = _canonicalize_state_layout(state_layout)
-    if state_layout != "vk":
-        raise NotImplementedError(
-            f"kda_decode_mtp_small_batch_aligned only supports state_layout='vk'; got {state_layout!r}"
-        )
-
-    h0_source, pool_size, state_layout_is_kv = _normalize_state_source(
-        initial_state_source,
-        N=N,
-        HV=HV,
-        K=K,
-        V=V,
-        device=q.device,
-        state_layout=state_layout,
-    )
-    assert not state_layout_is_kv
-
-    a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
-    if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
-        raise ValueError(f"Unexpected b shape for MTP dense: {tuple(b.shape)}; expected {(N, T, HV)}")
-
-    o = _prepare_output_tensor(q, out, (N, T, HV, V))
-
-    q = q if q.is_contiguous() else q.contiguous()
-    k = k if k.is_contiguous() else k.contiguous()
-    v = v if v.is_contiguous() else v.contiguous()
-    a = a if a.is_contiguous() else a.contiguous()
-    b = b if b.is_contiguous() else b.contiguous()
-
-    A_log = _normalize_A_log(A_log, HV)
-    dt_bias = _normalize_dt_bias(dt_bias, HV, K)
-    initial_state_indices = _normalize_state_indices(
-        initial_state_indices, N=N, pool_size=pool_size, device=q.device
-    )
-
-    h0_source_flat = h0_source.view(pool_size * HV, V, K)
-
-    stream = _get_cached_stream(q.device)
-
-    compiled_kernel = _get_compiled_mtp_aligned_kernel(
-        N,
-        T,
-        H,
-        HV,
-        K,
-        V,
-        pool_size,
-        bv,
-        scale=scale,
-        use_qk_l2norm=use_qk_l2norm_in_kernel,
-        disable_state_update=disable_state_update,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        opt_level=opt_level,
-        fast_math=fast_math,
-    )
-
-    compiled_kernel(
-        h0_source_flat,
-        A_log,
-        a,
-        dt_bias,
-        q,
-        k,
-        v,
-        b,
-        o,
-        initial_state_indices,
-        stream,
-    )
-
-    return o
