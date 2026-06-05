@@ -979,13 +979,15 @@ def _select_aligned_bv(work_units, V, num_sms):
     grid = work_units*(V/BV)↑ → 小批(N=1/2,远不到 1 wave)把空闲 SM 填上、多驻 warp 去藏
     lane=K butterfly-shuffle 的串行延迟(那是小批病根,软件流水治 load 治不了它)。
 
-    N≥4 已被软件流水追平 triton → 不切(BV=32)。代价:grid×(32/BV) 易跨 wave 边界。
-    阈值是起步猜测,实际最优用 bench --aligned-bv {8,16,32} 扫了再调。"""
+    B200 实测(N≤8,bench --aligned-bv sweep):BV=8 全程最优或并列——N=1 直接 match
+    lane=V 的 tsl(1.25–1.40x 超 triton),N=8 仍 1.06–1.09x 超 triton(高 occupancy
+    持续藏 lane=K shuffle 延迟,wave 量化代价没咬上来)。BV=16 从不严格最优(N=4 T=4 还
+    掉到 0.85x),不入 auto(仍可手动 --aligned-bv 16)。N≥16 未测,保守回 BV=32(机制上
+    BV=8 大概率仍好,待 sweep 确认后可抬阈值)。"""
     waves32 = work_units * (V // 32) / (num_sms * 12)  # BV=32 的波数(Block Limit Reg≈12)
-    for bv, thresh in ((8, 0.2), (16, 0.5)):
-        # 越欠载越降 BV:waves32<0.2→BV8,<0.5→BV16,否则(接近填满)→BV32。
-        if V % bv == 0 and waves32 < thresh:
-            return bv
+    # waves32: N1=0.14 N2=0.28 N4=0.56 N8=1.12 N16=2.25 → 阈值 1.5 让 N≤8 全进 BV8。
+    if V % 8 == 0 and waves32 < 1.5:
+        return 8
     return 32
 
 
