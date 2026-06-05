@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """对照测试 kda_decode_mtp_triton_style(KV-only)与 aligned/triton/ws。
 数值校验(max|Δ| 阈值 5e-2)+ 性能(kernel-only CUDA graph t_graph)。
-复用 diag_kda_mtp_small_batch 基建;需 CUDA 机器(B200),Mac 不能跑。
+自包含(原 diag_kda_mtp_small_batch 基建已内联);需 CUDA 机器(B200),Mac 不能跑。
 用法:python benchmarks/bench_kda_mtp_triton_style.py [--batch-sizes ... --Ts ... --check]
 """
 
@@ -15,7 +15,6 @@ import torch
 os.environ.setdefault("FLA_USE_FAST_OPS", os.getenv("CULA_USE_FAST_MATH", "1"))
 _here = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_here.parent))  # cuLA/
-sys.path.insert(0, str(_here))  # benchmarks/ (for diag helpers)
 
 from cula.kda import kda_decode_mtp_ws
 from cula.ops.kda_decode_mtp_triton_style import (
@@ -23,15 +22,117 @@ from cula.ops.kda_decode_mtp_triton_style import (
     kda_decode_mtp_triton_style,
 )
 
-from diag_kda_mtp_small_batch import (  # noqa: E402  复用 diag 基建
-    TRITON_MAX_GRID_Z,
-    _HAVE_TRITON,
-    make_dense_inputs,
-    make_triton_call,
-    t_graph_ms,
-    to_triton_varlen,
-    warmup,
-)
+
+# ============================================================================
+# 共享测试基建(原 diag_kda_mtp_small_batch,已内联以使本脚本自包含)
+# ============================================================================
+# CUDA gridDim.z 上限。Triton 把 N*HV 放 z 轴,超过即 launch 失败(cuLA 不受此限)。
+TRITON_MAX_GRID_Z = 65535
+
+# Triton 基线:优先用独立文件(零 sglang 依赖;KDA_TRITON_FILE 最高优先,再 benchmarks/
+# 同目录、repo 内/外的 Issue 17/),都没有则退回 sglang 包导入。
+_HAVE_TRITON = True
+_TRITON_ERR = ""
+fused_sigmoid_gating_delta_rule_update = None
+try:
+    import importlib.util
+
+    _candidates = [
+        os.environ.get("KDA_TRITON_FILE", ""),
+        str(_here / "fused_sigmoid_gating_recurrent.py"),
+        str(_here.parent / "Issue 17" / "fused_sigmoid_gating_recurrent.py"),
+        str(_here.parent.parent / "Issue 17" / "fused_sigmoid_gating_recurrent.py"),
+    ]
+    _triton_path = next((p for p in _candidates if p and os.path.exists(p)), None)
+    if _triton_path is not None:
+        _spec = importlib.util.spec_from_file_location("_kda_triton_standalone", _triton_path)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        fused_sigmoid_gating_delta_rule_update = _mod.fused_sigmoid_gating_delta_rule_update
+    else:
+        from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+except Exception as e:  # pragma: no cover
+    _HAVE_TRITON = False
+    _TRITON_ERR = repr(e)
+
+
+def make_dense_inputs(N, T, H, HV, K, V, device, seed=42):
+    """dense (N,T,...) KDA 输入(与 ws-vs-triton bench 对齐)。"""
+    g = torch.Generator(device=device).manual_seed(seed)
+    bf16 = torch.bfloat16
+    q = torch.randn(N, T, H, K, device=device, dtype=bf16, generator=g)
+    k = torch.randn(N, T, H, K, device=device, dtype=bf16, generator=g)
+    v = torch.randn(N, T, HV, V, device=device, dtype=bf16, generator=g)
+    a = (torch.randn(N, T, HV, K, device=device, dtype=torch.float32, generator=g) * 0.1).to(bf16)
+    b = torch.randn(N, T, HV, device=device, dtype=bf16, generator=g)
+    A_log = -torch.rand(HV, device=device, dtype=torch.float32, generator=g) * 2  # neg -> decay∈(0,1)
+    dt_bias = torch.randn(HV, K, device=device, dtype=torch.float32, generator=g) * 0.1
+    state = torch.randn(N, HV, V, K, device=device, dtype=torch.float32, generator=g) * 0.01
+    indices = torch.arange(N, device=device, dtype=torch.int32)
+    return q, k, v, a, b, A_log, dt_bias, state, indices
+
+
+def to_triton_varlen(q, k, v, a, b):
+    """dense (N,T,...) -> varlen packed [1, N*T, ...] + 等长 cu_seqlens。"""
+    N, T, H, K = q.shape
+    HV, V = v.shape[2], v.shape[3]
+    NT = N * T
+    q_t = q.reshape(1, NT, H, K).contiguous()
+    k_t = k.reshape(1, NT, H, K).contiguous()
+    v_t = v.reshape(1, NT, HV, V).contiguous()
+    a_t = a.reshape(1, NT, HV * K).contiguous()
+    b_t = b.reshape(1, NT, HV).contiguous()
+    cu_seqlens = torch.arange(0, (N + 1) * T, T, device=q.device, dtype=torch.int32)
+    return q_t, k_t, v_t, a_t, b_t, cu_seqlens
+
+
+def make_triton_call(qt, kt, vt, at, bt, cu_seqlens, A_log, dt_bias, state, indices, scale, dsu):
+    def call():
+        return fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log, a=at, dt_bias=dt_bias, softplus_beta=1.0, softplus_threshold=20.0,
+            q=qt, k=kt, v=vt, b=bt, initial_state_source=state, initial_state_indices=indices,
+            scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens, is_kda=True,
+            disable_state_update=dsu, intermediate_states_buffer=None,
+            retrieve_parent_token=None, lower_bound=None,
+        )
+
+    return call
+
+
+def warmup(fn, n):
+    for _ in range(n):
+        fn()
+    torch.cuda.synchronize()
+
+
+def t_graph_ms(fn, warmup_iters, rep):
+    """Kernel-only via CUDA graph:capture fn() 一次(wrapper 只在录制时跑),再计
+    graph.replay() = 纯 device kernel(cuLA/Triton 的 Python wrapper 与 launcher 全移除,
+    == CUDA-graph serving 真实代价)。capture 失败则抛(调用方捕获 -> n/a);dsu 须 True
+    以保证 replay 幂等(状态只读,多次 replay 不漂移)。"""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(warmup_iters):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    for _ in range(10):
+        g.replay()
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(rep):
+        g.replay()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end) / rep
 
 
 # tsl 的 opt_level / fast_math / k_split,由 main() 从 CLI 设置(供 register/spill 调优 A/B)。
@@ -135,7 +236,7 @@ def main():
     if not torch.cuda.is_available():
         sys.exit("需要 CUDA GPU(B200 等);Mac 无法跑。")
     if not _HAVE_TRITON:
-        sys.exit("Triton 不可用,本对照脚本需要 Triton 作基准。")
+        sys.exit(f"Triton 不可用,本对照脚本需要 Triton 作基准:{_TRITON_ERR}")
     assert args.HV % args.H == 0
     device = "cuda"
     print(f"GPU: {torch.cuda.get_device_name()}")
