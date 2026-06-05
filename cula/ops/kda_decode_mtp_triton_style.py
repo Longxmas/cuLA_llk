@@ -972,6 +972,23 @@ def _get_compiled_mtp_aligned_kernel(
     return compiled_kernel
 
 
+# B200(GB200)ncu:aligned BV=32 时 168 reg → Block Limit Registers ≈12。
+def _select_aligned_bv(work_units, V, num_sms):
+    """aligned 的「split」轴是 V(BV),不是 K(K 已 4/lane 摊满 32 lane)。BV = lane=K 下每
+    program 处理的 V 列数,state = vec_size*BV fp32/lane。降 BV → 寄存器↓ occupancy↑ +
+    grid = work_units*(V/BV)↑ → 小批(N=1/2,远不到 1 wave)把空闲 SM 填上、多驻 warp 去藏
+    lane=K butterfly-shuffle 的串行延迟(那是小批病根,软件流水治 load 治不了它)。
+
+    N≥4 已被软件流水追平 triton → 不切(BV=32)。代价:grid×(32/BV) 易跨 wave 边界。
+    阈值是起步猜测,实际最优用 bench --aligned-bv {8,16,32} 扫了再调。"""
+    waves32 = work_units * (V // 32) / (num_sms * 12)  # BV=32 的波数(Block Limit Reg≈12)
+    for bv, thresh in ((8, 0.2), (16, 0.5)):
+        # 越欠载越降 BV:waves32<0.2→BV8,<0.5→BV16,否则(接近填满)→BV32。
+        if V % bv == 0 and waves32 < thresh:
+            return bv
+    return 32
+
+
 def kda_decode_mtp_triton_aligned(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -995,8 +1012,9 @@ def kda_decode_mtp_triton_aligned(
 ) -> torch.Tensor:
     """KDA MTP decode,lane=K + warp-shuffle reduce(完全对齐 triton 的 thread→data 映射)。
 
-    仅 vk;用于对照 lane=V 版(``kda_decode_mtp_triton_style``)——验证 lane=K 在 vk 下能否
-    靠 coalesced load 追平 triton(预期 ≈ parity,它就是 triton 的 CuTe 复刻)。无 k_split。
+    仅 vk;lane=K + 连续块 float4 load + 2-stage 软件流水(预取 t+1 输入)。``bv`` = 每 program
+    的 V 列数,可调({8,16,32} 或 <=0 auto):降 BV → 寄存器↓ occupancy↑ + grid↑,小批(N=1/2)
+    填 wave、藏 lane=K shuffle 延迟。见 ``_select_aligned_bv``。
     """
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -1011,8 +1029,12 @@ def kda_decode_mtp_triton_aligned(
     assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
         f"aligned 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
     )
-    assert bv == TRITON_BV, f"aligned 固定 1 warp,bv 必须为 {TRITON_BV},got {bv}"
-    assert V % bv == 0, f"aligned requires V % {bv} == 0, got V={V}"
+    if bv <= 0:  # auto:按 work_units(N*HV) 的 wave 占用挑 BV(小批降 BV 填 grid 提 occupancy)
+        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        bv = _select_aligned_bv(N * HV, V, num_sms)
+    # block 恒 32(=K//vec_size=1 warp),与 BV 无关;BV 只是每 program 的 V 列数(state 大小)。
+    assert bv in (8, 16, 32), f"aligned BV 仅支持 8/16/32 或 <=0(auto),got {bv}"
+    assert V % bv == 0, f"aligned requires V % bv == 0, got V={V}, bv={bv}"
 
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":

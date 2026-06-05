@@ -50,6 +50,7 @@ _TSL_OPT_LEVEL = 3
 _TSL_FAST_MATH = True
 _TSL_K_SPLIT = 1
 _TSL_SKIP_LOAD = False  # ablation:tsl 传 -1 indices 跳过 state load,只测 perf(定位 fixed deficit 是否=state load)
+_ALIGNED_BV = -1  # aligned 的 BV(每 program V 列数);-1=auto(按 work_units 挑 8/16/32 提 occupancy)
 
 
 def make_triton_style_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu,
@@ -80,7 +81,7 @@ def make_triton_aligned_call(q, k, v, a, b, A_log, dt_bias, state, indices, scal
             A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
             initial_state_source=state, initial_state_indices=indices, scale=scale,
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
-            disable_state_update=dsu,
+            disable_state_update=dsu, bv=_ALIGNED_BV,
             opt_level=_TSL_OPT_LEVEL, fast_math=_TSL_FAST_MATH,
         )
 
@@ -130,9 +131,12 @@ def main():
                     help="tsl 的 k_split:每 V 列由 k_split 个 lane 分摊 K(降寄存器/提 occupancy);-1=auto(按 work_units wave 适配)")
     ap.add_argument("--tsl-skip-load", action="store_true",
                     help="ablation:tsl 传 -1 indices 跳过 state load(只测 perf,正确性必错)——定位 fixed deficit 是否来自 state load")
+    ap.add_argument("--aligned-bv", type=int, default=-1, choices=[-1, 8, 16, 32],
+                    help="aligned 的 BV(每 program V 列数);-1=auto(小批降 BV 提 occupancy 填 wave),或 8/16/32 扫")
     args = ap.parse_args()
 
-    global _TSL_OPT_LEVEL, _TSL_FAST_MATH, _TSL_K_SPLIT, _TSL_SKIP_LOAD
+    global _TSL_OPT_LEVEL, _TSL_FAST_MATH, _TSL_K_SPLIT, _TSL_SKIP_LOAD, _ALIGNED_BV
+    _ALIGNED_BV = args.aligned_bv
     _TSL_OPT_LEVEL = args.tsl_opt_level
     _TSL_FAST_MATH = bool(args.tsl_fast_math)
     _TSL_K_SPLIT = args.tsl_k_split
