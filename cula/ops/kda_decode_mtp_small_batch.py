@@ -1,7 +1,7 @@
 """CuTe DSL KDA MTP decode (KDA/topk=1/decode-only),两个 1-warp 算子:
-(1) kda_decode_mtp_triton_style = tslkv:lane=V + kv 布局(V 连续 coalesced)+ 线程内零-shuffle reduce + k_split 可调。
-(2) kda_decode_mtp_triton_aligned = aligned:lane=K + vk 布局 + float4 连续块 load + 2-stage 软件流水 + BV 可调。
-数学(decay-first)对齐 fp32 torch / Triton 口径(atol 3e-2 / rtol 2e-2)。
+(1) kda_decode_mtp_small_batch:lane=V + kv 布局(V 连续 coalesced)+ 线程内零-shuffle reduce + k_split 可调。
+(2) kda_decode_mtp_small_batch_aligned:lane=K + vk 布局 + float4 连续块 load + 2-stage 软件流水 + BV 可调。
+数学(decay-first)对齐 fp32 torch 参考口径(atol 3e-2 / rtol 2e-2)。
 """
 
 import logging
@@ -26,16 +26,16 @@ from cula.ops.kda_decode_mtp_ws import _normalize_mtp_a
 
 logger = logging.getLogger(__name__)
 
-# Triton 的 BV = min(next_pow2(V),32);decode V=128 → BV=32 = 一个 warp 的 lane 数。
-TRITON_BV = 32
+# 1 warp = 32 lane;decode V=128 → 每 program 默认 32 个 V 列(可由 bv/k_split 再切)。
+WARP_BV = 32
 # 每 lane 在 prep 负责的 K channel 数:K / warp_size = 128 / 32 = 4。
 VEC_SIZE = 4
 
-_compiled_mtp_triton_kernels: dict[tuple, object] = {}
+_compiled_mtp_small_batch_kernels: dict[tuple, object] = {}
 
 
 @cute.kernel
-def kda_mtp_triton_style_kernel(
+def kda_mtp_small_batch_kernel(
     h0_source: cute.Tensor,  # [pool*HV, K, V] fp32 (kv, V-last)
     A_log: cute.Tensor,  # [HV] fp32
     a: cute.Tensor,  # [N, T, HV, K]
@@ -193,7 +193,7 @@ def kda_mtp_triton_style_kernel(
 
 
 @cute.jit
-def run_kda_mtp_triton_style_kernel(
+def run_kda_mtp_small_batch_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -220,7 +220,7 @@ def run_kda_mtp_triton_style_kernel(
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    """tslkv host launcher:grid = N*HV*(V//BV),block = 32(1 warp)。
+    """kv-layout host launcher:grid = N*HV*(V//BV),block = 32(1 warp)。
     BV = 32//k_split = 每 program 的 V 列数,k_split 个 lane 分摊一个 V 列的 K。"""
     n_indices = h0_indices.layout.shape[0]
     num_v_tiles = cute.ceil_div(V, BV)  # kv 下 h0.shape[1]=K,统一用 V 常量
@@ -228,7 +228,7 @@ def run_kda_mtp_triton_style_kernel(
 
     smem_bytes = 3 * K * 4 + 256  # sQ + sK + sG
 
-    kda_mtp_triton_style_kernel(
+    kda_mtp_small_batch_kernel(
         h0_source,
         A_log,
         a,
@@ -262,7 +262,7 @@ def run_kda_mtp_triton_style_kernel(
     )
 
 
-def _get_compiled_mtp_triton_kernel(
+def _get_compiled_mtp_small_batch_kernel(
     N,
     T,
     H,
@@ -298,8 +298,8 @@ def _get_compiled_mtp_triton_kernel(
         opt_level,
         fast_math,
     )
-    if key in _compiled_mtp_triton_kernels:
-        return _compiled_mtp_triton_kernels[key]
+    if key in _compiled_mtp_small_batch_kernels:
+        return _compiled_mtp_small_batch_kernels[key]
 
     q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
     k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
@@ -326,7 +326,7 @@ def _get_compiled_mtp_triton_kernel(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = cute.compile(
-        run_kda_mtp_triton_style_kernel,
+        run_kda_mtp_small_batch_kernel,
         h0_source_t,
         A_log_t,
         a_t,
@@ -355,9 +355,9 @@ def _get_compiled_mtp_triton_kernel(
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
     )
 
-    _compiled_mtp_triton_kernels[key] = compiled_kernel
+    _compiled_mtp_small_batch_kernels[key] = compiled_kernel
     logger.info(
-        "CuTe DSL KDA MTP triton-style kernel compiled: "
+        "CuTe DSL KDA MTP small-batch kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, BV={BV}, "
         f"k_split={k_split}, opt_level={opt_level}, fast_math={fast_math}"
     )
@@ -365,13 +365,13 @@ def _get_compiled_mtp_triton_kernel(
 
 
 # B200 ncu:k_split 对应 register-limited CTAs/SM(r_h=128//ks fp32 → reg 255/166/111)。
-_TSL_CTAS_PER_SM = {1: 8, 2: 12, 4: 16}
+_KV_CTAS_PER_SM = {1: 8, 2: 12, 4: 16}
 
 
-def _select_tsl_k_split(work_units, V, num_sms):
+def _select_k_split(work_units, V, num_sms):
     """按 ks=1 的 wave 占用挑「够填就好」的最小 k_split(work_units = N*HV)。
     B200(HV=64,V=128)实测最优:N=1→4, N=2→2, N≥4→1(多切只为填 wave,代价是 shuffle 串行延迟)。"""
-    waves1 = work_units * (V // 32) / (num_sms * _TSL_CTAS_PER_SM[1])  # ks=1 的波数
+    waves1 = work_units * (V // 32) / (num_sms * _KV_CTAS_PER_SM[1])  # ks=1 的波数
     for ks, thresh in ((4, 0.3), (2, 0.6)):
         vcols = 32 // ks
         # 越欠载越该多切:waves1<0.3→ks4;<0.6→ks2;否则→ks1。
@@ -380,7 +380,7 @@ def _select_tsl_k_split(work_units, V, num_sms):
     return 1
 
 
-def kda_decode_mtp_triton_style(
+def kda_decode_mtp_small_batch(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     q: torch.Tensor,
@@ -397,12 +397,12 @@ def kda_decode_mtp_triton_style(
     out: torch.Tensor | None = None,
     state_layout: str = "kv",
     disable_state_update: bool = False,
-    bv: int = TRITON_BV,
+    bv: int = WARP_BV,
     k_split: int = 1,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """tslkv:lane=V + kv 布局(V 连续 → coalesced)+ 线程内零-shuffle reduce。
+    """lane=V + kv 布局(V 连续 → coalesced)+ 线程内零-shuffle reduce。
     仅 KDA/topk=1/decode;kv-only(state 全程 kv,不和 vk 的 ws 共享)。"""
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -413,24 +413,24 @@ def kda_decode_mtp_triton_style(
     else:
         assert scale > 0, f"scale must be positive, got {scale}"
 
-    assert K == TILE_K, f"KDA MTP (triton-style) requires K={TILE_K}, got {K}"
+    assert K == TILE_K, f"KDA MTP (small_batch) requires K={TILE_K}, got {K}"
     assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
-        f"triton-style 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
+        f"small_batch 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
     )
-    assert bv == TRITON_BV, f"triton-style 固定 1 warp,bv 必须为 {TRITON_BV},got {bv}"
+    assert bv == WARP_BV, f"small_batch 固定 1 warp,bv 必须为 {WARP_BV},got {bv}"
     if k_split <= 0:  # auto:按 work_units(N*HV)的 wave 适配挑 k_split
         num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-        k_split = _select_tsl_k_split(N * HV, V, num_sms)
+        k_split = _select_k_split(N * HV, V, num_sms)
     assert k_split in (1, 2, 4), f"k_split 仅支持 1/2/4 或 <=0(auto),got {k_split}"
     assert bv % k_split == 0 and K % k_split == 0, (
         f"需 bv%k_split==0 且 K%k_split==0,got bv={bv}, K={K}, k_split={k_split}"
     )
     vcols = bv // k_split  # 每 program 的 V 列数(= kernel 内 BV)
-    assert V % vcols == 0, f"triton-style requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
+    assert V % vcols == 0, f"small_batch requires V % (bv//k_split) == 0, got V={V}, vcols={vcols}"
 
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "kv":
-        raise NotImplementedError(f"tslkv is kv-only; got state_layout={state_layout!r}")
+        raise NotImplementedError(f"small_batch is kv-only; got state_layout={state_layout!r}")
 
     h0_source, pool_size, _ = _normalize_state_source(
         initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout=state_layout,
@@ -458,7 +458,7 @@ def kda_decode_mtp_triton_style(
 
     stream = _get_cached_stream(q.device)
 
-    compiled_kernel = _get_compiled_mtp_triton_kernel(
+    compiled_kernel = _get_compiled_mtp_small_batch_kernel(
         N,
         T,
         H,
@@ -495,13 +495,13 @@ def kda_decode_mtp_triton_style(
 
 
 # ============================================================================
-# aligned:lane=K + warp-shuffle reduce —— 对齐 triton thread→data 映射(仅 vk、单 warp、不 split)。
+# aligned:lane=K + warp-shuffle reduce —— lane t 沿 K 连续块映射(仅 vk、单 warp、不 split)。
 # lane t 沿 K 连续块持 vec_size 个 K × 全 BV 个 V 列(float4 load,coalesced+向量化);
 # reduce-over-K = 线程内 vec_size + 32-lane 5 步 butterfly;o 用 32 lane 同址幂等写落盘。
-# 数学与 tslkv 完全一致(对齐 triton/torch),预期 ≈ triton-parity。
+# 数学与 kv 布局变体完全一致(对齐 fp32 torch 参考)。
 # ============================================================================
 @cute.kernel
-def kda_mtp_triton_aligned_kernel(
+def kda_mtp_small_batch_aligned_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -547,7 +547,7 @@ def kda_mtp_triton_aligned_kernel(
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_bv = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)
     r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # float4 临时缓冲(state load/store)
-    # ===== 2-stage 软件流水双缓冲(对齐 triton num_stages):算 token t 时预取 t+1 的 q/k/a/b 输入 =====
+    # ===== 2-stage 软件流水双缓冲:算 token t 时预取 t+1 的 q/k/a/b 输入 =====
     r_qbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
     r_kbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
     r_abf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32) for _ in range(2)]
@@ -679,7 +679,7 @@ def kda_mtp_triton_aligned_kernel(
 
 
 @cute.jit
-def run_kda_mtp_triton_aligned_kernel(
+def run_kda_mtp_small_batch_aligned_kernel(
     h0_source: cute.Tensor,
     A_log: cute.Tensor,
     a: cute.Tensor,
@@ -710,7 +710,7 @@ def run_kda_mtp_triton_aligned_kernel(
     num_v_tiles = cute.ceil_div(V, BV)
     grid_size = n_indices * HV * num_v_tiles
 
-    kda_mtp_triton_aligned_kernel(
+    kda_mtp_small_batch_aligned_kernel(
         h0_source,
         A_log,
         a,
@@ -808,7 +808,7 @@ def _get_compiled_mtp_aligned_kernel(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     compiled_kernel = cute.compile(
-        run_kda_mtp_triton_aligned_kernel,
+        run_kda_mtp_small_batch_aligned_kernel,
         h0_source_t,
         A_log_t,
         a_t,
@@ -838,7 +838,7 @@ def _get_compiled_mtp_aligned_kernel(
 
     _compiled_mtp_aligned_kernels[key] = compiled_kernel
     logger.info(
-        "CuTe DSL KDA MTP triton-ALIGNED(lane=K) kernel compiled: "
+        "CuTe DSL KDA MTP small-batch ALIGNED(lane=K) kernel compiled: "
         f"N={N}, T={T}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, BV={BV}, "
         f"opt_level={opt_level}, fast_math={fast_math}"
     )
@@ -856,7 +856,7 @@ def _select_aligned_bv(work_units, V, num_sms):
     return 32
 
 
-def kda_decode_mtp_triton_aligned(
+def kda_decode_mtp_small_batch_aligned(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     q: torch.Tensor,
@@ -873,7 +873,7 @@ def kda_decode_mtp_triton_aligned(
     out: torch.Tensor | None = None,
     state_layout: str = "vk",
     disable_state_update: bool = False,
-    bv: int = TRITON_BV,
+    bv: int = WARP_BV,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
@@ -902,7 +902,7 @@ def kda_decode_mtp_triton_aligned(
     state_layout = _canonicalize_state_layout(state_layout)
     if state_layout != "vk":
         raise NotImplementedError(
-            f"kda_decode_mtp_triton_aligned only supports state_layout='vk'; got {state_layout!r}"
+            f"kda_decode_mtp_small_batch_aligned only supports state_layout='vk'; got {state_layout!r}"
         )
 
     h0_source, pool_size, state_layout_is_kv = _normalize_state_source(
