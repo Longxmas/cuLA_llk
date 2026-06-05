@@ -938,8 +938,8 @@ def _get_compiled_mtp_ws_kernel(
     use_packed_fma,
     use_smem_v,
     cache_intermediate_states,
-    opt_level=1,
-    fast_math=False,
+    opt_level=3,
+    fast_math=True,
 ):
     """Get or lazily compile the warp-spec MTP kernel for one shape/config.
 
@@ -1071,8 +1071,6 @@ def kda_decode_mtp_ws(
     use_packed_fma: bool | None = None,
     use_smem_v: bool | None = None,
     intermediate_states_buffer: torch.Tensor | None = None,
-    opt_level: int = 3,
-    fast_math: bool = True,
 ) -> torch.Tensor:
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -1204,8 +1202,6 @@ def kda_decode_mtp_ws(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
-        opt_level=opt_level,
-        fast_math=fast_math,
     )
 
     compiled_kernel(

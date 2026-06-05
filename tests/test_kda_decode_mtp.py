@@ -336,7 +336,7 @@ def test_kda_mtp_zero_state(T):
 # ===========================================================================
 def run_kda_decode_mtp_ws_dense(
     q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2,
-    use_packed_fma=None, use_smem_v=None, opt_level=1, fast_math=False,
+    use_packed_fma=None, use_smem_v=None,
 ):
     """Run the warp-specialized fused MTP kernel (kda_decode_mtp_ws), dense vk."""
     N = q.shape[0]
@@ -359,8 +359,6 @@ def run_kda_decode_mtp_ws_dense(
         ilp_rows=ilp_rows,
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
-        opt_level=opt_level,
-        fast_math=fast_math,
     )
     return o, state_source  # (N, T, HV, V), (N, HV, V, K)
 
@@ -1007,67 +1005,10 @@ def test_kda_decode_mtp_ws_intermediate_determinism(ilp_rows):
 
 
 # ===========================================================================
-# Compile-knob tuning (issue 17): opt_level + fast_math
-#
-# Two compile-knobs are now exposed on the decode entry points, implemented in
-# ONE change but TESTED SEPARATELY (each test varies exactly one knob, the other
-# pinned at its default):
-#   - opt_level: CuTe DSL --opt-level (codegen optimization; NOT a kernel
-#     constexpr). On kda_decode (single-token / loop baseline) and
-#     kda_decode_mtp_ws. Default 1 (the historical pin); 2/3 must
-#     stay correct (opt-level should not change the answer beyond FP reassoc).
-#   - fast_math: kernel constexpr threading fastmath= onto the ws
-#     transcendentals (exp/log/rsqrt). Default False reproduces the validated
-#     no-fastmath port; True is the FlashInfer-style fast intrinsic. kda_decode
-#     (single-token) is intentionally NOT given fast_math (stays no-fastmath).
-# All gate on the SAME fp32 torch oracle at the standard 3e-2/2e-2 band: these
-# knobs are codegen/intrinsic choices, not algorithm changes, so accuracy must
-# hold. The default (opt_level=1, fast_math=False) path is already covered by
-# every other test in this file; these add the 2/3 and fast_math=True legs.
+# Single-token kda_decode --opt-level: the bench 'loop' baseline at opt 2/3 must
+# stay correct vs the fp32 oracle (codegen optimization, not an algorithm change).
+# The mtp ws kernel is fixed at the shipped opt3 + fast_math (no caller knob).
 # ===========================================================================
-@pytest.mark.parametrize("opt_level", [2, 3])
-def test_kda_decode_mtp_ws_opt_level(opt_level):
-    """ws kernel at --opt-level 2/3 stays correct vs the fp32 oracle (fast_math off)."""
-    N, T, H, HV, K, V = 16, 4, 16, 32, 128, 128
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-
-    o_ref, state_ref = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
-    )
-    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale, opt_level=opt_level, fast_math=False
-    )
-
-    _assert_close(f"ws opt_level={opt_level} output", o_ref, o_kernel.float())
-    _assert_close(f"ws opt_level={opt_level} final state", state_ref, state_kernel)
-
-
-@pytest.mark.parametrize("ilp_rows", [2, 4])
-def test_kda_decode_mtp_ws_fast_math(ilp_rows):
-    """ws kernel with fast_math=True stays within the oracle band (opt_level fixed).
-
-    The fast intrinsics drift more than the default exp/log/rsqrt, but bf16 input
-    rounding dominates, so the 3e-2/2e-2 band still holds. tile_v=32 keeps ilp=4
-    legal so both ILP paths' transcendentals are exercised."""
-    N, T, H, HV, K, V = 16, 4, 16, 32, 128, 128
-    tile_v = 32
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-
-    o_ref, state_ref = torch_kda_mtp_ref(
-        q.float(), k.float(), v.float(), a, b.float(), A_log, dt_bias, state.clone(), scale
-    )
-    o_kernel, state_kernel = run_kda_decode_mtp_ws_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale,
-        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False,
-        opt_level=1, fast_math=True,
-    )
-
-    _assert_close(f"ws fast_math ilp={ilp_rows} output", o_ref, o_kernel.float())
-    _assert_close(f"ws fast_math ilp={ilp_rows} final state", state_ref, state_kernel)
-
-
 @pytest.mark.parametrize("opt_level", [2, 3])
 def test_kda_decode_single_token_opt_level(opt_level):
     """Single-token kda_decode (the bench 'loop' baseline) at --opt-level 2/3 stays
@@ -1088,10 +1029,9 @@ def test_kda_decode_single_token_opt_level(opt_level):
     _assert_close(f"single-token opt_level={opt_level} final state", state_ref, state_loop)
 
 
-# --- shipped production default (opt_level=3 + fast_math=True, B200-tuned) ----
-# The dense/tile_v/etc. tests drive the helpers, which pin the reference path
-# (opt_level=1, fast_math=False); these two exercise the actual default callers
-# get with NO knob args (both knobs at once), so the shipped config is covered.
+# --- shipped production default (opt3 + fast_math, B200-tuned) ----
+# The ws kernel is fixed at opt3 + fast_math (no longer a caller knob); this
+# exercises the default ws entry point with no extra args.
 def test_kda_decode_mtp_ws_default_config():
     """ws entry point with no knob args == production default (opt3 + fast_math)."""
     N, T, H, HV, K, V = 16, 4, 16, 32, 128, 128

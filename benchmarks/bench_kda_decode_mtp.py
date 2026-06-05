@@ -65,16 +65,6 @@ compile-cache key), so the full grid compiles ~1.3k kernels — expect a long ru
 subset via --sweep-hvs/--sweep-ns/--sweep-ts. Writes a markdown report (winner table
 + work_units-invariance check + full per-cell grid).
 
---knob-sweep tunes the two issue-17 COMPILE knobs SEPARATELY (never mixing both in a
-single comparison): opt_level (CuTe DSL --opt-level) and fast_math (fastmath= on the
-ws exp/log/rsqrt). It prints Table A = opt_level in {1,2,3} at fast_math=off,
-and Table B = fast_math in {off,on} at opt_level=1, across loop/ws/ws4
-(loop=kda_decode has no fast_math). opt-level scope is the 2
-kernels (loop single-token + ws); fast_math scope is ws only. The
---opt-level/--fast-math flags (without --knob-sweep) instead pin ONE setting for the
-main + --determinism modes, so a setting can be A/B'd by re-running. Defaults
-(opt_level=1, fast_math=off) reproduce the validated build.
-
 Fairness notes:
   - Both routes reset their state buffer before each timed iteration; the reset
     copy_() runs outside the CUDA event window and is NOT counted.
@@ -91,10 +81,7 @@ Usage:
     python benchmarks/bench_kda_decode_mtp.py --bench-intermediate --batch-sizes 64 256
     python benchmarks/bench_kda_decode_mtp.py --sweep-config                  # full KDA config sweep
     python benchmarks/bench_kda_decode_mtp.py --sweep-config --sweep-hvs 64 --sweep-ns 64 256 --sweep-ts 2 4
-    python benchmarks/bench_kda_decode_mtp.py --knob-sweep --batch-sizes 1 2 64 256 --Ts 2 4   # opt_level + fast_math, separately
-    python benchmarks/bench_kda_decode_mtp.py --prod-defaults                  # ws (opt3+fast_math) vs loop, shipped config
-    python benchmarks/bench_kda_decode_mtp.py --opt-level 3                    # pin opt_level 3 for the main table
-    python benchmarks/bench_kda_decode_mtp.py --fast-math --routes loop ws4            # pin fast_math on
+    python benchmarks/bench_kda_decode_mtp.py --routes loop ws4
     python benchmarks/bench_kda_decode_mtp.py --output
 
 Note:
@@ -139,37 +126,19 @@ def make_inputs_mtp(N, T, H, HV, K, V, device="cuda", seed=42):
     return q, k, v, a, b, A_log, dt_bias, state
 
 
-def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level=1, fast_math=False):
+def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v):
     """Build the ws + looped callables, their state buffers, and setup fns.
 
     Returns a dict with keys: call_<route>, setup_<route>, state_<route> for each
     of ws/ws4/ws4_smemv/ws_auto/loop (the live buffers, mutated in-place).
 
-    ``opt_level`` (CuTe DSL --opt-level) and ``fast_math`` (fastmath= on the
-    transcendentals) are the issue-17 compile knobs. They are applied to the
-    routes in their scope: ``opt_level`` to loop (single-token kda_decode) +
-    ws/ws4/ws4_smemv/ws_auto; ``fast_math`` to the ws routes only (loop =
-    kda_decode stays no-fastmath). Defaults (1, False) reproduce the validated
-    build.
-
-    Either knob may be ``None`` => omit it from the call so the wrapper's OWN
-    default applies. With both None (the bench ``--prod-defaults`` mode) every
-    route runs at its SHIPPED production config: loop = kda_decode opt-1/no
-    fast_math, ws = opt-3 + fast_math — so the vs-loop columns are a true
-    production-vs-production comparison (a single global opt_level/fast_math
-    cannot express loop@opt1 + ws@opt3 at once).
+    Every route runs at its SHIPPED production config: loop = kda_decode (its own
+    default), ws/ws4/ws4_smemv/ws_auto = kda_decode_mtp_ws (opt_level=3 +
+    fast_math, fixed internally).
     """
     N, T = q.shape[0], q.shape[1]
     device = q.device
     indices = torch.arange(N, device=device, dtype=torch.int32)
-
-    # Knob kwargs per route family; None => omit (wrapper default = production).
-    loop_kw = {} if opt_level is None else {"opt_level": opt_level}
-    mtp_kw = {}
-    if opt_level is not None:
-        mtp_kw["opt_level"] = opt_level
-    if fast_math is not None:
-        mtp_kw["fast_math"] = fast_math
 
     state_init = state.clone().contiguous()  # (N, HV, V, K)
 
@@ -192,7 +161,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=2,  # pin ilp=2 so ws-vs-ws4 isn't muddied by the None default
             use_smem_v=False,  # pin off so ws/ws4/ws4_smemv each isolate ONE knob
-            **mtp_kw,
         )
 
     def setup_ws():
@@ -224,7 +192,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=4,
             use_smem_v=False,  # see comment above: pin off so ws4_smemv/ws4 is clean
-            **mtp_kw,
         )
 
     def setup_ws4():
@@ -253,7 +220,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             tile_v=tile_v,
             ilp_rows=4,
             use_smem_v=True,
-            **mtp_kw,
         )
 
     def setup_ws4_smemv():
@@ -280,7 +246,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
             use_qk_l2norm_in_kernel=True,
             tile_v=tile_v,  # None in heuristic mode -> kernel auto-selects tile_v
             ilp_rows=None,  # heuristic picks ilp (the whole point of this route)
-            **mtp_kw,
         )
 
     def setup_ws_auto():
@@ -312,7 +277,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
                 initial_state_indices=indices,
                 scale=scale,
                 use_qk_l2norm_in_kernel=True,
-                **loop_kw,  # loop = single-token kda_decode; no fast_math (stays no-fastmath)
             )
             o_loop[:, t] = o_t.squeeze(1)
         return o_loop
@@ -343,8 +307,7 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
 # ──────────────────────────────────────────────────────────────────────
 # Timing one config
 # ──────────────────────────────────────────────────────────────────────
-def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_set,
-               opt_level=1, fast_math=False):
+def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_set):
     device = "cuda"
     scale = K**-0.5
 
@@ -356,8 +319,7 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
     # confirm mid/large batch hits ilp=4 without reading kernel logs.
     sel_tile_v, sel_ilp, sel_smem_v = _select_mtp_config(N, HV, V, T)
 
-    routes = _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v_override,
-                           opt_level=opt_level, fast_math=fast_math)
+    routes = _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v_override)
 
     # ws4 (ilp=4) is only valid when each warp's rows_per_group=tile_v/4 is a
     # multiple of 4; skip it (n/a) on small tile_v rather than asserting. ws_auto
@@ -420,8 +382,6 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
         "HV": HV,
         "tile_v": tile_v,
         "ws4_ok": ws4_ok,
-        "opt_level": opt_level,
-        "fast_math": fast_math,
         # Production-default selection (tile_v=None, ilp_rows=None).
         "sel_tile_v": sel_tile_v,
         "sel_ilp": sel_ilp,
@@ -459,8 +419,7 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
 # ──────────────────────────────────────────────────────────────────────
 # Determinism check (bit-for-bit, surfaces state-writeback races)
 # ──────────────────────────────────────────────────────────────────────
-def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route,
-                    opt_level=1, fast_math=False):
+def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route):
     device = "cuda"
     scale = K**-0.5
 
@@ -472,8 +431,7 @@ def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route,
         return {"N": N, "T": T, "tile_v": tile_v, "iters": 0, "route": route,
                 "passed": True, "first_bad": -1, "skipped": True}
 
-    routes = _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v_override,
-                           opt_level=opt_level, fast_math=fast_math)
+    routes = _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v_override)
 
     call = routes[f"call_{route}"]
     setup = routes[f"setup_{route}"]
@@ -1060,225 +1018,6 @@ def write_sweep_markdown_report(args, gpu_name, cells, output_path):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Compile-knob sweep (issue 17): opt_level + fast_math, measured SEPARATELY
-# ──────────────────────────────────────────────────────────────────────
-_KNOB_ROUTES = ("loop", "ws", "ws4")
-_KNOB_MS = {"loop": "t_loop_ms", "ws": "t_ws_ms", "ws4": "t_ws4_ms"}
-# vs-loop output rel-max per route (loop has none — it IS the reference).
-_KNOB_RMAX = {"ws": "ws_out_rel_max", "ws4": "ws4_out_rel_max"}
-
-
-def run_knob_sweep(args, gpu_name):
-    """Sweep the two issue-17 compile knobs SEPARATELY (never mixing both in one
-    comparison), across loop/ws/ws4:
-
-      Table A — opt-level: fast_math fixed OFF, opt_level in --knob-opt-levels.
-      Table B — fast_math:  opt_level fixed 1, fast_math in {off, on} (ws only;
-                loop = kda_decode has no fast_math).
-
-    Reuses run_config (the validated timing + vs-loop xcheck path), restricted to
-    the knob routes, so only those kernels JIT per (cell, knob-setting). Each row
-    is one (N, T, route); ms + the route's vs-loop out-rmax (a correctness sanity
-    number — the formal gate is the oracle tests). Returns the collected rows so a
-    markdown report can be written.
-    """
-    opt_levels = list(dict.fromkeys(args.knob_opt_levels))  # dedup, keep order
-    route_set = set(_KNOB_ROUTES)
-    cells = [(N, T) for T in args.Ts for N in args.batch_sizes]
-
-    print(f"GPU: {gpu_name}")
-    print("=== Compile-knob sweep (issue 17): opt_level + fast_math, measured SEPARATELY ===")
-    print(f"  Config: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}, "
-          f"tile_v={'heuristic' if args.tile_v is None else args.tile_v}")
-    print(f"  Routes: {', '.join(_KNOB_ROUTES)}.")
-    print(f"  Cells (N x T): N={args.batch_sizes}, T={args.Ts}; opt_levels={opt_levels}")
-    print(f"  Timing: warmup={args.warmup}, rep={args.rep}.")
-    print("  NOTE: every (N,T,route,opt_level/fast_math) is a DISTINCT JIT compile; the big "
-          "ilp=4\n        ws4 kernel at opt-level 2/3 is slow to compile (tens of "
-          "seconds each).\n        Heartbeat lines below show live progress. Smoke first with "
-          "e.g. --batch-sizes 64\n        --Ts 2; drop slow levels via --knob-opt-levels 1 2.\n")
-
-    def _routes_present(res):
-        # routes whose opt1/baseline run produced a real time (ws4 is n/a
-        # at small tile_v); always include loop/ws, drop NaN ms.
-        out = []
-        for r in _KNOB_ROUTES:
-            ms = res.get(_KNOB_MS[r])
-            if ms is not None and ms == ms:  # not None / NaN
-                out.append(r)
-        return out
-
-    n_cells = len(cells)
-
-    # ───────── Table A: opt-level sweep (fast_math OFF) ─────────
-    # Print each cell's rows AS SOON AS its opt-levels finish timing (and a
-    # heartbeat line before every compile), so a compile-heavy sweep shows
-    # continuous progress instead of looking hung during a silent collect phase
-    # (every (N, T, route, opt_level) is a distinct JIT; opt 2/3 of the big
-    # ilp=4 ws4 kernel can each take tens of seconds to compile).
-    lvl_cols = "".join(f"{('opt' + str(L) + ' ms'):>11}" for L in opt_levels)
-    hdrA = (f"{'N':>5} | {'T':>3} | {'route':>7} | {'tile_v':>6} |{lvl_cols} | "
-            f"{'best':>5} | {'best/opt1':>9} | {'vs-loop rmax':>13}")
-    print("── Table A: opt-level (fast_math=OFF) " + "─" * max(0, len(hdrA) - 37))
-    print(hdrA)
-    print("-" * len(hdrA))
-    a_rows = []
-    opt1_by_cell = {}  # (N, T) -> opt_level=1 result (reused for Table B's off column)
-    for ci, (N, T) in enumerate(cells, 1):
-        per = {}
-        for L in opt_levels:
-            print(f"  … [{ci}/{n_cells}] N={N} T={T}: compiling+timing opt{L} (fast_math=off) …",
-                  flush=True)
-            per[L] = run_config(N, T, args.H, args.HV, args.K, args.V, args.tile_v,
-                                args.warmup, args.rep, args.ncu, route_set,
-                                opt_level=L, fast_math=False)
-        if 1 in per:
-            opt1_by_cell[(N, T)] = per[1]
-        base = per[opt_levels[0]]
-        for r in _routes_present(base):
-            ms_by_lvl = {L: per[L].get(_KNOB_MS[r]) for L in opt_levels}
-            valid = {L: m for L, m in ms_by_lvl.items() if m is not None and m == m}
-            best_lvl = min(valid, key=valid.get) if valid else None
-            t1 = ms_by_lvl.get(1) or ms_by_lvl.get(opt_levels[0])
-            best_speedup = (t1 / valid[best_lvl]) if (best_lvl is not None and t1 and t1 == t1) else float("nan")
-            rmax = base.get(_KNOB_RMAX[r]) if r in _KNOB_RMAX else None
-            lvl_str = "".join(f"{_fmt(ms_by_lvl[L], '.4f'):>11}" for L in opt_levels)
-            print(f"{N:5d} | {T:3d} | {r:>7} | {base['tile_v']:6d} |{lvl_str} | "
-                  f"{(str(best_lvl) if best_lvl is not None else 'n/a'):>5} | "
-                  f"{_fmt(best_speedup, '.2f'):>8}x | {_fmt(rmax, '.2e'):>13}", flush=True)
-            a_rows.append({"N": N, "T": T, "route": r, "tile_v": base["tile_v"],
-                           "ms_by_lvl": ms_by_lvl, "best_lvl": best_lvl,
-                           "best_speedup": best_speedup, "rmax": rmax})
-    print()
-
-    # ───────── Table B: fast_math sweep (opt_level = 1) ─────────
-    print("── Table B: fast_math (opt_level=1; loop excluded — kda_decode has no fast_math) "
-          + "─" * 6)
-    # off/on = t_off / t_on = fast_math-on SPEEDUP (>1 => on faster), same
-    # baseline/candidate convention as Table A's best/opt1 (avoids the inverted
-    # "ratio<1 means faster" reading).
-    hdrB = (f"{'N':>5} | {'T':>3} | {'route':>7} | {'tile_v':>6} | {'fm=off ms':>11} | "
-            f"{'fm=on ms':>11} | {'off/on':>7} | {'on rmax':>10} | {'off rmax':>10}")
-    print(hdrB)
-    print("-" * len(hdrB))
-    b_rows = []
-    for ci, (N, T) in enumerate(cells, 1):
-        # Reuse Table A's opt_level=1 / fast_math=off run as the "off" column when
-        # it was swept (identical config); else time it fresh.
-        res_off = opt1_by_cell.get((N, T))
-        if res_off is None:
-            print(f"  … [{ci}/{n_cells}] N={N} T={T}: compiling+timing fast_math=off (opt1) …",
-                  flush=True)
-            res_off = run_config(N, T, args.H, args.HV, args.K, args.V, args.tile_v,
-                                 args.warmup, args.rep, args.ncu, route_set,
-                                 opt_level=1, fast_math=False)
-        print(f"  … [{ci}/{n_cells}] N={N} T={T}: compiling+timing fast_math=on (opt1) …",
-              flush=True)
-        res_on = run_config(N, T, args.H, args.HV, args.K, args.V, args.tile_v,
-                            args.warmup, args.rep, args.ncu, route_set,
-                            opt_level=1, fast_math=True)
-        for r in _routes_present(res_off):
-            if r == "loop":
-                continue  # kda_decode has no fast_math knob
-            t_off = res_off.get(_KNOB_MS[r])
-            t_on = res_on.get(_KNOB_MS[r])
-            # SPEEDUP of fast_math=on over off (>1 => on faster). Matches Table A.
-            speedup = (t_off / t_on) if (t_off and t_on and t_off == t_off and t_on == t_on) else float("nan")
-            rmax_on = res_on.get(_KNOB_RMAX[r])
-            rmax_off = res_off.get(_KNOB_RMAX[r])
-            print(f"{N:5d} | {T:3d} | {r:>7} | {res_off['tile_v']:6d} | "
-                  f"{_fmt(t_off, '.4f'):>11} | {_fmt(t_on, '.4f'):>11} | "
-                  f"{_fmt(speedup, '.3f'):>6}x | {_fmt(rmax_on, '.2e'):>10} | {_fmt(rmax_off, '.2e'):>10}",
-                  flush=True)
-            b_rows.append({"N": N, "T": T, "route": r, "tile_v": res_off["tile_v"],
-                           "t_off": t_off, "t_on": t_on, "speedup": speedup,
-                           "rmax_on": rmax_on, "rmax_off": rmax_off})
-    print()
-
-    # ───────── Headline ─────────
-    print("=== Headline (drives the default-flip decision; lower ms = faster) ===")
-    from collections import Counter
-    import statistics
-    # opt-level: tally + MAGNITUDE (the tally is unweighted — a 0.3% win counts like
-    # a 5% one — so always read it next to the median/max best/opt1 speedup).
-    best_lvl_count = Counter(row["best_lvl"] for row in a_rows if row["best_lvl"] is not None)
-    opt_spd = [row["best_speedup"] for row in a_rows if row["best_speedup"] == row["best_speedup"]]
-    med_opt = statistics.median(opt_spd) if opt_spd else float("nan")
-    max_opt = max(opt_spd) if opt_spd else float("nan")
-    print(f"  opt-level best-pick tally (across {len(a_rows)} route-cells): "
-          + ", ".join(f"opt{L}:{c}" for L, c in sorted(best_lvl_count.items())))
-    print(f"    best/opt1 speedup: median {_fmt(med_opt, '.3f')}x, max {_fmt(max_opt, '.3f')}x — "
-          + ("MARGINAL (within run-to-run noise); keep opt-level=1 (check loop separately: "
-             "opt2/3 can be slightly slower at large N)."
-             if (med_opt == med_opt and med_opt < 1.02)
-             else "a real edge; consider flipping ws (not loop) to the best level."))
-    # fast_math: count + magnitude (off/on > 1 => on faster) + worst precision drift.
-    fm_spd = [row["speedup"] for row in b_rows if row["speedup"] == row["speedup"]]
-    fm_faster = [s for s in fm_spd if s > 1.01]
-    fm_slower = [s for s in fm_spd if s < 0.99]
-    med_fm = statistics.median(fm_spd) if fm_spd else float("nan")
-    max_fm = max(fm_spd) if fm_spd else float("nan")
-    rmax_on_vals = [row["rmax_on"] for row in b_rows if row["rmax_on"] is not None and row["rmax_on"] == row["rmax_on"]]
-    worst_rmax = max(rmax_on_vals) if rmax_on_vals else float("nan")
-    print(f"  fast_math off/on speedup (>1 = on faster): faster in {len(fm_faster)}/{len(b_rows)}, "
-          f"slower in {len(fm_slower)}; median {_fmt(med_fm, '.3f')}x, max {_fmt(max_fm, '.3f')}x.")
-    print(f"    worst fast_math=on vs-loop out-rmax = {_fmt(worst_rmax, '.2e')} "
-          "(precision gate is the oracle tests; this is the in-sweep sanity number).")
-    print()
-
-    if args.output is not None:
-        from benchmarks.bench_kda_decode import normalize_gpu_type
-        if args.output == "__AUTO__":
-            output_path = pathlib.Path(f"BENCHMARK_KDA_DECODE_MTP_KNOBS_{normalize_gpu_type(gpu_name)}.md")
-        else:
-            output_path = pathlib.Path(args.output)
-        _write_knob_sweep_markdown(args, gpu_name, opt_levels, a_rows, b_rows, output_path)
-        print(f"Knob-sweep markdown report written to: {output_path.resolve()}")
-
-    return a_rows, b_rows
-
-
-def _write_knob_sweep_markdown(args, gpu_name, opt_levels, a_rows, b_rows, output_path):
-    """Markdown for --knob-sweep: the two per-knob tables + a note on the scope."""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines = []
-    lines.append(f"# KDA MTP decode — compile-knob sweep ({gpu_name})")
-    lines.append("")
-    lines.append(f"> Auto-generated by `benchmarks/bench_kda_decode_mtp.py --knob-sweep` on {now}.")
-    lines.append(f"> Config: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}; "
-                 f"N={args.batch_sizes}, T={args.Ts}; warmup={args.warmup}, rep={args.rep}.")
-    lines.append(">")
-    lines.append("> Two compile knobs measured SEPARATELY (never both at once): "
-                 "**opt_level** (CuTe DSL `--opt-level`) and **fast_math** (`fastmath=` on "
-                 "ws exp/log/rsqrt). opt-level scope = loop (kda_decode) + ws "
-                 "kernels; fast_math scope = ws only (loop stays no-fastmath). "
-                 "Route-2 `kda_decode_mtp` is out of scope. vs-loop rmax is a correctness "
-                 "sanity number; the formal gate is the oracle tests in `tests/`.")
-    lines.append("")
-    lines.append("## Table A — opt-level (fast_math = OFF)")
-    lines.append("")
-    lvl_h = " | ".join(f"opt{L} ms" for L in opt_levels)
-    lines.append(f"| N | T | route | tile_v | {lvl_h} | best | best/opt1 | vs-loop rmax |")
-    lines.append("|--:|--:|:--|--:|" + "--:|" * len(opt_levels) + "--:|--:|--:|")
-    for row in a_rows:
-        lvl_c = " | ".join(_fmt(row["ms_by_lvl"][L], ".4f") for L in opt_levels)
-        lines.append(f"| {row['N']} | {row['T']} | {row['route']} | {row['tile_v']} | {lvl_c} | "
-                     f"{row['best_lvl']} | {_fmt(row['best_speedup'], '.2f')}x | {_fmt(row['rmax'], '.2e')} |")
-    lines.append("")
-    lines.append("## Table B — fast_math (opt_level = 1; loop excluded)")
-    lines.append("")
-    lines.append("| N | T | route | tile_v | fm=off ms | fm=on ms | off/on (on speedup) | on rmax | off rmax |")
-    lines.append("|--:|--:|:--|--:|--:|--:|--:|--:|--:|")
-    for row in b_rows:
-        lines.append(f"| {row['N']} | {row['T']} | {row['route']} | {row['tile_v']} | "
-                     f"{_fmt(row['t_off'], '.4f')} | {_fmt(row['t_on'], '.4f')} | "
-                     f"{_fmt(row['speedup'], '.3f')}x | {_fmt(row['rmax_on'], '.2e')} | "
-                     f"{_fmt(row['rmax_off'], '.2e')} |")
-    lines.append("")
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-
-
-# ──────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────
 def build_parser():
@@ -1332,39 +1071,6 @@ def build_parser():
         "--sweep-ts", nargs="+", type=int, default=[2, 3, 4, 6],
         help="T (MTP token counts) to sweep with --sweep-config.",
     )
-    # ── issue-17 compile-knob tuning ──────────────────────────────────────
-    parser.add_argument(
-        "--opt-level", type=int, default=1, choices=[1, 2, 3],
-        help="CuTe DSL --opt-level for the in-scope kernels (loop=kda_decode + "
-             "ws/ws4/ws4_smemv/ws_auto). "
-             "Default 1 (the historical pin). Applies to the main + --determinism modes.",
-    )
-    parser.add_argument(
-        "--fast-math", action="store_true",
-        help="Enable fastmath= on the ws transcendentals (exp/log/rsqrt). "
-             "kda_decode (loop) stays no-fastmath. Default off. Applies to the main "
-             "+ --determinism modes. Ignored under --prod-defaults.",
-    )
-    parser.add_argument(
-        "--prod-defaults", action="store_true",
-        help="Run every route at its SHIPPED wrapper default instead of a global "
-             "pin: loop=kda_decode (opt-1, no fast_math), ws=opt-3 + "
-             "fast_math. Use this for the true production-vs-loop comparison (a "
-             "single --opt-level/--fast-math can't be opt1 for loop AND opt3 for "
-             "ws at once). Overrides --opt-level/--fast-math.",
-    )
-    parser.add_argument(
-        "--knob-sweep", action="store_true",
-        help="Sweep the two compile knobs SEPARATELY (never mixing both in one "
-             "comparison): opt_level in {1,2,3} at fast_math=off, AND fast_math in "
-             "{off,on} at opt_level=1, across loop/ws/ws4. Prints one "
-             "table per knob (perf + vs-loop rmax) + a headline. Ignores --opt-level/"
-             "--fast-math (it drives them itself). Optional --output markdown report.",
-    )
-    parser.add_argument(
-        "--knob-opt-levels", nargs="+", type=int, default=[1, 2, 3],
-        help="opt_level values for the --knob-sweep opt-level table (default 1 2 3).",
-    )
     parser.add_argument(
         "--output",
         nargs="?",
@@ -1385,22 +1091,11 @@ def main(argv=None):
     gpu_name = torch.cuda.get_device_name(0)
     route_set = set(args.routes)
 
-    # issue-17 compile-knob sweep is a self-contained mode (drives the knobs itself).
-    if args.knob_sweep:
-        run_knob_sweep(args, gpu_name)
-        return True
-
-    # --prod-defaults => omit the knobs (None) so each route uses its wrapper
-    # default = shipped production config (loop opt1/no-fastmath, ws opt3+fm).
-    eff_opt_level = None if args.prod_defaults else args.opt_level
-    eff_fast_math = None if args.prod_defaults else args.fast_math
-    knob_banner = ("per-route production defaults (loop=opt1/no-fastmath, "
-                   "ws=opt3+fast_math)" if args.prod_defaults
-                   else f"opt_level={args.opt_level}, fast_math={'on' if args.fast_math else 'off'}")
+    # Every route runs at its shipped production config (loop=kda_decode default,
+    # ws=kda_decode_mtp_ws opt_level=3 + fast_math, fixed internally).
     print(f"GPU: {gpu_name}")
     print(f"Config: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}, "
-          f"tile_v={'heuristic' if args.tile_v is None else args.tile_v}, routes={args.routes}, "
-          f"{knob_banner}")
+          f"tile_v={'heuristic' if args.tile_v is None else args.tile_v}, routes={args.routes}")
     print()
 
     if args.determinism:
@@ -1415,8 +1110,7 @@ def main(argv=None):
         for route in det_routes:
             for T in args.Ts:
                 for N in args.batch_sizes:
-                    res = run_determinism(N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.det_iters, route,
-                                          opt_level=eff_opt_level, fast_math=eff_fast_math)
+                    res = run_determinism(N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.det_iters, route)
                     if res.get("skipped"):
                         tag = "SKIP"
                     elif res["passed"]:
@@ -1494,8 +1188,7 @@ def main(argv=None):
     results = []
     for T in args.Ts:
         for N in args.batch_sizes:
-            res = run_config(N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.warmup, args.rep, args.ncu, route_set,
-                             opt_level=eff_opt_level, fast_math=eff_fast_math)
+            res = run_config(N, T, args.H, args.HV, args.K, args.V, args.tile_v, args.warmup, args.rep, args.ncu, route_set)
             results.append(res)
             row = [f"{res['N']:5d}", f"{res['T']:3d}", f"{res['tile_v']:6d}", f"{res['sel_ilp']:7d}"]
             row += [f"{_fmt(res[tk], '.4f'):>10}" for (_, tk, _, _) in sel_cols]
