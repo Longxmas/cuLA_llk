@@ -48,7 +48,7 @@ from cula.kda import (
     kda_decode,
     kda_decode_mtp_ws,
 )
-from cula.ops.kda_decode_mtp_ws import _select_mtp_config, _select_mtp_tile_v
+from cula.ops.kda_decode_mtp import _select_mtp_config, _select_mtp_tile_v
 
 # Trusted single-token reference from the existing decode test. We cross-check
 # our MTP reference against it (pure torch, no kernel) so the MTP oracle is

@@ -106,7 +106,7 @@ from cula.kda import (
     kda_decode,
     kda_decode_mtp_ws,
 )
-from cula.ops.kda_decode_mtp_ws import _select_mtp_config, _select_mtp_tile_v
+from cula.ops.kda_decode_mtp import _select_mtp_config, _select_mtp_tile_v
 
 
 # ──────────────────────────────────────────────────────────────────────

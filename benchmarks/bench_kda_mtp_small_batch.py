@@ -15,7 +15,7 @@ _here = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_here.parent))  # cuLA/
 
 from cula.kda import kda_decode_mtp_ws
-from cula.ops.kda_decode_mtp_small_batch import kda_decode_mtp_small_batch
+from cula.ops.kda_decode_mtp import kda_decode_mtp_small_batch
 
 # CUDA gridDim.z 上限。Triton 把 N*HV 放 z 轴,超过即 launch 失败(cuLA 不受此限)。
 TRITON_MAX_GRID_Z = 65535
