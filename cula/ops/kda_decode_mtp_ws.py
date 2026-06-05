@@ -64,11 +64,6 @@ VEC_SIZE_MTP = 4
 # ilp_rows, use_packed_fma) and cached.
 _compiled_mtp_ws_kernels: dict[tuple, object] = {}
 
-# Gating pre-pass kernels (compute g + beta once per (i_n, i_t, i_hv), used by the
-# ws recurrence kernel when precompute_gating is on). Cached
-# by (N, T, HV, K, softplus_beta, softplus_threshold, opt_level, fast_math).
-_compiled_mtp_gating_kernels: dict[tuple, object] = {}
-
 
 # ---------------------------------------------------------------------------
 # Host-side config helpers (pure-Python; shared by the ws entry point,
@@ -139,188 +134,6 @@ def fma_pair(a1, a2, b1, b2, c1, c2):
     result2 = a2 * b2 + c2
     return result1, result2
 
-@cute.kernel
-def kda_gating_kernel_mtp(
-    A_log: cute.Tensor,  # [HV] fp32
-    a: cute.Tensor,  # [N, T, HV, K] (per-channel decay input)
-    dt_bias: cute.Tensor,  # [HV, K] (per-channel decay bias)
-    b: cute.Tensor,  # [N, T, HV] (update-gate logit)
-    g: cute.Tensor,  # [N, T, HV, K] fp32 OUT — per-channel decay gate
-    beta: cute.Tensor,  # [N, T, HV] fp32 OUT — sigmoid update gate
-    softplus_beta: cutlass.Constexpr[float],
-    softplus_threshold: cutlass.Constexpr[float],
-    HV: cutlass.Constexpr[int],
-    T: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-    fast_math: cutlass.Constexpr[bool],
-):
-    tidx, _, _ = cute.arch.thread_idx()
-    bidx, _, _ = cute.arch.block_idx()
-
-    # Flat CTA index -> (i_n, i_t, i_hv). Layout matches the [N, T, HV] row-major
-    # order so consecutive CTAs over i_hv hit consecutive a/g rows.
-    i_hv = bidx % HV
-    tmp = bidx // HV
-    i_t = tmp % T
-    i_n = tmp // T
-
-    kk = tidx  # block = K threads; this thread owns K-channel kk
-
-    # exp(A_log) is per-head, shared across all K channels (KDA); each thread
-    # recomputes the single value (1 exp) rather than staging it through SMEM.
-    r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
-
-    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(dt_bias[i_hv, kk])
-    beta_x = softplus_beta * x
-    exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
-    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-        cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
-    )
-    use_softplus = (
-        cutlass.Float32(1.0)
-        if beta_x <= softplus_threshold
-        else cutlass.Float32(0.0)
-    )
-    softplus_x = (
-        use_softplus * softplus_val + (cutlass.Float32(1.0) - use_softplus) * x
-    )
-    g[(i_n, i_t, i_hv, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
-
-    # beta = sigmoid(b) is a per-(i_n, i_t, i_hv) scalar — thread 0 writes it.
-    if tidx == 0:
-        r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-        beta[(i_n, i_t, i_hv)] = cutlass.Float32(1.0) / (
-            cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
-        )
-
-
-@cute.jit
-def run_kda_gating_kernel_mtp(
-    A_log: cute.Tensor,
-    a: cute.Tensor,
-    dt_bias: cute.Tensor,
-    b: cute.Tensor,
-    g: cute.Tensor,
-    beta: cute.Tensor,
-    softplus_beta: cutlass.Constexpr[float],
-    softplus_threshold: cutlass.Constexpr[float],
-    HV: cutlass.Constexpr[int],
-    T: cutlass.Constexpr[int],
-    K: cutlass.Constexpr[int],
-    fast_math: cutlass.Constexpr[bool],
-    stream: cuda.CUstream,
-):
-    """Host-side launcher for the gating pre-pass: grid = N*T*HV, block = K."""
-    n = a.layout.shape[0]
-    grid_size = n * T * HV
-    kda_gating_kernel_mtp(
-        A_log,
-        a,
-        dt_bias,
-        b,
-        g,
-        beta,
-        softplus_beta,
-        softplus_threshold,
-        HV,
-        T,
-        K,
-        fast_math,
-    ).launch(
-        grid=(grid_size, 1, 1),
-        block=[K, 1, 1],
-        stream=stream,
-    )
-
-
-def _get_compiled_mtp_gating_kernel(
-    N,
-    T,
-    HV,
-    K,
-    softplus_beta,
-    softplus_threshold,
-    opt_level=1,
-    fast_math=False,
-):
-    key = (N, T, HV, K, softplus_beta, softplus_threshold, opt_level, fast_math)
-    if key in _compiled_mtp_gating_kernels:
-        return _compiled_mtp_gating_kernels[key]
-
-    a = torch.zeros(N, T, HV, K, dtype=torch.bfloat16, device="cuda")
-    b = torch.zeros(N, T, HV, dtype=torch.bfloat16, device="cuda")
-    A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
-    dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
-    g = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
-    beta = torch.zeros(N, T, HV, dtype=torch.float32, device="cuda")
-
-    a_tensor = from_dlpack(a, assumed_align=16)
-    b_tensor = from_dlpack(b, assumed_align=16)
-    A_log_tensor = from_dlpack(A_log, assumed_align=16)
-    dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    g_tensor = from_dlpack(g, assumed_align=16)
-    beta_tensor = from_dlpack(beta, assumed_align=16)
-
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-    compiled_kernel = cute.compile(
-        run_kda_gating_kernel_mtp,
-        A_log_tensor,
-        a_tensor,
-        dt_bias_tensor,
-        b_tensor,
-        g_tensor,
-        beta_tensor,
-        softplus_beta=softplus_beta,
-        softplus_threshold=softplus_threshold,
-        HV=HV,
-        T=T,
-        K=K,
-        fast_math=fast_math,
-        stream=stream,
-        options=f"--enable-tvm-ffi --opt-level {opt_level}",
-    )
-
-    _compiled_mtp_gating_kernels[key] = compiled_kernel
-    logger.info(
-        "CuTe DSL KDA MTP gating pre-pass kernel compiled: "
-        f"N={N}, T={T}, HV={HV}, K={K}, opt_level={opt_level}, fast_math={fast_math}"
-    )
-    return compiled_kernel
-
-
-def _run_mtp_gating_prepass(
-    A_log,
-    a,
-    dt_bias,
-    b,
-    *,
-    N,
-    T,
-    HV,
-    K,
-    softplus_beta,
-    softplus_threshold,
-    opt_level,
-    fast_math,
-    device,
-    stream,
-):
-    g = torch.empty(N, T, HV, K, dtype=torch.float32, device=device)
-    beta = torch.empty(N, T, HV, dtype=torch.float32, device=device)
-    compiled_kernel = _get_compiled_mtp_gating_kernel(
-        N,
-        T,
-        HV,
-        K,
-        softplus_beta,
-        softplus_threshold,
-        opt_level=opt_level,
-        fast_math=fast_math,
-    )
-    compiled_kernel(A_log, a, dt_bias, b, g, beta, stream)
-    return g, beta
-
 
 @cute.kernel
 def kda_verify_kernel_mtp_ws(
@@ -329,15 +142,13 @@ def kda_verify_kernel_mtp_ws(
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
-    A_log: cute.Tensor,  # [HV] fp32 (gating recompute; dummy when precompute_gating)
-    a: cute.Tensor,  # [N, T, HV, K] (per-channel decay input; dummy when precompute)
-    dt_bias: cute.Tensor,  # [HV, K] (per-channel decay bias; dummy when precompute)
+    A_log: cute.Tensor,  # [HV] fp32 (per-channel decay)
+    a: cute.Tensor,  # [N, T, HV, K] (per-channel decay input)
+    dt_bias: cute.Tensor,  # [HV, K] (per-channel decay bias)
     q: cute.Tensor,  # [N, T, H, K]
     k: cute.Tensor,  # [N, T, H, K]
     v: cute.Tensor,  # [N, T, HV, V]
-    b: cute.Tensor,  # [N, T, HV] (update-gate logit; dummy when precompute_gating)
-    g: cute.Tensor,  # [N, T, HV, K] fp32 precomputed decay gate (dummy when not)
-    beta_pre: cute.Tensor,  # [N, T, HV] fp32 precomputed sigmoid gate (dummy when not)
+    b: cute.Tensor,  # [N, T, HV] (update-gate logit)
     o: cute.Tensor,  # [N, T, HV, V] output
     h0_indices: cute.Tensor,  # [N] int32 (state-pool slot per sequence; <0 = pad)
     softplus_beta: cutlass.Constexpr[float],
@@ -354,7 +165,6 @@ def kda_verify_kernel_mtp_ws(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
-    precompute_gating: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -379,11 +189,9 @@ def kda_verify_kernel_mtp_ws(
 
     cache_idx = h0_indices[i_n]
 
-    # exp(A_log) is per-head, shared across all K channels — hoist once. Needed
-    # only on the recompute path (the pre-pass already folds it into g in GMEM).
-    if cutlass.const_expr(not precompute_gating):
-        r_A_log = cutlass.Float32(A_log[i_hv])
-        r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
+    # exp(A_log) is per-head, shared across all K channels — hoist once.
+    r_A_log = cutlass.Float32(A_log[i_hv])
+    r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
 
     # SMEM broadcast buffers (warp 0 -> all warps). sG is [T, K] (per-channel);
     smem = cutlass.utils.SmemAllocator()
@@ -468,43 +276,35 @@ def kda_verify_kernel_mtp_ws(
                     sQ[(i_t, k_start + i)] = r_q[i]
                     sK[(i_t, k_start + i)] = r_k[i]
 
-                if cutlass.const_expr(precompute_gating):
-                    # warp 0 stages this token's g (each lane its vec_size channels)
-                    # + scalar beta from the pre-pass GMEM buffers into SMEM.
-                    for i in cutlass.range_constexpr(vec_size):
-                        kk = k_start + i
-                        sG[(i_t, kk)] = cutlass.Float32(g[i_n, i_t, i_hv, kk])
-                    sBeta[i_t] = cutlass.Float32(beta_pre[i_n, i_t, i_hv])
-                else:
-                    # KDA per-channel decay gate: each lane computes g for its own
-                    # vec_size channels. g[kk] = exp(-exp(A_log) * softplus(a+dt_bias)).
-                    for i in cutlass.range_constexpr(vec_size):
-                        kk = k_start + i
-                        x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(
-                            dt_bias[i_hv, kk]
-                        )
-                        beta_x = softplus_beta * x
-                        exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
-                        softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                            cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
-                        )
-                        use_softplus = (
-                            cutlass.Float32(1.0)
-                            if beta_x <= softplus_threshold
-                            else cutlass.Float32(0.0)
-                        )
-                        softplus_x = (
-                            use_softplus * softplus_val
-                            + (cutlass.Float32(1.0) - use_softplus) * x
-                        )
-                        sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
-
-                    # Update gate beta is a per-(head, token) scalar (warp-uniform).
-                    r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-                    r_beta = cutlass.Float32(1.0) / (
-                        cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
+                # KDA per-channel decay gate: each lane computes g for its own
+                # vec_size channels. g[kk] = exp(-exp(A_log) * softplus(a+dt_bias)).
+                for i in cutlass.range_constexpr(vec_size):
+                    kk = k_start + i
+                    x = cutlass.Float32(a[i_n, i_t, i_hv, kk]) + cutlass.Float32(
+                        dt_bias[i_hv, kk]
                     )
-                    sBeta[i_t] = r_beta
+                    beta_x = softplus_beta * x
+                    exp_beta_x = cute.exp(beta_x, fastmath=fast_math)
+                    softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + exp_beta_x, fastmath=fast_math
+                    )
+                    use_softplus = (
+                        cutlass.Float32(1.0)
+                        if beta_x <= softplus_threshold
+                        else cutlass.Float32(0.0)
+                    )
+                    softplus_x = (
+                        use_softplus * softplus_val
+                        + (cutlass.Float32(1.0) - use_softplus) * x
+                    )
+                    sG[(i_t, kk)] = cute.exp(-r_exp_A * softplus_x, fastmath=fast_math)
+
+                # Update gate beta is a per-(head, token) scalar (warp-uniform).
+                r_b = cutlass.Float32(b[i_n, i_t, i_hv])
+                r_beta = cutlass.Float32(1.0) / (
+                    cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math)
+                )
+                sBeta[i_t] = r_beta
 
                 # Preload the v-tile into SMEM: warp 0 covers tile-local cols 0..31,
                 # warps 1-3 the rest (tidx<tile_v guard -> each col written once).
@@ -1042,8 +842,6 @@ def run_kda_verify_kernel_mtp_ws(
     k: cute.Tensor,
     v: cute.Tensor,
     b: cute.Tensor,
-    g: cute.Tensor,
-    beta_pre: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
     softplus_beta: cutlass.Constexpr[float],
@@ -1062,7 +860,6 @@ def run_kda_verify_kernel_mtp_ws(
     use_packed_fma: cutlass.Constexpr[bool],
     use_smem_v: cutlass.Constexpr[bool],
     cache_intermediate_states: cutlass.Constexpr[bool],
-    precompute_gating: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
@@ -1098,8 +895,6 @@ def run_kda_verify_kernel_mtp_ws(
         k,
         v,
         b,
-        g,
-        beta_pre,
         o,
         h0_indices,
         softplus_beta,
@@ -1116,7 +911,6 @@ def run_kda_verify_kernel_mtp_ws(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
-        precompute_gating,
         fast_math,
     ).launch(
         grid=(grid_size, 1, 1),
@@ -1144,14 +938,12 @@ def _get_compiled_mtp_ws_kernel(
     use_packed_fma,
     use_smem_v,
     cache_intermediate_states,
-    precompute_gating=True,
     opt_level=1,
     fast_math=False,
 ):
     """Get or lazily compile the warp-spec MTP kernel for one shape/config.
 
-    ``opt_level`` (``--opt-level``), ``fast_math``, and ``precompute_gating`` are
-    all part of the cache key.
+    ``opt_level`` (``--opt-level``) and ``fast_math`` are part of the cache key.
     """
     key = (
         N,
@@ -1171,7 +963,6 @@ def _get_compiled_mtp_ws_kernel(
         use_packed_fma,
         use_smem_v,
         cache_intermediate_states,
-        precompute_gating,
         opt_level,
         fast_math,
     )
@@ -1200,20 +991,11 @@ def _get_compiled_mtp_ws_kernel(
     else:
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
 
-    if precompute_gating:
-        g = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
-        beta_pre = torch.zeros(N, T, HV, dtype=torch.float32, device="cuda")
-    else:
-        g = torch.zeros(1, 1, 1, 1, dtype=torch.float32, device="cuda")
-        beta_pre = torch.zeros(1, 1, 1, dtype=torch.float32, device="cuda")
-
     q_tensor = from_dlpack(q, assumed_align=16)
     k_tensor = from_dlpack(k, assumed_align=16)
     v_tensor = from_dlpack(v, assumed_align=16)
     a_tensor = from_dlpack(a, assumed_align=16)
     b_tensor = from_dlpack(b, assumed_align=16)
-    g_tensor = from_dlpack(g, assumed_align=16)
-    beta_pre_tensor = from_dlpack(beta_pre, assumed_align=16)
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
     dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
     h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
@@ -1234,8 +1016,6 @@ def _get_compiled_mtp_ws_kernel(
         k_tensor,
         v_tensor,
         b_tensor,
-        g_tensor,
-        beta_pre_tensor,
         o_tensor,
         h0_indices_tensor,
         softplus_beta=softplus_beta,
@@ -1254,7 +1034,6 @@ def _get_compiled_mtp_ws_kernel(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
-        precompute_gating=precompute_gating,
         fast_math=fast_math,
         stream=stream,
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
@@ -1292,11 +1071,9 @@ def kda_decode_mtp_ws(
     use_packed_fma: bool | None = None,
     use_smem_v: bool | None = None,
     intermediate_states_buffer: torch.Tensor | None = None,
-    use_gate_in_kernel: bool = False,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    precompute_gating = not use_gate_in_kernel
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -1409,27 +1186,6 @@ def kda_decode_mtp_ws(
 
     stream = _get_cached_stream(q.device)
 
-    if precompute_gating:
-        g_buf, beta_buf = _run_mtp_gating_prepass(
-            A_log,
-            a,
-            dt_bias,
-            b,
-            N=N,
-            T=T,
-            HV=HV,
-            K=K,
-            softplus_beta=softplus_beta,
-            softplus_threshold=softplus_threshold,
-            opt_level=opt_level,
-            fast_math=fast_math,
-            device=q.device,
-            stream=stream,
-        )
-    else:
-        g_buf = torch.empty(1, 1, 1, 1, dtype=torch.float32, device=q.device)
-        beta_buf = torch.empty(1, 1, 1, dtype=torch.float32, device=q.device)
-
     compiled_kernel = _get_compiled_mtp_ws_kernel(
         N,
         T,
@@ -1448,7 +1204,6 @@ def kda_decode_mtp_ws(
         use_packed_fma=use_packed_fma,
         use_smem_v=use_smem_v,
         cache_intermediate_states=cache_intermediate_states,
-        precompute_gating=precompute_gating,
         opt_level=opt_level,
         fast_math=fast_math,
     )
@@ -1463,8 +1218,6 @@ def kda_decode_mtp_ws(
         k,
         v,
         b,
-        g_buf,
-        beta_buf,
         o,
         initial_state_indices,
         stream,

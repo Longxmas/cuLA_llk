@@ -337,7 +337,6 @@ def test_kda_mtp_zero_state(T):
 def run_kda_decode_mtp_ws_dense(
     q, k, v, a, b, A_log, dt_bias, state, scale, tile_v=None, ilp_rows=2,
     use_packed_fma=None, use_smem_v=None, opt_level=1, fast_math=False,
-    precompute_gating=True,
 ):
     """Run the warp-specialized fused MTP kernel (kda_decode_mtp_ws), dense vk."""
     N = q.shape[0]
@@ -362,7 +361,6 @@ def run_kda_decode_mtp_ws_dense(
         use_smem_v=use_smem_v,
         opt_level=opt_level,
         fast_math=fast_math,
-        use_gate_in_kernel=not precompute_gating,
     )
     return o, state_source  # (N, T, HV, V), (N, HV, V, K)
 
@@ -402,46 +400,6 @@ def test_kda_decode_mtp_ws_kernel_tile_v(tile_v, T):
 
     _assert_close(f"ws mtp tile_v={tile_v} output", o_ref, o_kernel.float())
     _assert_close(f"ws mtp tile_v={tile_v} final state", state_ref, state_kernel)
-
-
-# Structural fix (issue 17): the gating pre-pass (precompute_gating=True, the
-# shipped default) must be numerically equivalent to recomputing gating in-kernel
-# (precompute_gating=False). The g/beta are fp32 in GMEM and the math is identical
-# under the same fast_math, so the two paths should agree FAR tighter than the
-# bf16-vs-oracle bound — a wrong g would diverge by orders of magnitude more than
-# this. Covers the smoking-gun small-batch configs (N=4) plus a tile_v=8 case.
-@pytest.mark.parametrize(
-    "N,T,tile_v,ilp_rows",
-    [
-        (4, 2, 16, 2),  # heuristic pick for N=4,T<=2 (the 0.78x smoking gun)
-        (4, 4, 32, 4),  # heuristic pick for N=4,T>=3
-        (4, 2, 8, 2),   # smallest tile_v -> max num_v_tiles redundancy removed
-        (16, 4, 32, 4),
-    ],
-)
-def test_kda_decode_mtp_ws_precompute_gating_equivalence(N, T, tile_v, ilp_rows):
-    H, HV, K, V = 8, 16, 128, 128
-    scale = K**-0.5
-    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
-
-    o_pre, state_pre = run_kda_decode_mtp_ws_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale,
-        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, precompute_gating=True,
-    )
-    o_rec, state_rec = run_kda_decode_mtp_ws_dense(
-        q, k, v, a, b, A_log, dt_bias, state, scale,
-        tile_v=tile_v, ilp_rows=ilp_rows, use_packed_fma=False, precompute_gating=False,
-    )
-
-    # Equivalent, not just close: tolerance is ~10x tighter than the oracle bound.
-    _assert_close(
-        f"ws precompute vs recompute output (N={N},T={T},tile_v={tile_v})",
-        o_rec.float(), o_pre.float(), atol=2e-3, rtol=2e-3,
-    )
-    _assert_close(
-        f"ws precompute vs recompute final state (N={N},T={T},tile_v={tile_v})",
-        state_rec, state_pre, atol=2e-3, rtol=2e-3,
-    )
 
 
 @pytest.mark.parametrize("T", [2, 4, 8])

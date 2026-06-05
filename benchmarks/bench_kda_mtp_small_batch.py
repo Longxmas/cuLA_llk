@@ -150,7 +150,7 @@ def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, tile
             initial_state_source=state, initial_state_indices=indices, scale=scale,
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
             tile_v=tile_v, ilp_rows=ilp, use_smem_v=False,
-            disable_state_update=dsu, use_gate_in_kernel=True,  # recompute 分支
+            disable_state_update=dsu,
         )
 
     return call
