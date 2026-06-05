@@ -980,13 +980,13 @@ def _select_aligned_bv(work_units, V, num_sms):
     lane=K butterfly-shuffle 的串行延迟(那是小批病根,软件流水治 load 治不了它)。
 
     B200 实测(N≤8,bench --aligned-bv sweep):BV=8 全程最优或并列——N=1 直接 match
-    lane=V 的 tsl(1.25–1.40x 超 triton),N=8 仍 1.06–1.09x 超 triton(高 occupancy
-    持续藏 lane=K shuffle 延迟,wave 量化代价没咬上来)。BV=16 从不严格最优(N=4 T=4 还
-    掉到 0.85x),不入 auto(仍可手动 --aligned-bv 16)。N≥16 未测,保守回 BV=32(机制上
-    BV=8 大概率仍好,待 sweep 确认后可抬阈值)。"""
+    lane=V 的 tsl(1.25–1.40x 超 triton)。**扩展 sweep(N≤16, T≤8)实证 BV=8 全程碾压
+    BV=32**——连 N=16 都 0.92–1.15x vs BV=32 的 0.64–0.99x。BV=16 从不严格最优(N=4 T=4
+    掉 0.85x),不入 auto(仍可手动 --aligned-bv 16)。N≥32 未测,保守回 BV=32。
+    注:BV 最优可能随「向量化 reduce」优化(消掉逐 V 串行 shuffle 链)后改变,届时重 sweep。"""
     waves32 = work_units * (V // 32) / (num_sms * 12)  # BV=32 的波数(Block Limit Reg≈12)
-    # waves32: N1=0.14 N2=0.28 N4=0.56 N8=1.12 N16=2.25 → 阈值 1.5 让 N≤8 全进 BV8。
-    if V % 8 == 0 and waves32 < 1.5:
+    # waves32: N1=0.14 N2=0.28 N4=0.56 N8=1.12 N16=2.25 N32=4.5 → 阈值 3.0 覆盖 N≤16。
+    if V % 8 == 0 and waves32 < 3.0:
         return 8
     return 32
 
