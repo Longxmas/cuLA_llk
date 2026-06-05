@@ -13,13 +13,12 @@
 # limitations under the License.
 
 from cula.ops.kda_decode import fused_sigmoid_gating_delta_rule_update, kda_decode
-from cula.ops.kda_decode_mtp_ws import kda_decode_mtp_ws, kda_decode_mtp_ws_inline
+from cula.ops.kda_decode_mtp_ws import kda_decode_mtp_ws
 from cula.ops.la_decode import linear_attention_decode
 
 __all__ = [
     "kda_decode",
     "kda_decode_mtp_ws",
-    "kda_decode_mtp_ws_inline",
     "fused_sigmoid_gating_delta_rule_update",
     "linear_attention_decode",
 ]

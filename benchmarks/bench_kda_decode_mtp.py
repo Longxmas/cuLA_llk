@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-bench_kda_decode_mtp.py — perf harness for KDA MTP decode (ws / inline vs looped).
+bench_kda_decode_mtp.py — perf harness for KDA MTP decode (ws vs looped).
 
 Compares routes that compute the SAME T-token recurrence:
   1. looped : T sequential single-token kda_decode launches (state carried over).
@@ -42,7 +42,7 @@ speedups vs looped, and the **ws4-vs-ws** head-to-head (the ilp=4-vs-ilp=2 win).
 Also cross-checks each route's output/state against the looped route (rel error)
 as a sanity gate.
 
-Pass --routes to restrict which of {loop,ws,ws4,ws4_smemv,ws_auto,inline,inline4}
+Pass --routes to restrict which of {loop,ws,ws4,ws4_smemv,ws_auto}
 run (default: all).
 
 A bit-for-bit determinism check (--determinism) re-runs a state-writeback kernel
@@ -67,10 +67,10 @@ subset via --sweep-hvs/--sweep-ns/--sweep-ts. Writes a markdown report (winner t
 
 --knob-sweep tunes the two issue-17 COMPILE knobs SEPARATELY (never mixing both in a
 single comparison): opt_level (CuTe DSL --opt-level) and fast_math (fastmath= on the
-ws/inline exp/log/rsqrt). It prints Table A = opt_level in {1,2,3} at fast_math=off,
-and Table B = fast_math in {off,on} at opt_level=1, across loop/ws/ws4/inline/inline4
-(loop=kda_decode has no fast_math). opt-level scope is the 3
-kernels (loop single-token + ws + inline); fast_math scope is ws/inline only. The
+ws exp/log/rsqrt). It prints Table A = opt_level in {1,2,3} at fast_math=off,
+and Table B = fast_math in {off,on} at opt_level=1, across loop/ws/ws4
+(loop=kda_decode has no fast_math). opt-level scope is the 2
+kernels (loop single-token + ws); fast_math scope is ws only. The
 --opt-level/--fast-math flags (without --knob-sweep) instead pin ONE setting for the
 main + --determinism modes, so a setting can be A/B'd by re-running. Defaults
 (opt_level=1, fast_math=off) reproduce the validated build.
@@ -92,9 +92,9 @@ Usage:
     python benchmarks/bench_kda_decode_mtp.py --sweep-config                  # full KDA config sweep
     python benchmarks/bench_kda_decode_mtp.py --sweep-config --sweep-hvs 64 --sweep-ns 64 256 --sweep-ts 2 4
     python benchmarks/bench_kda_decode_mtp.py --knob-sweep --batch-sizes 1 2 64 256 --Ts 2 4   # opt_level + fast_math, separately
-    python benchmarks/bench_kda_decode_mtp.py --prod-defaults                  # ws/inline (opt3+fast_math) vs loop, shipped config
+    python benchmarks/bench_kda_decode_mtp.py --prod-defaults                  # ws (opt3+fast_math) vs loop, shipped config
     python benchmarks/bench_kda_decode_mtp.py --opt-level 3                    # pin opt_level 3 for the main table
-    python benchmarks/bench_kda_decode_mtp.py --fast-math --routes loop ws4 inline4            # pin fast_math on
+    python benchmarks/bench_kda_decode_mtp.py --fast-math --routes loop ws4            # pin fast_math on
     python benchmarks/bench_kda_decode_mtp.py --output
 
 Note:
@@ -118,7 +118,6 @@ from benchmarks.utils import benchmark_cuda_fn, relative_rms_error_rel_max
 from cula.kda import (
     kda_decode,
     kda_decode_mtp_ws,
-    kda_decode_mtp_ws_inline,
 )
 from cula.ops.kda_decode_mtp_ws import _select_mtp_config, _select_mtp_tile_v
 
@@ -141,25 +140,24 @@ def make_inputs_mtp(N, T, H, HV, K, V, device="cuda", seed=42):
 
 
 def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level=1, fast_math=False):
-    """Build the ws/inline + looped callables, their state buffers, and setup fns.
+    """Build the ws + looped callables, their state buffers, and setup fns.
 
     Returns a dict with keys: call_<route>, setup_<route>, state_<route> for each
-    of ws/ws4/ws4_smemv/ws_auto/inline/inline4/loop (the live buffers, mutated
-    in-place).
+    of ws/ws4/ws4_smemv/ws_auto/loop (the live buffers, mutated in-place).
 
     ``opt_level`` (CuTe DSL --opt-level) and ``fast_math`` (fastmath= on the
     transcendentals) are the issue-17 compile knobs. They are applied to the
     routes in their scope: ``opt_level`` to loop (single-token kda_decode) +
-    ws/ws4/ws4_smemv/ws_auto + inline/inline4; ``fast_math`` to the ws/inline
-    routes only (loop = kda_decode stays no-fastmath). Defaults (1, False)
-    reproduce the validated build.
+    ws/ws4/ws4_smemv/ws_auto; ``fast_math`` to the ws routes only (loop =
+    kda_decode stays no-fastmath). Defaults (1, False) reproduce the validated
+    build.
 
     Either knob may be ``None`` => omit it from the call so the wrapper's OWN
     default applies. With both None (the bench ``--prod-defaults`` mode) every
     route runs at its SHIPPED production config: loop = kda_decode opt-1/no
-    fast_math, ws/inline = opt-3 + fast_math — so the vs-loop columns are a true
+    fast_math, ws = opt-3 + fast_math — so the vs-loop columns are a true
     production-vs-production comparison (a single global opt_level/fast_math
-    cannot express loop@opt1 + ws/inline@opt3 at once).
+    cannot express loop@opt1 + ws@opt3 at once).
     """
     N, T = q.shape[0], q.shape[1]
     device = q.device
@@ -288,63 +286,6 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
     def setup_ws_auto():
         state_ws_auto.copy_(state_init)
 
-    # --- inline route (Route 1, inline variant): same warp-spec contract but the
-    # INLINE kernel (no warp-0 staging / Phase-1 barrier, deferred L2 norm,
-    # register-resident q/k/g/beta — FlashInfer's small-batch path). ilp=2,
-    # use_smem_v pinned off so inline/ws is an apples-to-apples staging swap at the
-    # SAME config; the head-to-head inline/ws answers "does the inline staging win
-    # at small work_units?" (its design target). ---
-    state_inline = state_init.clone()
-
-    def call_inline():
-        return kda_decode_mtp_ws_inline(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            initial_state_source=state_inline,
-            initial_state_indices=indices,
-            scale=scale,
-            use_qk_l2norm_in_kernel=True,
-            tile_v=tile_v,
-            ilp_rows=2,
-            use_smem_v=False,
-            **mtp_kw,
-        )
-
-    def setup_inline():
-        state_inline.copy_(state_init)
-
-    # --- inline4 route (inline variant, ilp=4): the inline kernel's 4-row ILP path
-    # (scalar FMA + deferred L2 norm — no packed-FMA/double-accum, unlike ws4).
-    # Head-to-head inline4/ws4. Gated on ws4_ok (same tile_v//4 %4 constraint). ---
-    state_inline4 = state_init.clone()
-
-    def call_inline4():
-        return kda_decode_mtp_ws_inline(
-            A_log=A_log,
-            dt_bias=dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=a,
-            b=b,
-            initial_state_source=state_inline4,
-            initial_state_indices=indices,
-            scale=scale,
-            use_qk_l2norm_in_kernel=True,
-            tile_v=tile_v,
-            ilp_rows=4,
-            use_smem_v=False,
-            **mtp_kw,
-        )
-
-    def setup_inline4():
-        state_inline4.copy_(state_init)
-
     # --- looped route: T single-token launches, state carried in-place ---
     # Pre-slice per-token tensors once (outside the timed loop) so only the T
     # kernel launches are counted.
@@ -388,18 +329,12 @@ def _build_routes(q, k, v, a, b, A_log, dt_bias, state, scale, tile_v, opt_level
         "setup_ws4_smemv": setup_ws4_smemv,
         "call_ws_auto": call_ws_auto,
         "setup_ws_auto": setup_ws_auto,
-        "call_inline": call_inline,
-        "setup_inline": setup_inline,
-        "call_inline4": call_inline4,
-        "setup_inline4": setup_inline4,
         "call_loop": call_loop,
         "setup_loop": setup_loop,
         "state_ws": state_ws,
         "state_ws4": state_ws4,
         "state_ws4_smemv": state_ws4_smemv,
         "state_ws_auto": state_ws_auto,
-        "state_inline": state_inline,
-        "state_inline4": state_inline4,
         "state_loop": state_loop,
         "state_init": state_init,
     }
@@ -432,13 +367,13 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
     # when ilp=4 is invalid for this tile_v.
     active = [
         r
-        for r in ("loop", "ws", "ws_auto", "ws4", "ws4_smemv", "inline", "inline4")
-        if r in route_set and (r not in ("ws4", "ws4_smemv", "inline4") or ws4_ok)
+        for r in ("loop", "ws", "ws_auto", "ws4", "ws4_smemv")
+        if r in route_set and (r not in ("ws4", "ws4_smemv") or ws4_ok)
     ]
     corr_routes = [r for r in active if r != "loop"]
 
     # Correctness reference = looped single-token route (always run once, fresh
-    # state). Each ws/ws4/inline route is cross-checked against it (rel error).
+    # state). Each ws/ws4 route is cross-checked against it (rel error).
     nan2 = (float("nan"), float("nan"))
     corr = {}  # route name -> (out_rel_max, state_rel_max)
     with torch.no_grad():
@@ -478,8 +413,6 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
     t_ws, t_ws4 = times.get("ws"), times.get("ws4")
     t_ws_auto = times.get("ws_auto")
     t_ws4_smemv = times.get("ws4_smemv")
-    t_inline = times.get("inline")
-    t_inline4 = times.get("inline4")
     return {
         "N": N,
         "T": T,
@@ -512,21 +445,6 @@ def run_config(N, T, H, HV, K, V, tile_v_override, warmup, rep, ncu_mode, route_
         # Stage C: use_smem_v win over plain ilp=4. >1 -> smem_v faster (expected
         # at large batch / tile_v=64 from the coalesced merged writeback).
         "ws4_smemv_vs_ws4": ratio(t_ws4, t_ws4_smemv),
-        # Inline variant (small-batch path). t_inline=ilp2 (vs ws), t_inline4=ilp4
-        # (vs ws4). >1 means the inline staging beats warp-spec at this config —
-        # expected to surface only at small work_units (its design target).
-        "t_inline_ms": t_inline,
-        "t_inline4_ms": t_inline4,
-        "inline_mtok_s": mtok(t_inline),
-        "inline4_mtok_s": mtok(t_inline4),
-        "inline_speedup": speedup_vs_loop(t_inline),  # vs looped
-        "inline4_speedup": speedup_vs_loop(t_inline4),  # vs looped
-        "inline_vs_ws": ratio(t_ws, t_inline),  # >1 -> inline faster than ws (ilp=2)
-        "inline4_vs_ws4": ratio(t_ws4, t_inline4),  # >1 -> inline4 faster than ws4
-        "inline_out_rel_max": corr.get("inline", nan2)[0],
-        "inline_state_rel_max": corr.get("inline", nan2)[1],
-        "inline4_out_rel_max": corr.get("inline4", nan2)[0],
-        "inline4_state_rel_max": corr.get("inline4", nan2)[1],
         "ws_out_rel_max": corr.get("ws", nan2)[0],
         "ws_state_rel_max": corr.get("ws", nan2)[1],
         "ws4_out_rel_max": corr.get("ws4", nan2)[0],
@@ -549,8 +467,8 @@ def run_determinism(N, T, H, HV, K, V, tile_v_override, det_iters, route,
     q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V, device)
     tile_v = tile_v_override if tile_v_override is not None else _select_mtp_tile_v(N, HV, V, T)
 
-    # ws4 / ws4_smemv / inline4 (ilp=4) require (tile_v//4)%4==0; skip otherwise.
-    if route in ("ws4", "ws4_smemv", "inline4") and (tile_v // 4) % 4 != 0:
+    # ws4 / ws4_smemv (ilp=4) require (tile_v//4)%4==0; skip otherwise.
+    if route in ("ws4", "ws4_smemv") and (tile_v // 4) % 4 != 0:
         return {"N": N, "T": T, "tile_v": tile_v, "iters": 0, "route": route,
                 "passed": True, "first_bad": -1, "skipped": True}
 
@@ -942,7 +860,7 @@ def write_markdown_report(args, gpu_name, results, output_path):
         return f"avg={sum(vals) / len(vals):.2f}x, min={min(vals):.2f}x, max={max(vals):.2f}x"
 
     lines = []
-    lines.append("# Benchmark Results - KDA MTP Decode (ws / inline vs looped single-token)")
+    lines.append("# Benchmark Results - KDA MTP Decode (ws vs looped single-token)")
     lines.append("")
     lines.append(f"> Auto-generated by `benchmarks/bench_kda_decode_mtp.py` on {now}.")
     lines.append("")
@@ -967,8 +885,6 @@ def write_markdown_report(args, gpu_name, results, output_path):
     lines.append(f"- ws_auto-vs-looped speedup: {summary([r['ws_auto_speedup'] for r in results])}  (production default; ilp picked by heuristic — see 'sel ilp')")
     lines.append(f"- **ws4-vs-ws (ilp4/ilp2): {summary([r['ws4_vs_ws'] for r in results])}**  (>1 → ilp=4 wins)")
     lines.append(f"- **ws4_smemv-vs-ws4 (Stage C use_smem_v): {summary([r['ws4_smemv_vs_ws4'] for r in results])}**  (>1 → use_smem_v wins; expect at large batch / tile_v=64)")
-    lines.append(f"- **inline-vs-ws (inline variant, ilp=2): {summary([r['inline_vs_ws'] for r in results])}**  (>1 → inline staging wins; expect at small work_units = N*HV)")
-    lines.append(f"- **inline4-vs-ws4 (inline variant, ilp=4): {summary([r['inline4_vs_ws4'] for r in results])}**  (>1 → inline wins)")
     lines.append(f"- Batch sizes (N): {args.batch_sizes}")
     lines.append(f"- T values: {args.Ts}")
     lines.append(f"- tile_v: {'heuristic (work_units=N*HV)' if args.tile_v is None else args.tile_v}")
@@ -1146,21 +1062,19 @@ def write_sweep_markdown_report(args, gpu_name, cells, output_path):
 # ──────────────────────────────────────────────────────────────────────
 # Compile-knob sweep (issue 17): opt_level + fast_math, measured SEPARATELY
 # ──────────────────────────────────────────────────────────────────────
-_KNOB_ROUTES = ("loop", "ws", "ws4", "inline", "inline4")
-_KNOB_MS = {"loop": "t_loop_ms", "ws": "t_ws_ms", "ws4": "t_ws4_ms",
-            "inline": "t_inline_ms", "inline4": "t_inline4_ms"}
+_KNOB_ROUTES = ("loop", "ws", "ws4")
+_KNOB_MS = {"loop": "t_loop_ms", "ws": "t_ws_ms", "ws4": "t_ws4_ms"}
 # vs-loop output rel-max per route (loop has none — it IS the reference).
-_KNOB_RMAX = {"ws": "ws_out_rel_max", "ws4": "ws4_out_rel_max",
-              "inline": "inline_out_rel_max", "inline4": "inline4_out_rel_max"}
+_KNOB_RMAX = {"ws": "ws_out_rel_max", "ws4": "ws4_out_rel_max"}
 
 
 def run_knob_sweep(args, gpu_name):
     """Sweep the two issue-17 compile knobs SEPARATELY (never mixing both in one
-    comparison), across loop/ws/ws4/inline/inline4:
+    comparison), across loop/ws/ws4:
 
       Table A — opt-level: fast_math fixed OFF, opt_level in --knob-opt-levels.
-      Table B — fast_math:  opt_level fixed 1, fast_math in {off, on} (ws/inline
-                only; loop = kda_decode has no fast_math).
+      Table B — fast_math:  opt_level fixed 1, fast_math in {off, on} (ws only;
+                loop = kda_decode has no fast_math).
 
     Reuses run_config (the validated timing + vs-loop xcheck path), restricted to
     the knob routes, so only those kernels JIT per (cell, knob-setting). Each row
@@ -1180,13 +1094,13 @@ def run_knob_sweep(args, gpu_name):
     print(f"  Cells (N x T): N={args.batch_sizes}, T={args.Ts}; opt_levels={opt_levels}")
     print(f"  Timing: warmup={args.warmup}, rep={args.rep}.")
     print("  NOTE: every (N,T,route,opt_level/fast_math) is a DISTINCT JIT compile; the big "
-          "ilp=4\n        ws4/inline4 kernels at opt-level 2/3 are slow to compile (tens of "
+          "ilp=4\n        ws4 kernel at opt-level 2/3 is slow to compile (tens of "
           "seconds each).\n        Heartbeat lines below show live progress. Smoke first with "
           "e.g. --batch-sizes 64\n        --Ts 2; drop slow levels via --knob-opt-levels 1 2.\n")
 
     def _routes_present(res):
-        # routes whose opt1/baseline run produced a real time (ws4/inline4 are n/a
-        # at small tile_v); always include loop/ws/inline, drop NaN ms.
+        # routes whose opt1/baseline run produced a real time (ws4 is n/a
+        # at small tile_v); always include loop/ws, drop NaN ms.
         out = []
         for r in _KNOB_ROUTES:
             ms = res.get(_KNOB_MS[r])
@@ -1201,7 +1115,7 @@ def run_knob_sweep(args, gpu_name):
     # heartbeat line before every compile), so a compile-heavy sweep shows
     # continuous progress instead of looking hung during a silent collect phase
     # (every (N, T, route, opt_level) is a distinct JIT; opt 2/3 of the big
-    # ilp=4 ws4/inline4 kernels can each take tens of seconds to compile).
+    # ilp=4 ws4 kernel can each take tens of seconds to compile).
     lvl_cols = "".join(f"{('opt' + str(L) + ' ms'):>11}" for L in opt_levels)
     hdrA = (f"{'N':>5} | {'T':>3} | {'route':>7} | {'tile_v':>6} |{lvl_cols} | "
             f"{'best':>5} | {'best/opt1':>9} | {'vs-loop rmax':>13}")
@@ -1297,7 +1211,7 @@ def run_knob_sweep(args, gpu_name):
           + ("MARGINAL (within run-to-run noise); keep opt-level=1 (check loop separately: "
              "opt2/3 can be slightly slower at large N)."
              if (med_opt == med_opt and med_opt < 1.02)
-             else "a real edge; consider flipping ws/inline (not loop) to the best level."))
+             else "a real edge; consider flipping ws (not loop) to the best level."))
     # fast_math: count + magnitude (off/on > 1 => on faster) + worst precision drift.
     fm_spd = [row["speedup"] for row in b_rows if row["speedup"] == row["speedup"]]
     fm_faster = [s for s in fm_spd if s > 1.01]
@@ -1336,8 +1250,8 @@ def _write_knob_sweep_markdown(args, gpu_name, opt_levels, a_rows, b_rows, outpu
     lines.append(">")
     lines.append("> Two compile knobs measured SEPARATELY (never both at once): "
                  "**opt_level** (CuTe DSL `--opt-level`) and **fast_math** (`fastmath=` on "
-                 "ws/inline exp/log/rsqrt). opt-level scope = loop (kda_decode) + ws + inline "
-                 "kernels; fast_math scope = ws/inline only (loop stays no-fastmath). "
+                 "ws exp/log/rsqrt). opt-level scope = loop (kda_decode) + ws "
+                 "kernels; fast_math scope = ws only (loop stays no-fastmath). "
                  "Route-2 `kda_decode_mtp` is out of scope. vs-loop rmax is a correctness "
                  "sanity number; the formal gate is the oracle tests in `tests/`.")
     lines.append("")
@@ -1368,7 +1282,7 @@ def _write_knob_sweep_markdown(args, gpu_name, opt_levels, a_rows, b_rows, outpu
 # Main
 # ──────────────────────────────────────────────────────────────────────
 def build_parser():
-    parser = argparse.ArgumentParser(description="Benchmark KDA MTP decode: ws/inline vs T× single-token")
+    parser = argparse.ArgumentParser(description="Benchmark KDA MTP decode: ws vs T× single-token")
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 4, 16, 64, 256])
     parser.add_argument("--Ts", nargs="+", type=int, default=[2, 4], help="MTP token counts to benchmark")
     parser.add_argument("--H", type=int, default=16, help="Q/K head count")
@@ -1382,13 +1296,11 @@ def build_parser():
     parser.add_argument(
         "--routes",
         nargs="+",
-        choices=["loop", "ws", "ws4", "ws4_smemv", "ws_auto", "inline", "inline4"],
-        default=["loop", "ws", "ws_auto", "ws4", "ws4_smemv", "inline", "inline4"],
+        choices=["loop", "ws", "ws4", "ws4_smemv", "ws_auto"],
+        default=["loop", "ws", "ws_auto", "ws4", "ws4_smemv"],
         help="Which routes to run/time. loop=T× single-token, "
         "ws=kda_decode_mtp_ws ilp=2, ws4=kda_decode_mtp_ws ilp=4 (skipped when tile_v//4 not %4), "
-        "ws_auto=kda_decode_mtp_ws ilp_rows=None (production default; heuristic picks ilp), "
-        "inline=kda_decode_mtp_ws_inline ilp=2 (inline variant, head-to-head vs ws), "
-        "inline4=inline ilp=4 (vs ws4; skipped when tile_v//4 not %4).",
+        "ws_auto=kda_decode_mtp_ws ilp_rows=None (production default; heuristic picks ilp).",
     )
     parser.add_argument("--determinism", action="store_true", help="Run bit-for-bit determinism check instead of timing")
     parser.add_argument("--det-iters", type=int, default=10000, help="Determinism check repetitions per config")
@@ -1424,28 +1336,28 @@ def build_parser():
     parser.add_argument(
         "--opt-level", type=int, default=1, choices=[1, 2, 3],
         help="CuTe DSL --opt-level for the in-scope kernels (loop=kda_decode + "
-             "ws/ws4/ws4_smemv/ws_auto + inline/inline4). "
+             "ws/ws4/ws4_smemv/ws_auto). "
              "Default 1 (the historical pin). Applies to the main + --determinism modes.",
     )
     parser.add_argument(
         "--fast-math", action="store_true",
-        help="Enable fastmath= on the ws/inline transcendentals (exp/log/rsqrt). "
+        help="Enable fastmath= on the ws transcendentals (exp/log/rsqrt). "
              "kda_decode (loop) stays no-fastmath. Default off. Applies to the main "
              "+ --determinism modes. Ignored under --prod-defaults.",
     )
     parser.add_argument(
         "--prod-defaults", action="store_true",
         help="Run every route at its SHIPPED wrapper default instead of a global "
-             "pin: loop=kda_decode (opt-1, no fast_math), ws/inline=opt-3 + "
+             "pin: loop=kda_decode (opt-1, no fast_math), ws=opt-3 + "
              "fast_math. Use this for the true production-vs-loop comparison (a "
              "single --opt-level/--fast-math can't be opt1 for loop AND opt3 for "
-             "ws/inline at once). Overrides --opt-level/--fast-math.",
+             "ws at once). Overrides --opt-level/--fast-math.",
     )
     parser.add_argument(
         "--knob-sweep", action="store_true",
         help="Sweep the two compile knobs SEPARATELY (never mixing both in one "
              "comparison): opt_level in {1,2,3} at fast_math=off, AND fast_math in "
-             "{off,on} at opt_level=1, across loop/ws/ws4/inline/inline4. Prints one "
+             "{off,on} at opt_level=1, across loop/ws/ws4. Prints one "
              "table per knob (perf + vs-loop rmax) + a headline. Ignores --opt-level/"
              "--fast-math (it drives them itself). Optional --output markdown report.",
     )
@@ -1479,11 +1391,11 @@ def main(argv=None):
         return True
 
     # --prod-defaults => omit the knobs (None) so each route uses its wrapper
-    # default = shipped production config (loop opt1/no-fastmath, ws/inline opt3+fm).
+    # default = shipped production config (loop opt1/no-fastmath, ws opt3+fm).
     eff_opt_level = None if args.prod_defaults else args.opt_level
     eff_fast_math = None if args.prod_defaults else args.fast_math
     knob_banner = ("per-route production defaults (loop=opt1/no-fastmath, "
-                   "ws/inline=opt3+fast_math)" if args.prod_defaults
+                   "ws=opt3+fast_math)" if args.prod_defaults
                    else f"opt_level={args.opt_level}, fast_math={'on' if args.fast_math else 'off'}")
     print(f"GPU: {gpu_name}")
     print(f"Config: H={args.H}, HV={args.HV}, K={args.K}, V={args.V}, "
@@ -1492,9 +1404,9 @@ def main(argv=None):
     print()
 
     if args.determinism:
-        det_routes = [r for r in args.routes if r in ("ws", "ws4", "ws4_smemv", "ws_auto", "inline", "inline4")]
+        det_routes = [r for r in args.routes if r in ("ws", "ws4", "ws4_smemv", "ws_auto")]
         if not det_routes:
-            print("No state-writeback route selected (--routes must include ws, ws4, ws4_smemv, ws_auto, inline, and/or inline4 for --determinism).")
+            print("No state-writeback route selected (--routes must include ws, ws4, ws4_smemv, and/or ws_auto for --determinism).")
             return True
         hdr = f"{'route':>6} | {'N':>5} | {'T':>3} | {'tile_v':>6} | {'iters':>8} | {'result':>8}"
         print(hdr)
@@ -1547,7 +1459,7 @@ def main(argv=None):
         return True
 
     # Dynamic head-to-head table: every column follows the selected --routes, so
-    # e.g. `--routes loop ws4 inline inline4` drops the ws/ws4sv/wsAuto ms
+    # e.g. `--routes loop ws4` drops the ws/ws4sv/wsAuto ms
     # columns AND every comparison that involves them (an h2h shows only when BOTH
     # of its routes are selected; a route's vs-loop speedup + out-rmax show only
     # when that route is selected). One ms col + one /loop speedup + one out-rmax
@@ -1559,15 +1471,11 @@ def main(argv=None):
         ("ws_auto", "t_ws_auto_ms", "ws_auto_speedup", "wsAuto"),
         ("ws4", "t_ws4_ms", "ws4_speedup", "ws4"),
         ("ws4_smemv", "t_ws4_smemv_ms", "ws4_smemv_speedup", "ws4sv"),
-        ("inline", "t_inline_ms", "inline_speedup", "inline"),
-        ("inline4", "t_inline4_ms", "inline4_speedup", "inline4"),
     ]
     # (result_key, label, routes_required)
     H2H = [
         ("ws4_vs_ws", "ws4/ws", ("ws4", "ws")),
         ("ws4_smemv_vs_ws4", "ws4sv/ws4", ("ws4_smemv", "ws4")),
-        ("inline_vs_ws", "inl/ws", ("inline", "ws")),
-        ("inline4_vs_ws4", "inl4/ws4", ("inline4", "ws4")),
     ]
     sel_cols = [c for c in ROUTE_COLS if c[0] in route_set]
     sel_speed = [c for c in sel_cols if c[2] is not None]  # speedup vs loop
