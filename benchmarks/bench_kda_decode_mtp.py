@@ -91,8 +91,9 @@ def warmup(fn, n):
     torch.cuda.synchronize()
 
 
-def t_graph_ms(fn, warmup_iters, rep):
-    """Kernel-only 计时:CUDA graph capture + replay,纯 device kernel(wrapper/launcher 全移除);dsu 须 True 保证 replay 幂等。"""
+def t_graph_ms(fn, warmup_iters, rep, graph_calls=1):
+    """Kernel-only 计时:CUDA graph capture + replay,纯 device kernel(wrapper/launcher 全移除);dsu 须 True 保证 replay 幂等。
+    graph_calls>1:graph 内连发 K 次 op,放大 per-op 信号、摊薄固定量化/overhead(幂等才合法)。"""
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -102,7 +103,8 @@ def t_graph_ms(fn, warmup_iters, rep):
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        fn()
+        for _ in range(graph_calls):
+            fn()
     for _ in range(10):
         g.replay()
     torch.cuda.synchronize()
@@ -113,7 +115,7 @@ def t_graph_ms(fn, warmup_iters, rep):
         g.replay()
     end.record()
     torch.cuda.synchronize()
-    return start.elapsed_time(end) / rep
+    return start.elapsed_time(end) / rep / graph_calls
 
 
 # small_batch 的 opt_level / fast_math / k_split,由 main() 从 CLI 设置。
@@ -207,6 +209,7 @@ def main():
     ap.add_argument("--V", type=int, default=128)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--rep", type=int, default=300)
+    ap.add_argument("--graph-calls", type=int, default=1, help="graph 内连发 K 次 op(放大信号、摊薄量化);dsu=True 幂等才合法")
     ap.add_argument("--check", action="store_true", help="只数值校验,不计时")
     ap.add_argument("--check-cases", type=str, nargs="+", default=["1:2", "4:4"],
                     help="精度校验只跑这些 N:T 样例(默认 2 个角点,覆盖最小/最大 T 的累加深度;"
@@ -331,7 +334,7 @@ def main():
                                        state0.clone(), indices, scale, True)
                 try:
                     warmup(tri, args.warmup)
-                    tg_tri = t_graph_ms(tri, 3, args.rep)
+                    tg_tri = t_graph_ms(tri, 3, args.rep, args.graph_calls)
                 except Exception as e:
                     print(f"{N:>4} {T:>3} | triton FAIL: {str(e)[:50]}")
 
@@ -348,7 +351,7 @@ def main():
             for name, fn_obj in makers.items():
                 try:
                     warmup(fn_obj, args.warmup)
-                    tg[name] = t_graph_ms(fn_obj, 3, args.rep)
+                    tg[name] = t_graph_ms(fn_obj, 3, args.rep, args.graph_calls)
                 except Exception as e:
                     tg[name] = None
                     print(f"{N:>4} {T:>3} | {name} FAIL: {str(e)[:50]}")
