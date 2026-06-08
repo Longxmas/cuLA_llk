@@ -1,6 +1,7 @@
 """对照 small_batch(vk/kv)/ws-auto/auto-dispatch vs triton + loop(T× 单 token kda_decode)。
 数值校验(max|Δ| 阈值 5e-2,以 triton 为基准)+ 性能(kernel-only CUDA graph t_graph)。
-用法:python benchmarks/bench_kda_decode_mtp.py [--batch-sizes ... --Ts ... --check]
+--dsu 0 测真实 decode(写回 state);--intermediate 1 给 vk/ws 传 snapshot buffer(triton 基线不传)。
+用法:python benchmarks/bench_kda_decode_mtp.py [--batch-sizes ... --Ts ... --check --dsu 0 --intermediate 1]
 """
 
 import argparse
@@ -72,13 +73,13 @@ def to_triton_varlen(q, k, v, a, b):
     return q_t, k_t, v_t, a_t, b_t, cu_seqlens
 
 
-def make_triton_call(qt, kt, vt, at, bt, cu_seqlens, A_log, dt_bias, state, indices, scale, dsu):
+def make_triton_call(qt, kt, vt, at, bt, cu_seqlens, A_log, dt_bias, state, indices, scale, dsu, inter=None):
     def call():
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log, a=at, dt_bias=dt_bias, softplus_beta=1.0, softplus_threshold=20.0,
             q=qt, k=kt, v=vt, b=bt, initial_state_source=state, initial_state_indices=indices,
             scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens, is_kda=True,
-            disable_state_update=dsu, intermediate_states_buffer=None,
+            disable_state_update=dsu, intermediate_states_buffer=inter,
             retrieve_parent_token=None, lower_bound=None,
         )
 
@@ -91,8 +92,10 @@ def warmup(fn, n):
     torch.cuda.synchronize()
 
 
-def t_graph_ms(fn, warmup_iters, rep):
-    """Kernel-only 计时:CUDA graph capture + replay,纯 device kernel(wrapper/launcher 全移除);dsu 须 True 保证 replay 幂等。"""
+def t_graph_ms(fn, warmup_iters, rep, rounds=5):
+    """Kernel-only 计时:CUDA graph capture + replay,纯 device kernel(wrapper/launcher 全移除)。
+    rounds 轮、每轮 rep 次 replay 的均值,再对 rounds 轮取平均(代表典型性能;比单窗口稳,比 min 不乐观)。
+    dsu=False(写回 state)/intermediate(写 snapshot)时 replay 非幂等(state 漂移),但每次算量不变,计时有效。"""
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
@@ -108,12 +111,15 @@ def t_graph_ms(fn, warmup_iters, rep):
     torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(rep):
-        g.replay()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / rep
+    total = 0.0
+    for _ in range(rounds):
+        start.record()
+        for _ in range(rep):
+            g.replay()
+        end.record()
+        torch.cuda.synchronize()
+        total += start.elapsed_time(end) / rep
+    return total / rounds
 
 
 # small_batch 的 opt_level / fast_math / k_split,由 main() 从 CLI 设置。
@@ -123,8 +129,9 @@ _SB_K_SPLIT = 1
 _VK_BV = -1  # vk 的 BV(每 program V 列数);-1=auto(按 work_units 挑 8/16/32 提 occupancy)
 
 
-def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, variant="kv"):
-    """small_batch 封装;variant='kv'(lane=V/kv 布局)或 'vk'(lane=K/vk 布局)。"""
+def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, variant="kv", inter=None):
+    """small_batch 封装;variant='kv'(lane=V/kv 布局)或 'vk'(lane=K/vk 布局)。
+    inter(intermediate_states_buffer)仅 vk 支持;kv 强制 None。"""
     if variant == "kv":
         state = state.transpose(-2, -1).contiguous()  # vk→kv 预转置(计时外一次,coalesced)
     common = dict(
@@ -138,19 +145,20 @@ def make_small_batch_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, 
             return kda_decode_mtp_small_batch(**common, variant="kv", k_split=_SB_K_SPLIT)
     else:
         def call():
-            return kda_decode_mtp_small_batch(**common, variant="vk", bv=_VK_BV)
+            return kda_decode_mtp_small_batch(**common, variant="vk", bv=_VK_BV,
+                                              intermediate_states_buffer=inter)
 
     return call
 
 
-def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu):
+def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inter=None):
     """wsAuto:不锁 tile_v/ilp/use_smem_v,由 ws 的 work_units heuristic 自动选。"""
     def call():
         return kda_decode_mtp_ws(
             A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
             initial_state_source=state, initial_state_indices=indices, scale=scale,
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
-            disable_state_update=dsu,
+            disable_state_update=dsu, intermediate_states_buffer=inter,
         )
 
     return call
@@ -207,6 +215,8 @@ def main():
     ap.add_argument("--V", type=int, default=128)
     ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--rep", type=int, default=300)
+    ap.add_argument("--rounds", type=int, default=5,
+                    help="计时轮数,对各轮均值再取平均(降单窗口抖动);小 kernel 抖动大可调高")
     ap.add_argument("--check", action="store_true", help="只数值校验,不计时")
     ap.add_argument("--check-cases", type=str, nargs="+", default=["1:2", "4:4"],
                     help="精度校验只跑这些 N:T 样例(默认 2 个角点,覆盖最小/最大 T 的累加深度;"
@@ -224,6 +234,10 @@ def main():
                     help="small_batch 的 k_split:每 V 列由 k_split 个 lane 分摊 K(降寄存器/提 occupancy);-1=auto(按 work_units wave 适配)")
     ap.add_argument("--vk-bv", type=int, default=-1, choices=[-1, 8, 16, 32],
                     help="vk 的 BV(每 program V 列数);-1=auto(小批降 BV 提 occupancy 填 wave),或 8/16/32 扫")
+    ap.add_argument("--dsu", type=int, default=1, choices=[0, 1],
+                    help="disable_state_update:1=forward-only(默认),0=真实 decode 写回 state")
+    ap.add_argument("--intermediate", type=int, default=0, choices=[0, 1],
+                    help="1=给 vk/ws 传 intermediate_states_buffer 测 snapshot 写回开销(triton 基线不传)")
     args = ap.parse_args()
 
     global _SB_OPT_LEVEL, _SB_FAST_MATH, _SB_K_SPLIT, _VK_BV
@@ -232,12 +246,21 @@ def main():
     _SB_FAST_MATH = bool(args.sb_fast_math)
     _SB_K_SPLIT = args.sb_k_split
 
+    dsu = bool(args.dsu)  # disable_state_update,传给所有 maker
+
+    def mk_inter(N, T):
+        # snapshot buffer [N,T,HV,V,K] fp32(仅 --intermediate 时分配,否则 None)
+        if not args.intermediate:
+            return None
+        return torch.zeros(N, T, args.HV, args.V, args.K, dtype=torch.float32, device="cuda")
+
     if not _HAVE_TRITON:
         sys.exit(f"Triton 不可用,本对照脚本需要 Triton 作基准:{_TRITON_ERR}")
     assert args.HV % args.H == 0
     device = "cuda"
     print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"形状 H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu=True(forward-only)")
+    print(f"形状 H={args.H} HV={args.HV} K={args.K} V={args.V}  "
+          f"dsu={dsu} intermediate={bool(args.intermediate)}")
 
     # ---------------- 单 config 长跑(供 ncu/nsys 外部 profiler) ----------------
     if args.profile is not None:
@@ -245,25 +268,26 @@ def main():
         q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
             N, T, args.H, args.HV, args.K, args.V, device)
         scale = args.K ** -0.5
+        inter = mk_inter(N, T)
         if args.profile_variant == "triton":
             qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
             fn = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
-                                  state0.clone(), indices, scale, True)
+                                  state0.clone(), indices, scale, dsu)
         elif args.profile_variant == "ws":
             fn = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                              scale, True)
+                              scale, dsu, inter=inter)
         elif args.profile_variant == "auto":
             fn = make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                                scale, True)
+                                scale, dsu)
         elif args.profile_variant == "loop":
             fn = make_loop_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                                scale, True)
+                                scale, dsu)
         elif args.profile_variant == "sbkv":
             fn = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                       state0.clone(), indices, scale, True, variant="kv")
+                                       state0.clone(), indices, scale, dsu, variant="kv")
         else:  # sbvk
             fn = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                       state0.clone(), indices, scale, True, variant="vk")
+                                       state0.clone(), indices, scale, dsu, variant="vk", inter=inter)
         warmup(fn, args.warmup)
         print(f"[profile] variant={args.profile_variant} N={N} T={T}: "
               f"{args.profile_iters} forward iters(供外部 profiler 包裹)")
@@ -289,14 +313,15 @@ def main():
         qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
         scale = args.K ** -0.5
         o_tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
-                                 state0.clone(), indices, scale, True)()
+                                 state0.clone(), indices, scale, dsu)()
         o_tri = o_tri.reshape(N, T, args.HV, args.V).float()
         o_sbkv = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                       state0.clone(), indices, scale, True, variant="kv")().float()
+                                       state0.clone(), indices, scale, dsu, variant="kv")().float()
         o_sbvk = make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                        state0.clone(), indices, scale, True, variant="vk")().float()
+                                        state0.clone(), indices, scale, dsu, variant="vk",
+                                        inter=mk_inter(N, T))().float()
         o_auto = make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices,
-                                scale, True)().float()
+                                scale, dsu)().float()
         d_sbkv = (o_sbkv - o_tri).abs().max().item()
         d_sbvk = (o_sbvk - o_tri).abs().max().item()
         d_auto = (o_auto - o_tri).abs().max().item()
@@ -328,27 +353,29 @@ def main():
             if N * args.HV <= TRITON_MAX_GRID_Z:
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
-                                       state0.clone(), indices, scale, True)
+                                       state0.clone(), indices, scale, dsu)
                 try:
                     warmup(tri, args.warmup)
-                    tg_tri = t_graph_ms(tri, 3, args.rep)
+                    tg_tri = t_graph_ms(tri, 3, args.rep, args.rounds)
                 except Exception as e:
                     print(f"{N:>4} {T:>3} | triton FAIL: {str(e)[:50]}")
 
             makers = {
-                "loop": make_loop_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True),
-                "ws": make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True),
+                "loop": make_loop_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, dsu),
+                "ws": make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, dsu,
+                                   inter=mk_inter(N, T)),
                 "sbkv": make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                              state0.clone(), indices, scale, True, variant="kv"),
+                                              state0.clone(), indices, scale, dsu, variant="kv"),
                 "sbvk": make_small_batch_call(q, k, v, a, b, A_log, dt_bias,
-                                              state0.clone(), indices, scale, True, variant="vk"),
-                "auto": make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, True),
+                                              state0.clone(), indices, scale, dsu, variant="vk",
+                                              inter=mk_inter(N, T)),
+                "auto": make_auto_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, dsu),
             }
             tg = {}
             for name, fn_obj in makers.items():
                 try:
                     warmup(fn_obj, args.warmup)
-                    tg[name] = t_graph_ms(fn_obj, 3, args.rep)
+                    tg[name] = t_graph_ms(fn_obj, 3, args.rep, args.rounds)
                 except Exception as e:
                     tg[name] = None
                     print(f"{N:>4} {T:>3} | {name} FAIL: {str(e)[:50]}")
