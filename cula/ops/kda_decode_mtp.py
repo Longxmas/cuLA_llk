@@ -1757,6 +1757,8 @@ def kda_mtp_small_batch_vk_kernel(
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_bv = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)
     r_red = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)  # ILP:BV 个 reduce partial,批量 butterfly
+    r_gx = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: x=a+dtb(跨 pipe 交错暂存)
+    r_gexp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: exp(beta_x),提前发与 l2norm butterfly 重叠
     r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # float4 临时缓冲(state load/store)
     # ===== 2-stage 软件流水双缓冲:算 token t 时预取 t+1 的 q/k/a/b 输入 =====
     r_qbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
@@ -1804,10 +1806,16 @@ def kda_mtp_small_batch_vk_kernel(
                 r_abf[nxt][c] = cutlass.Float32(a[i_n, i_t + 1, i_hv, vec_size * lane + c])
             r_bbf[nxt][0] = cutlass.Float32(b[i_n, i_t + 1, i_hv])
 
-        # ===== prep:从 cur 缓冲读 q/k(已在寄存器,无 LDG 阻塞)+ l2norm + g =====
+        # ===== prep:读 q/k + gate↔l2norm 跨 pipe 交错(gate 的 exp/log 走 XU、l2norm butterfly 走 MIO,两条慢 pipe 并行)=====
         for c in cutlass.range_constexpr(vec_size):
             r_q[c] = cutlass.Float32(r_qbf[cur][c])
             r_k[c] = cutlass.Float32(r_kbf[cur][c])
+
+        # gate 阶段1:x=a+dtb,先批量发 4 个 exp(beta_x)(XU)——与下面 l2norm 的 MIO butterfly 重叠,4 个 exp 互相 ILP 流水
+        for c in cutlass.range_constexpr(vec_size):
+            r_gx[c] = r_abf[cur][c] + r_dtb[c]  # x = a + dt_bias
+        for c in cutlass.range_constexpr(vec_size):
+            r_gexp[c] = cute.exp(softplus_beta * r_gx[c], fastmath=fast_math)  # exp(beta_x)
 
         if cutlass.const_expr(use_qk_l2norm):
             sum_q = cutlass.Float32(0.0)
@@ -1827,20 +1835,20 @@ def kda_mtp_small_batch_vk_kernel(
             for c in cutlass.range_constexpr(vec_size):
                 r_q[c] = r_q[c] * scale
 
+        # gate 阶段2:log + softplus 选择 → sp_x 暂存 r_g;再批量发 4 个最终 exp(ILP)
         for c in cutlass.range_constexpr(vec_size):
-            x = r_abf[cur][c] + r_dtb[c]  # a 已预取,dt_bias 循环外载
-            beta_x = softplus_beta * x
-            exp_bx = cute.exp(beta_x, fastmath=fast_math)
+            beta_x = softplus_beta * r_gx[c]
             sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+                cutlass.Float32(1.0) + r_gexp[c], fastmath=fast_math
             )
             use_sp = (
                 cutlass.Float32(1.0)
                 if beta_x <= softplus_threshold
                 else cutlass.Float32(0.0)
             )
-            sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-            r_g[c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+            r_g[c] = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * r_gx[c]  # 暂存 sp_x
+        for c in cutlass.range_constexpr(vec_size):
+            r_g[c] = cute.exp(-r_exp_A * r_g[c], fastmath=fast_math)  # 最终 exp(批量)
 
         r_beta = cutlass.Float32(1.0) / (
             cutlass.Float32(1.0)
