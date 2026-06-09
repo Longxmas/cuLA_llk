@@ -17,10 +17,7 @@ sys.path.insert(0, str(_here.parent))  # cuLA/
 from cula.kda import kda_decode, kda_decode_mtp, kda_decode_mtp_ws
 from cula.ops.kda_decode_mtp import kda_decode_mtp_small_batch
 
-# CUDA gridDim.z 上限。Triton 把 N*HV 放 z 轴,超过即 launch 失败(cuLA 不受此限)。
 TRITON_MAX_GRID_Z = 65535
-
-# Triton 基线:KDA_TRITON_FILE 指定基线文件则从该文件加载,否则退回 sglang 包。
 _HAVE_TRITON = True
 _TRITON_ERR = ""
 fused_sigmoid_gating_delta_rule_update = None
@@ -322,6 +319,7 @@ def main():
     print(hdr)
     print("-" * len(hdr))
     for N in args.batch_sizes:
+        gc = 1 if N >= 16 else args.graph_calls  # 大 batch 强制 gc=1,省测试时间
         for T in args.Ts:
             q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
                 N, T, args.H, args.HV, args.K, args.V, device)
@@ -334,7 +332,7 @@ def main():
                                        state0.clone(), indices, scale, True)
                 try:
                     warmup(tri, args.warmup)
-                    tg_tri = t_graph_ms(tri, 3, args.rep, args.graph_calls)
+                    tg_tri = t_graph_ms(tri, 3, args.rep, gc)
                 except Exception as e:
                     print(f"{N:>4} {T:>3} | triton FAIL: {str(e)[:50]}")
 
@@ -351,7 +349,7 @@ def main():
             for name, fn_obj in makers.items():
                 try:
                     warmup(fn_obj, args.warmup)
-                    tg[name] = t_graph_ms(fn_obj, 3, args.rep, args.graph_calls)
+                    tg[name] = t_graph_ms(fn_obj, 3, args.rep, gc)
                 except Exception as e:
                     tg[name] = None
                     print(f"{N:>4} {T:>3} | {name} FAIL: {str(e)[:50]}")
