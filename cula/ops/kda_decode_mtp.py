@@ -1755,7 +1755,7 @@ def kda_mtp_small_batch_vk_kernel(
     r_q = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_k = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_g = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    r_bv = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)
+    r_vbf = [cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]  # v: bf16 双缓冲,t+1 预取
     r_red = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)  # ILP:BV 个 reduce partial,批量 butterfly
     r_gx = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: x=a+dtb(跨 pipe 交错暂存)
     r_gexp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # gate: exp(beta_x),提前发与 l2norm butterfly 重叠
@@ -1763,7 +1763,7 @@ def kda_mtp_small_batch_vk_kernel(
     # ===== 2-stage 软件流水双缓冲:算 token t 时预取 t+1 的 q/k/a/b 输入 =====
     r_qbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
     r_kbf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
-    r_abf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32) for _ in range(2)]
+    r_abf = [cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16) for _ in range(2)]
     r_bbf = [cute.make_rmem_tensor(cute.make_layout((1,), stride=(1,)), cutlass.Float32) for _ in range(2)]
     r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # dt_bias 与 token 无关,循环外载一次
 
@@ -1789,8 +1789,10 @@ def kda_mtp_small_batch_vk_kernel(
     k_t0 = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
     cute.autovec_copy(q_t0, r_qbf[0])
     cute.autovec_copy(k_t0, r_kbf[0])
-    for c in cutlass.range_constexpr(vec_size):
-        r_abf[0][c] = cutlass.Float32(a[i_n, 0, i_hv, vec_size * lane + c])
+    a_t0 = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, 0, i_hv, lane))
+    cute.autovec_copy(a_t0, r_abf[0])
+    v_t0 = cute.local_tile(v, (1, 1, 1, BV), (i_n, 0, i_hv, i_v))
+    cute.autovec_copy(v_t0, r_vbf[0])
     r_bbf[0][0] = cutlass.Float32(b[i_n, 0, i_hv])
 
     for i_t in cutlass.range_constexpr(T):
@@ -1802,8 +1804,10 @@ def kda_mtp_small_batch_vk_kernel(
             k_tn = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
             cute.autovec_copy(q_tn, r_qbf[nxt])
             cute.autovec_copy(k_tn, r_kbf[nxt])
-            for c in cutlass.range_constexpr(vec_size):
-                r_abf[nxt][c] = cutlass.Float32(a[i_n, i_t + 1, i_hv, vec_size * lane + c])
+            a_tn = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, i_t + 1, i_hv, lane))
+            cute.autovec_copy(a_tn, r_abf[nxt])
+            v_tn = cute.local_tile(v, (1, 1, 1, BV), (i_n, i_t + 1, i_hv, i_v))
+            cute.autovec_copy(v_tn, r_vbf[nxt])
             r_bbf[nxt][0] = cutlass.Float32(b[i_n, i_t + 1, i_hv])
 
         # ===== prep:读 q/k + gate↔l2norm 跨 pipe 交错(gate 的 exp/log 走 XU、l2norm butterfly 走 MIO,两条慢 pipe 并行)=====
@@ -1813,7 +1817,7 @@ def kda_mtp_small_batch_vk_kernel(
 
         # gate 阶段1:x=a+dtb,先批量发 4 个 exp(beta_x)(XU)——与下面 l2norm 的 MIO butterfly 重叠,4 个 exp 互相 ILP 流水
         for c in cutlass.range_constexpr(vec_size):
-            r_gx[c] = r_abf[cur][c] + r_dtb[c]  # x = a + dt_bias
+            r_gx[c] = cutlass.Float32(r_abf[cur][c]) + r_dtb[c]  # x = a + dt_bias
         for c in cutlass.range_constexpr(vec_size):
             r_gexp[c] = cute.exp(softplus_beta * r_gx[c], fastmath=fast_math)  # exp(beta_x)
 
@@ -1855,34 +1859,22 @@ def kda_mtp_small_batch_vk_kernel(
             + cute.exp(-r_bbf[cur][0], fastmath=fast_math)
         )
 
-        # v_t 迭代内载入(延迟 overlap 进上面 l2norm/gate;各 v 同址广播,便宜)
-        for vv in cutlass.range_constexpr(BV):
-            r_bv[vv] = cutlass.Float32(v[i_n, i_t, i_hv, i_v * BV + vv])
 
-        # ===== recurrence =====
-        # decay:h *= exp(g)(per K)
-        for vv in cutlass.range_constexpr(BV):
-            for c in cutlass.range_constexpr(vec_size):
-                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] * r_g[c]
-
-        # s[v]=Σ_k h·k_norm。ILP:先算全 BV 个 partial → 按 offset 批量交错发 BV 个 butterfly(每步 BV 个独立 shuffle 背靠背,藏延迟)→ rank-1。
+        # ===== recurrence(融合:decay+h@k 一遍 / update+h@q 一遍,保留 batched butterfly)=====
         for vv in cutlass.range_constexpr(BV):
             sv = cutlass.Float32(0.0)
             for c in cutlass.range_constexpr(vec_size):
+                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] * r_g[c]
                 sv += r_h[vv * vec_size + c] * r_k[c]
             r_red[vv] = sv
         for off in [16, 8, 4, 2, 1]:
             for vv in cutlass.range_constexpr(BV):
                 r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
         for vv in cutlass.range_constexpr(BV):
-            v_new = (r_bv[vv] - r_red[vv]) * r_beta
-            for c in cutlass.range_constexpr(vec_size):
-                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] + r_k[c] * v_new
-
-        # o[v]=Σ_k h·q_scaled(同 reduce,ILP 批量 butterfly,复用 r_red)→ 32 lane 同址幂等写。
-        for vv in cutlass.range_constexpr(BV):
+            v_new = (cutlass.Float32(r_vbf[cur][vv]) - r_red[vv]) * r_beta
             ovv = cutlass.Float32(0.0)
             for c in cutlass.range_constexpr(vec_size):
+                r_h[vv * vec_size + c] = r_h[vv * vec_size + c] + r_k[c] * v_new
                 ovv += r_h[vv * vec_size + c] * r_q[c]
             r_red[vv] = ovv
         for off in [16, 8, 4, 2, 1]:
