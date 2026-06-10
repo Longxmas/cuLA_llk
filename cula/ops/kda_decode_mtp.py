@@ -1071,7 +1071,11 @@ def kda_decode_mtp_ws(
             N, HV, V, T, disable_state_update=disable_state_update
         )
         if tile_v is None:
-            tile_v = sel_tile_v
+            if intermediate_states_buffer is not None and N >= 8 and V % 16 == 0:
+                # write-bound: smaller tile = more CTAs = more in-flight DRAM requests
+                tile_v = 16
+            else:
+                tile_v = sel_tile_v
         if ilp_rows is None:
             ilp_rows = sel_ilp_rows
             if ilp_rows == 4 and tile_v % 16 != 0:
