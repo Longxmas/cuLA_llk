@@ -1157,7 +1157,7 @@ def kda_decode_mtp_ws(
             )
         intermediate_states_flat = intermediate_states_buffer.view(N * T * HV, V, K)
     else:
-        intermediate_states_flat = torch.zeros(
+        intermediate_states_flat = torch.empty(
             1, 1, 1, dtype=torch.float32, device=q.device
         )
 
@@ -1567,6 +1567,7 @@ def kda_decode_mtp_small_batch(
     k_split: int = 1,
     opt_level: int = 3,
     fast_math: bool = True,
+    intermediate_states_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert variant in ("kv", "vk"), f"variant only supports 'kv'/'vk',got {variant!r}"
     N, T, H, K = q.shape
@@ -1627,6 +1628,18 @@ def kda_decode_mtp_small_batch(
 
     stream = _get_cached_stream(q.device)
 
+    cache_intermediate_states = intermediate_states_buffer is not None
+    if cache_intermediate_states:
+        if variant != "vk":
+            raise NotImplementedError("intermediate_states_buffer only supported for variant='vk'")
+        if intermediate_states_buffer.dtype != torch.float32:
+            raise ValueError(f"intermediate_states_buffer must be float32, got {intermediate_states_buffer.dtype}")
+        if tuple(intermediate_states_buffer.shape) != (N, T, HV, V, K):
+            raise ValueError(f"intermediate_states_buffer shape {tuple(intermediate_states_buffer.shape)} != expected {(N, T, HV, V, K)} ([N,T,HV,V,K] vk)")
+        intermediate_states_flat = intermediate_states_buffer.view(N * T * HV, V, K)
+    else:
+        intermediate_states_flat = torch.empty(1, 1, 1, dtype=torch.float32, device=q.device)
+
     if variant == "kv":
         h0_source_flat = h0_source.view(pool_size * HV, K, V)  # kv
         compiled_kernel = _get_compiled_mtp_small_batch_kernel(
@@ -1644,21 +1657,19 @@ def kda_decode_mtp_small_batch(
             disable_state_update=disable_state_update,
             softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
             opt_level=opt_level, fast_math=fast_math,
+            cache_intermediate_states=cache_intermediate_states,
         )
 
-    compiled_kernel(
-        h0_source_flat,
-        A_log,
-        a,
-        dt_bias,
-        q,
-        k,
-        v,
-        b,
-        o,
-        initial_state_indices,
-        stream,
-    )
+    if variant == "vk":
+        compiled_kernel(
+            h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
+            intermediate_states_flat, initial_state_indices, stream,
+        )
+    else:
+        compiled_kernel(
+            h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
+            initial_state_indices, stream,
+        )
 
     return o
 
@@ -1673,6 +1684,7 @@ def kda_mtp_small_batch_vk_kernel(
     v: cute.Tensor,
     b: cute.Tensor,
     o: cute.Tensor,
+    intermediate_states: cute.Tensor,
     h0_indices: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
@@ -1687,6 +1699,7 @@ def kda_mtp_small_batch_vk_kernel(
     V: cutlass.Constexpr[int],
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -1833,6 +1846,13 @@ def kda_mtp_small_batch_vk_kernel(
                 r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
         for vv in cutlass.range_constexpr(BV):
             o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(r_red[vv])
+        if cutlass.const_expr(cache_intermediate_states):  # Stage-D snapshot: post-token-t state
+            flat_idx = i_n * T * HV + i_t * HV + i_hv
+            for vv in cutlass.range_constexpr(BV):
+                for c in cutlass.range_constexpr(vec_size):
+                    r_h4[c] = r_h[vv * vec_size + c]
+                inter_tile = cute.local_tile(intermediate_states, (1, 1, vec_size), (flat_idx, i_v * BV + vv, lane))
+                cute.autovec_copy(r_h4, inter_tile)
 
     # ===== epilogue: write state back =====
     if cache_idx >= 0:
@@ -1857,6 +1877,7 @@ def run_kda_mtp_small_batch_vk_kernel(
     v: cute.Tensor,
     b: cute.Tensor,
     o: cute.Tensor,
+    intermediate_states: cute.Tensor,
     h0_indices: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
@@ -1870,6 +1891,7 @@ def run_kda_mtp_small_batch_vk_kernel(
     V: cutlass.Constexpr[int],
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
@@ -1888,6 +1910,7 @@ def run_kda_mtp_small_batch_vk_kernel(
         v,
         b,
         o,
+        intermediate_states,
         h0_indices,
         vec_size,
         num_v_tiles,
@@ -1902,6 +1925,7 @@ def run_kda_mtp_small_batch_vk_kernel(
         V,
         use_qk_l2norm,
         disable_state_update,
+        cache_intermediate_states,
         fast_math,
     ).launch(
         grid=(grid_size, 1, 1),
@@ -1930,6 +1954,7 @@ def _get_compiled_mtp_vk_kernel(
     softplus_threshold,
     opt_level=3,
     fast_math=True,
+    cache_intermediate_states=False,
 ):
     key = (
         N,
@@ -1943,6 +1968,7 @@ def _get_compiled_mtp_vk_kernel(
         scale,
         use_qk_l2norm,
         disable_state_update,
+        cache_intermediate_states,
         softplus_beta,
         softplus_threshold,
         opt_level,
@@ -1961,6 +1987,10 @@ def _get_compiled_mtp_vk_kernel(
     dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
     h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
     h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+    if cache_intermediate_states:
+        intermediate_states = torch.zeros(N * T * HV, V, K, dtype=torch.float32, device="cuda")
+    else:
+        intermediate_states = torch.empty(1, 1, 1, dtype=torch.float32, device="cuda")
 
     q_t = from_dlpack(q, assumed_align=16)
     k_t = from_dlpack(k, assumed_align=16)
@@ -1972,6 +2002,7 @@ def _get_compiled_mtp_vk_kernel(
     dt_bias_t = from_dlpack(dt_bias, assumed_align=16)
     h0_source_t = from_dlpack(h0_source, assumed_align=16)
     h0_indices_t = from_dlpack(h0_indices, assumed_align=16)
+    intermediate_states_t = from_dlpack(intermediate_states, assumed_align=16)
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -1986,6 +2017,7 @@ def _get_compiled_mtp_vk_kernel(
         v_t,
         b_t,
         o_t,
+        intermediate_states_t,
         h0_indices_t,
         vec_size=VEC_SIZE,
         BV=BV,
@@ -1999,6 +2031,7 @@ def _get_compiled_mtp_vk_kernel(
         V=V,
         use_qk_l2norm=use_qk_l2norm,
         disable_state_update=disable_state_update,
+        cache_intermediate_states=cache_intermediate_states,
         fast_math=fast_math,
         stream=stream,
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
@@ -2036,6 +2069,7 @@ def kda_decode_mtp(
     out: torch.Tensor | None = None,
     state_layout: str = "vk",
     disable_state_update: bool = False,
+    intermediate_states_buffer: torch.Tensor | None = None,
 ) -> torch.Tensor:
     common = dict(
         A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
@@ -2044,6 +2078,7 @@ def kda_decode_mtp(
         scale=scale, use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
         out=out, disable_state_update=disable_state_update,
+	intermediate_states_buffer=intermediate_states_buffer,
     )
     if state_layout == "kv":
         return kda_decode_mtp_small_batch(**common, variant="kv", k_split=-1)  # k_split auto

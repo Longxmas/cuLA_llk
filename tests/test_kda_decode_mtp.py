@@ -153,10 +153,12 @@ def run_ws(q, k, v, a, b, A_log, dt_bias, state, scale, *, tile_v=None,
 
 
 def run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, *, variant,
-                    bv=-1, k_split=-1, disable_state_update=False):
+                    bv=-1, k_split=-1, disable_state_update=False, intermediate=False):
     """Run kda_decode_mtp_small_batch; state fed/returned in vk layout (kv transposed in and back)."""
     N = q.shape[0]
     indices = torch.arange(N, device=q.device, dtype=torch.int32)
+    T = q.shape[1]; HV, V, K = v.shape[2], v.shape[3], q.shape[3]
+    inter = torch.zeros(N, T, HV, V, K, device=q.device, dtype=torch.float32) if intermediate else None
     st = state.clone().contiguous()
     if variant == "kv":
         st = st.transpose(-2, -1).contiguous()  # vk -> kv
@@ -167,12 +169,13 @@ def run_small_batch(q, k, v, a, b, A_log, dt_bias, state, scale, *, variant,
         initial_state_source=st, initial_state_indices=indices,
         scale=scale, use_qk_l2norm_in_kernel=True,
         variant=variant, k_split=k_split, disable_state_update=disable_state_update,
+        intermediate_states_buffer=inter,
     )
     if variant == "vk":
         sb_kwargs["bv"] = bv  # kv is fixed 1-warp; bv stays at the WARP_BV default
     o = kda_decode_mtp_small_batch(**sb_kwargs)
     state_vk = st.transpose(-2, -1).contiguous() if variant == "kv" else st
-    return o, state_vk
+    return (o, state_vk, inter) if intermediate else (o, state_vk)
 
 
 @pytest.mark.parametrize("T", [1, 2, 4, 8])
@@ -465,6 +468,22 @@ def test_intermediate_buffer_validation():
         _call(torch.zeros(N, T + 1, HV, V, K, device="cuda", dtype=torch.float32))
     with pytest.raises((ValueError, AssertionError)):
         _call(torch.zeros(N, T, HV, V, K, device="cuda", dtype=torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    "N,T", [(1, 2), (4, 4), (8, 8), (4, 2), (16, 6)]
+)
+def test_intermediate_small_batch_vk(N, T):
+    """vk per-token snapshot == fp32 oracle; t=T-1 snapshot == final state pool."""
+    H, HV, K, V = 8, 16, 128, 128
+    scale = K**-0.5
+    q, k, v, a, b, A_log, dt_bias, state = make_inputs_mtp(N, T, H, HV, K, V)
+    inter_ref = oracle_intermediate_states(q, k, v, a, b, A_log, dt_bias, state.clone(), scale)
+    o, st_vk, inter = run_small_batch(q, k, v, a, b, A_log, dt_bias, state.clone(), scale,
+                                      variant="vk", disable_state_update=False, intermediate=True)
+    for t in range(T):
+        _assert_close(f"sbvk inter snapshot[t={t}]", inter_ref[:, t], inter[:, t])
+    assert torch.equal(inter[:, T - 1], st_vk), "sbvk: t=T-1 snapshot != final state"
 
 
 if __name__ == "__main__":
