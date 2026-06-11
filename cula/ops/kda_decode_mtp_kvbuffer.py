@@ -131,8 +131,13 @@ def kda_mtp_kvbuffer_vk_kernel(
     b_run = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # 累积衰减 b_t(本 lane 通道)
     r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    # 2-stage 软流水:current(无后缀)+ next(_n)双缓冲,prefetch t+1 的 q/k/a 与 token t 计算重叠。
     r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_abf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_qbf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_kbf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_abf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     # ILP batched butterfly:把固定 t 的所有 reduce-over-K（A/P 的 i 个 + Skdec/Sqdec 的 BV 个）
     # 拼进一个宽度 i_t+BV 的 partial 数组,一趟 butterfly 全归约 → 依赖深度从 (i_t+BV)*5 降到 5。
     # 前段 [0:i_t] = A[t,i]/P[t,i] partial;后段 [i_t:i_t+BV] = Skdec/Sqdec partial。
@@ -155,13 +160,24 @@ def kda_mtp_kvbuffer_vk_kernel(
         r_dtb[c] = cutlass.Float32(dt_bias[i_hv, vec_size * lane + c])
 
     # ===== Phase A:逐 token 算 g_t→累积 b_t、l2norm/scale、kdec/kinv/qdec、beta_t =====
+    # 2-stage 软流水:preload token0,循环内先发 t+1 的 q/k/a load(与本 token compute 重叠),末尾换缓冲。
     for c in cutlass.range_constexpr(vec_size):
         b_run[c] = cutlass.Float32(1.0)
+    q_tile0 = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
+    k_tile0 = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
+    a_tile0 = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, 0, i_hv, lane))
+    cute.autovec_copy(q_tile0, r_qbf)
+    cute.autovec_copy(k_tile0, r_kbf)
+    cute.autovec_copy(a_tile0, r_abf)
     for i_t in cutlass.range_constexpr(T):
-        q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
-        k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane))
-        cute.autovec_copy(q_tile, r_qbf)
-        cute.autovec_copy(k_tile, r_kbf)
+        # prefetch t+1 的 q/k/a 到 _n 缓冲(发射在 compute 前 → load 延迟被本 token 计算掩盖)
+        if cutlass.const_expr(i_t + 1 < T):
+            q_tile_n = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
+            k_tile_n = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
+            a_tile_n = cute.local_tile(a, (1, 1, 1, vec_size), (i_n, i_t + 1, i_hv, lane))
+            cute.autovec_copy(q_tile_n, r_qbf_n)
+            cute.autovec_copy(k_tile_n, r_kbf_n)
+            cute.autovec_copy(a_tile_n, r_abf_n)
         for c in cutlass.range_constexpr(vec_size):
             r_qf[c] = cutlass.Float32(r_qbf[c])
             r_kf[c] = cutlass.Float32(r_kbf[c])
@@ -184,9 +200,9 @@ def kda_mtp_kvbuffer_vk_kernel(
             for c in cutlass.range_constexpr(vec_size):
                 r_qf[c] = r_qf[c] * scale
 
-        # g_t[c](per K 通道)→ 累积 b_run[c] *= g_t
+        # g_t[c](per K 通道)→ 累积 b_run[c] *= g_t(a 从 prefetch 的 r_abf 读)
         for c in cutlass.range_constexpr(vec_size):
-            x = cutlass.Float32(a[i_n, i_t, i_hv, vec_size * lane + c]) + r_dtb[c]
+            x = cutlass.Float32(r_abf[c]) + r_dtb[c]
             beta_x = softplus_beta * x
             exp_bx = cute.exp(beta_x, fastmath=fast_math)
             sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
@@ -219,6 +235,13 @@ def kda_mtp_kvbuffer_vk_kernel(
                     r_h4[c] = b_run[c]
                 b_out = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane))
                 cute.autovec_copy(r_h4, b_out)
+
+        # 换缓冲:next → current(寄存器搬移,prefetch 的 t+1 成为下一轮 current)
+        if cutlass.const_expr(i_t + 1 < T):
+            for c in cutlass.range_constexpr(vec_size):
+                r_qbf[c] = r_qbf_n[c]
+                r_kbf[c] = r_kbf_n[c]
+                r_abf[c] = r_abf_n[c]
     # 循环后 b_run[c] = b_{T-1}[c]（末尾 state 更新用）。
 
     # ===== Phase B:前代求 u_t[vv]。u_t = beta_t*(v_t - S0@kdec_t - Σ_{i<t} A[t,i] u_i) =====
