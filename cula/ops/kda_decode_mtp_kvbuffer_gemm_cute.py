@@ -242,6 +242,11 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
         n_base3 = (warp_idx % 2) * 8
         for ks in cutlass.range_constexpr(K // 8):
             kb = ks * 8
+            # DSL runtime-if: vars must pre-exist to survive the branch (scf.if yields)
+            a0 = cutlass.Float32(0.0)
+            a1 = cutlass.Float32(0.0)
+            a2 = cutlass.Float32(0.0)
+            a3 = cutlass.Float32(0.0)
             if warp_idx < 2:
                 a0 = sKdec[gid, kb + tig]
                 a1 = sKdec[gid + 8, kb + tig]
