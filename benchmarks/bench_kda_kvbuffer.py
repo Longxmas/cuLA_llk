@@ -38,6 +38,13 @@ try:
 except Exception:
     _HAVE_TPKVB = False
 
+# gemm-kvbuffer (Triton tl.dot, paper-form, target = flat-in-T verify).
+try:
+    from cula.ops.kda_decode_mtp_kvbuffer_gemm import kda_decode_mtp_gemm_kvbuffer
+    _HAVE_GKVB = True
+except Exception:
+    _HAVE_GKVB = False
+
 
 def _load_from_file(path, attr):
     """Load a single attribute from a standalone .py file via importlib."""
@@ -236,6 +243,23 @@ def make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, u
     return call
 
 
+def make_gkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ubufs=None):
+    """gemm-kvbuffer (Triton tl.dot chunkwise, paper form). env KDA_GKVB_BV / KDA_GKVB_WARPS."""
+    u_buf, kinv_buf, b_buf = (ubufs if ubufs is not None else (None, None, None))
+    _bv = int(os.environ.get("KDA_GKVB_BV", "64"))
+    _nw = int(os.environ.get("KDA_GKVB_WARPS", "4"))
+    def call():
+        return kda_decode_mtp_gemm_kvbuffer(
+            A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
+            initial_state_source=state, initial_state_indices=indices, scale=scale,
+            use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
+            disable_state_update=dsu, emit_output=True,
+            u_buffer=u_buf, kinv_buffer=kinv_buf, b_buffer=b_buf,
+            bv=_bv, num_warps=_nw,
+        )
+    return call
+
+
 # ---- verify-chain components: commit (recurrent rollback) & flush (kvbuffer) ----
 def make_scatter_commit_call(state_pool, inter_buf, m, N, T, HV, V, K):
     """Recurrent rollback via the OFFICIAL sglang fused_mamba_state_scatter_with_mask:
@@ -307,6 +331,8 @@ def _profile_one(args, DSU, device):
         fn = make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
     elif p == "tpkvb":
         fn = make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
+    elif p == "gkvb":
+        fn = make_gkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
     elif p == "triton":
         qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
         tri_idx = torch.arange(N, device=device, dtype=torch.int32)
@@ -353,7 +379,7 @@ def main():
     ap.add_argument("--check", action="store_true", help="numerical check only, no timing")
     ap.add_argument("--atol", type=float, default=5e-2)
     ap.add_argument("--profile", default="",
-                    choices=["", "vk", "ws", "vkkvb", "wskvb", "tpkvb", "triton", "commit", "flush"],
+                    choices=["", "vk", "ws", "vkkvb", "wskvb", "tpkvb", "gkvb", "triton", "commit", "flush"],
                     help="ncu profile mode: run one method's kernel in a loop (uses batch-sizes[0], Ts[0])")
     ap.add_argument("--profile-iters", type=int, default=20, help="kernel launches in the profiled loop")
     args = ap.parse_args()
@@ -367,7 +393,7 @@ def main():
         return
     print(f"GPU: {torch.cuda.get_device_name()}")
     print(f"shape H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu={DSU} "
-          f"wskvb_impl={_HAVE_WSKVB} tpkvb_impl={_HAVE_TPKVB}")
+          f"wskvb_impl={_HAVE_WSKVB} tpkvb_impl={_HAVE_TPKVB} gkvb_impl={_HAVE_GKVB}")
 
     # ---------------- numerical check (vs Triton recurrent) ----------------
     if not _HAVE_TRITON:
@@ -376,7 +402,7 @@ def main():
         print("\n=== numerical check (max|Δ| vs Triton recurrent, threshold "
               f"{args.atol}) ===")
         print(f"{'N':>4} {'T':>3} | {'Δ vk':>10} | {'Δ vkkvb':>10} | "
-              f"{'Δ ws':>10} | {'Δ wskvb':>10} | {'Δ tpkvb':>10} | flag")
+              f"{'Δ ws':>10} | {'Δ wskvb':>10} | {'Δ tpkvb':>10} | {'Δ gkvb':>10} | flag")
         for N in args.batch_sizes:
             for T in args.Ts:
                 q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
@@ -405,10 +431,15 @@ def main():
                     o_tpkvb = make_tpkvb_call(q, k, v, a, b, A_log, dt_bias,
                                               state0.clone(), indices, scale, True)()
                     d_tpkvb = (o_tpkvb - o_tri).abs().max().item()
-                cand = [x for x in (d_vk, d_vkkvb, d_ws, d_wskvb, d_tpkvb) if x == x]
+                d_gkvb = float("nan")
+                if _HAVE_GKVB:
+                    o_gkvb = make_gkvb_call(q, k, v, a, b, A_log, dt_bias,
+                                            state0.clone(), indices, scale, True)()
+                    d_gkvb = (o_gkvb - o_tri).abs().max().item()
+                cand = [x for x in (d_vk, d_vkkvb, d_ws, d_wskvb, d_tpkvb, d_gkvb) if x == x]
                 flag = "OK" if max(cand) < args.atol else "DIFF!"
                 print(f"{N:>4} {T:>3} | {d_vk:>10.2e} | {d_vkkvb:>10.2e} | "
-                      f"{d_ws:>10.2e} | {d_wskvb:>10.2e} | {d_tpkvb:>10.2e} | {flag}")
+                      f"{d_ws:>10.2e} | {d_wskvb:>10.2e} | {d_tpkvb:>10.2e} | {d_gkvb:>10.2e} | {flag}")
 
     if args.check:
         return
@@ -469,6 +500,8 @@ def _timing_verify_chain(args, DSU, device):
                 tg["wskvb_v"] = time_seg(make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
             if _HAVE_TPKVB:
                 tg["tpkvb_v"] = time_seg(make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
+            if _HAVE_GKVB:
+                tg["gkvb_v"] = time_seg(make_gkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
             # official triton recurrent verify (dsu=1, writes T·d² states)
             if _HAVE_TRITON:
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
@@ -483,6 +516,7 @@ def _timing_verify_chain(args, DSU, device):
             r["REC_ws"] = tg["ws_v"] + tg["cmt"]
             r["KVB_ws"] = tg["wskvb_v"] + tg["flush"] if _HAVE_WSKVB else None
             r["KVB_tp"] = tg["tpkvb_v"] + tg["flush"] if _HAVE_TPKVB else None
+            r["KVB_gk"] = tg["gkvb_v"] + tg["flush"] if _HAVE_GKVB else None
             r["REC_tri"] = tg["tri_v"] + tg["cmt"] if _HAVE_TRITON else None
             results.append(r)
 
@@ -490,26 +524,26 @@ def _timing_verify_chain(args, DSU, device):
     print(f"\n=== verify-CHAIN total latency (us) + speedup — accept m={args.accept} commit={args.commit} ===")
     print("  REC_* = recurrent verify (writes T·d² states) + commit;  KVB_* = kvbuffer verify (u-buffer) + flush")
     print("  spd_vk/spd_ws = REC_(vk/ws) / KVB_(vk/ws);  spd_vkbf/spd_wsbf = REC_tri (official triton) / KVB_(vk/ws)")
-    hdr = (f"{'N':>4} {'T':>3} {'m':>3} | {'REC_vk':>7} {'REC_ws':>7} {'REC_tri':>7} | {'KVB_vk':>7} {'KVB_ws':>7} {'KVB_tp':>7} | "
-           f"{'spd_vk':>7} {'spd_ws':>7} {'spd_tp':>7} {'spd_vkbf':>8} {'spd_wsbf':>8}")
+    hdr = (f"{'N':>4} {'T':>3} {'m':>3} | {'REC_vk':>7} {'REC_ws':>7} {'REC_tri':>7} | {'KVB_vk':>7} {'KVB_ws':>7} {'KVB_tp':>7} {'KVB_gk':>7} | "
+           f"{'spd_vk':>7} {'spd_ws':>7} {'spd_tp':>7} {'spd_gk':>7} {'spd_vkbf':>8} {'spd_wsbf':>8}")
     print(hdr)
     print("-" * len(hdr))
     for r in results:
         print(f"{r['N']:>4} {r['T']:>3} {r['m']:>3} | {us(r['REC_vk']):>7} {us(r['REC_ws']):>7} {us(r['REC_tri']):>7} | "
-              f"{us(r['KVB_vk']):>7} {us(r['KVB_ws']):>7} {us(r['KVB_tp']):>7} | "
-              f"{rat(r['REC_vk'], r['KVB_vk']):>7} {rat(r['REC_ws'], r['KVB_ws']):>7} {rat(r['REC_ws'], r['KVB_tp']):>7} "
+              f"{us(r['KVB_vk']):>7} {us(r['KVB_ws']):>7} {us(r['KVB_tp']):>7} {us(r['KVB_gk']):>7} | "
+              f"{rat(r['REC_vk'], r['KVB_vk']):>7} {rat(r['REC_ws'], r['KVB_ws']):>7} {rat(r['REC_ws'], r['KVB_tp']):>7} {rat(r['REC_ws'], r['KVB_gk']):>7} "
               f"{rat(r['REC_tri'], r['KVB_vk']):>8} {rat(r['REC_tri'], r['KVB_ws']):>8}")
 
     # ---- table 2: per-segment breakdown ----
     print("\n=== per-segment breakdown (us) — verify kernels + shared commit/flush ===")
-    hdr2 = (f"{'N':>4} {'T':>3} | {'vk_v':>6} {'ws_v':>6} {'tri_v':>6} | {'kvb_v':>6} {'wskvb_v':>7} {'tpkvb_v':>7} | "
+    hdr2 = (f"{'N':>4} {'T':>3} | {'vk_v':>6} {'ws_v':>6} {'tri_v':>6} | {'kvb_v':>6} {'wskvb_v':>7} {'tpkvb_v':>7} {'gkvb_v':>7} | "
             f"{'cmt':>5} {'flush':>6}")
     print(hdr2)
     print("-" * len(hdr2))
     for r in results:
         tg = r["tg"]
         print(f"{r['N']:>4} {r['T']:>3} | {us(tg.get('vk_v')):>6} {us(tg.get('ws_v')):>6} {us(tg.get('tri_v')):>6} | "
-              f"{us(tg.get('kvb_v')):>6} {us(tg.get('wskvb_v')):>7} {us(tg.get('tpkvb_v')):>7} | "
+              f"{us(tg.get('kvb_v')):>6} {us(tg.get('wskvb_v')):>7} {us(tg.get('tpkvb_v')):>7} {us(tg.get('gkvb_v')):>7} | "
               f"{us(tg.get('cmt')):>5} {us(tg.get('flush')):>6}")
 
 
