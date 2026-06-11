@@ -641,6 +641,7 @@ def kda_mtp_ws_kvbuffer_kernel(
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
+    ilp_rows: cutlass.Constexpr[int],
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -693,9 +694,10 @@ def kda_mtp_ws_kvbuffer_kernel(
     r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     b_run = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_tmp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # SMEM 读写 float4 临时
-    r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # consumer:一行 S0 的 K 通道
-    r_skdec = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)
-    r_u = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)
+    # consumer:ilp_rows 行的 S0 K 通道一起持有(批量 butterfly),r_part = 各行 reduce 的 partial。
+    r_h = cute.make_rmem_tensor(cute.make_layout((ilp_rows, vec_size), stride=(vec_size, 1)), cutlass.Float32)
+    r_u = cute.make_rmem_tensor(cute.make_layout((ilp_rows, T), stride=(T, 1)), cutlass.Float32)
+    r_part = cute.make_rmem_tensor(cute.make_layout((ilp_rows,), stride=(1,)), cutlass.Float32)
 
     if cache_idx >= 0:
         k_start = lane_in_group * vec_size
@@ -790,53 +792,67 @@ def kda_mtp_ws_kvbuffer_kernel(
         # 发布 warp0 的 SMEM 给所有 warp
         cute.arch.barrier()
 
-        # ===== consumers:每组 rows_per_group 行 =====
-        for row in cutlass.range_constexpr(rows_per_group):
-            v_idx = i_v * tile_v + group_idx * rows_per_group + row
-            if v_idx < V:
-                # 载 S0 行(本 lane 的 4 个 K 通道)
-                h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx, lane_in_group))
-                cute.autovec_copy(h_tile, r_h)
-                # Skdec_t = S0@kdec_t (reduce-over-K)
-                for i_t in cutlass.range_constexpr(T):
+        # ===== consumers:每组 rows_per_group 行,按 ilp_rows 批量处理 =====
+        # 把 ilp_rows 个 V-row 一起做:Skdec/Sqdec 的 K-reduce butterfly 在每个 offset
+        # 上交错发射(ilp_rows-way ILP 隐藏 shuffle 延迟),三角解/末态各行独立。
+        n_row_groups: cutlass.Constexpr[int] = rows_per_group // ilp_rows
+        for rg in cutlass.range_constexpr(n_row_groups):
+            v_base = i_v * tile_v + group_idx * rows_per_group + rg * ilp_rows
+            # 载 ilp_rows 行 S0(本 lane 的 vec_size 个 K 通道)
+            for r in cutlass.range_constexpr(ilp_rows):
+                h_tile = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_in_group)
+                )
+                cute.autovec_copy(h_tile, cute.slice_(r_h, (r, None)))
+            # 三角前代:每 token 批量算 Skdec_t=S0@kdec_t,再各行 fwd-subst u_t
+            for i_t in cutlass.range_constexpr(T):
+                for r in cutlass.range_constexpr(ilp_rows):
                     sk = cutlass.Float32(0.0)
                     for c in cutlass.range_constexpr(vec_size):
-                        sk += r_h[c] * sKdec[i_t, k_start + c]
-                    for off in [16, 8, 4, 2, 1]:
-                        sk += cute.arch.shuffle_sync_bfly(sk, offset=off, mask=-1, mask_and_clamp=31)
-                    r_skdec[i_t] = sk
-                # 三角前代:u_t = beta_t*(v_t - Skdec_t - Σ_{i<t} A[t,i] u_i)
-                for i_t in cutlass.range_constexpr(T):
-                    acc = cutlass.Float32(v[i_n, i_t, i_hv, v_idx]) - r_skdec[i_t]
+                        sk += r_h[r, c] * sKdec[i_t, k_start + c]
+                    r_part[r] = sk
+                for off in [16, 8, 4, 2, 1]:
+                    for r in cutlass.range_constexpr(ilp_rows):
+                        r_part[r] += cute.arch.shuffle_sync_bfly(r_part[r], offset=off, mask=-1, mask_and_clamp=31)
+                for r in cutlass.range_constexpr(ilp_rows):
+                    acc = cutlass.Float32(v[i_n, i_t, i_hv, v_base + r]) - r_part[r]
                     for i_i in cutlass.range_constexpr(i_t):
-                        acc -= sA[i_t, i_i] * r_u[i_i]
-                    r_u[i_t] = sBeta[i_t] * acc
-                # u-buffer:每行 u_t 复制在所有 lane,lane0 写一次
-                if cutlass.const_expr(write_ubuf):
-                    if lane_in_group == 0:
+                        acc -= sA[i_t, i_i] * r_u[r, i_i]
+                    r_u[r, i_t] = sBeta[i_t] * acc
+            # u-buffer:每行 u_t 复制在所有 lane,lane0 写一次
+            if cutlass.const_expr(write_ubuf):
+                if lane_in_group == 0:
+                    for r in cutlass.range_constexpr(ilp_rows):
                         for i_t in cutlass.range_constexpr(T):
-                            u_buf[i_n, i_t, i_hv, v_idx] = r_u[i_t]
-                # 输出 o_t = Sqdec_t + Σ_{i<=t} P[t,i] u_i
-                if cutlass.const_expr(emit_output):
-                    for i_t in cutlass.range_constexpr(T):
+                            u_buf[i_n, i_t, i_hv, v_base + r] = r_u[r, i_t]
+            # 输出 o_t = Sqdec_t + Σ_{i<=t} P[t,i] u_i(Sqdec 也批量 butterfly)
+            if cutlass.const_expr(emit_output):
+                for i_t in cutlass.range_constexpr(T):
+                    for r in cutlass.range_constexpr(ilp_rows):
                         sq = cutlass.Float32(0.0)
                         for c in cutlass.range_constexpr(vec_size):
-                            sq += r_h[c] * sQdec[i_t, k_start + c]
-                        for off in [16, 8, 4, 2, 1]:
-                            sq += cute.arch.shuffle_sync_bfly(sq, offset=off, mask=-1, mask_and_clamp=31)
-                        ov = sq
+                            sq += r_h[r, c] * sQdec[i_t, k_start + c]
+                        r_part[r] = sq
+                    for off in [16, 8, 4, 2, 1]:
+                        for r in cutlass.range_constexpr(ilp_rows):
+                            r_part[r] += cute.arch.shuffle_sync_bfly(r_part[r], offset=off, mask=-1, mask_and_clamp=31)
+                    for r in cutlass.range_constexpr(ilp_rows):
+                        ov = r_part[r]
                         for i_i in cutlass.range_constexpr(i_t + 1):
-                            ov += sP[i_t, i_i] * r_u[i_i]
+                            ov += sP[i_t, i_i] * r_u[r, i_i]
                         if lane_in_group == 0:
-                            o[(i_n, i_t, i_hv, v_idx)] = cutlass.BFloat16(ov)
-                # 末态:S_T[v,k] = b_{T-1}[k]*(S0[v,k] + Σ_t u_t kinv_t[k]),一次性回写
-                if cutlass.const_expr(not disable_state_update):
+                            o[(i_n, i_t, i_hv, v_base + r)] = cutlass.BFloat16(ov)
+            # 末态:S_T[v,k] = b_{T-1}[k]*(S0[v,k] + Σ_t u_t kinv_t[k]),逐行回写
+            if cutlass.const_expr(not disable_state_update):
+                for r in cutlass.range_constexpr(ilp_rows):
                     for c in cutlass.range_constexpr(vec_size):
-                        acc = r_h[c]
+                        acc = r_h[r, c]
                         for i_t in cutlass.range_constexpr(T):
-                            acc += r_u[i_t] * sKinv[i_t, k_start + c]
+                            acc += r_u[r, i_t] * sKinv[i_t, k_start + c]
                         r_tmp[c] = sBlast[k_start + c] * acc
-                    h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx, lane_in_group))
+                    h_out = cute.local_tile(
+                        h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_in_group)
+                    )
                     cute.autovec_copy(r_tmp, h_out)
 
 
@@ -857,6 +873,7 @@ def run_kda_mtp_ws_kvbuffer_kernel(
     b_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],
+    ilp_rows: cutlass.Constexpr[int],
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -886,7 +903,7 @@ def run_kda_mtp_ws_kvbuffer_kernel(
     kda_mtp_ws_kvbuffer_kernel(
         h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
         u_buf, kinv_buf, b_buf,
-        vec_size, num_v_tiles, tile_v,
+        vec_size, num_v_tiles, tile_v, ilp_rows,
         softplus_beta, softplus_threshold, scale,
         HV, T, H, K, V,
         use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
@@ -897,12 +914,12 @@ _compiled_mtp_ws_kvbuffer_kernels: dict[tuple, object] = {}
 
 
 def _get_compiled_mtp_ws_kvbuffer_kernel(
-    N, T, H, HV, K, V, pool_size, tile_v, scale, use_qk_l2norm,
+    N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
     disable_state_update, emit_output, write_ubuf,
     softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
 ):
     key = (
-        N, T, H, HV, K, V, pool_size, tile_v, scale, use_qk_l2norm,
+        N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
         disable_state_update, emit_output, write_ubuf,
         softplus_beta, softplus_threshold, opt_level, fast_math,
     )
@@ -940,6 +957,7 @@ def _get_compiled_mtp_ws_kvbuffer_kernel(
         from_dlpack(b_buf, assumed_align=16),
         vec_size=VEC_SIZE,
         tile_v=tile_v,
+        ilp_rows=ilp_rows,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
         scale=scale,
@@ -955,18 +973,33 @@ def _get_compiled_mtp_ws_kvbuffer_kernel(
     _compiled_mtp_ws_kvbuffer_kernels[key] = compiled_kernel
     logger.info(
         "CuTe DSL KDA MTP ws-KVBuffer kernel compiled: "
-        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, tile_v={tile_v}, "
+        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, tile_v={tile_v}, ilp_rows={ilp_rows}, "
         f"opt_level={opt_level}, fast_math={fast_math}"
     )
     return compiled_kernel
 
 
-def _select_ws_kvb_tile_v(V):
-    """简单启发:tile_v 取能整除 V 且 ≥ 32 的最大值(≤64),保证 rows_per_group≥1。"""
-    for tv in (64, 32, 16, 8):
+def _select_ws_kvb_tile_v(V, N):
+    """N-dependent tile_v(H200 sweep,H=HV=32 K=V=128 verify-chain spd_ws):
+      N<=4  → tile_v=32(block 少时优先并行/occupancy:N=4 spd 1.03→1.16);
+      N>=8  → tile_v=64(block 已够时优先 reuse,摊薄 producer 重复:N=8/16/32/64 spd
+              1.48/1.55/1.41/1.48 vs tile_v=32 的 1.33/1.38/1.20/1.28)。
+    取首个整除 V 的候选。"""
+    order = (32, 64, 16, 8) if N <= 4 else (64, 32, 16, 8)
+    for tv in order:
         if V % tv == 0:
             return tv
     return 8
+
+
+def _select_ws_kvb_ilp_rows(tile_v):
+    """ilp_rows 取能整除 rows_per_group(=tile_v/4)的最大值 ∈{4,2,1}。
+    批量 butterfly:更大的 ilp_rows = 更多 K-reduce shuffle 链交错 → 更强 ILP。"""
+    rows_per_group = tile_v // 4
+    for r in (4, 2, 1):
+        if rows_per_group % r == 0:
+            return r
+    return 1
 
 
 def kda_decode_mtp_ws_kvbuffer(
@@ -990,6 +1023,7 @@ def kda_decode_mtp_ws_kvbuffer(
     kinv_buffer: torch.Tensor | None = None,
     b_buffer: torch.Tensor | None = None,
     tile_v: int = -1,
+    ilp_rows: int = -1,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
@@ -1014,9 +1048,15 @@ def kda_decode_mtp_ws_kvbuffer(
     )
 
     if tile_v <= 0:
-        tile_v = _select_ws_kvb_tile_v(V)
+        tile_v = _select_ws_kvb_tile_v(V, N)
     assert V % tile_v == 0, f"ws-kvbuffer requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
     assert tile_v % 4 == 0, f"ws-kvbuffer requires tile_v % 4 == 0 (4 warps), got {tile_v}"
+    rows_per_group = tile_v // 4
+    if ilp_rows <= 0:
+        ilp_rows = _select_ws_kvb_ilp_rows(tile_v)
+    assert rows_per_group % ilp_rows == 0, (
+        f"ws-kvbuffer requires (tile_v/4) % ilp_rows == 0, got tile_v={tile_v}, ilp_rows={ilp_rows}"
+    )
 
     h0_source, pool_size, _ = _normalize_state_source(
         initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout="vk",
@@ -1055,7 +1095,7 @@ def kda_decode_mtp_ws_kvbuffer(
 
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
     compiled_kernel = _get_compiled_mtp_ws_kvbuffer_kernel(
-        N, T, H, HV, K, V, pool_size, tile_v,
+        N, T, H, HV, K, V, pool_size, tile_v, ilp_rows,
         scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
         disable_state_update=disable_state_update, emit_output=emit_output,
         write_ubuf=write_ubuf,

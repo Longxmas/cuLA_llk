@@ -196,8 +196,11 @@ def make_ws_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inte
 
 
 def make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ubufs=None):
-    """ws-kvbuffer (warp-spec chunkwise) — only if implemented; same u-buffer as vk-kvbuffer."""
+    """ws-kvbuffer (warp-spec chunkwise) — only if implemented; same u-buffer as vk-kvbuffer.
+    tile_v / ilp_rows overridable via env KDA_WSKVB_TILE_V / KDA_WSKVB_ILP_ROWS (-1 = auto) for tuning."""
     u_buf, kinv_buf, b_buf = (ubufs if ubufs is not None else (None, None, None))
+    _tv = int(os.environ.get("KDA_WSKVB_TILE_V", "-1"))
+    _ilp = int(os.environ.get("KDA_WSKVB_ILP_ROWS", "-1"))
     def call():
         return kda_decode_mtp_ws_kvbuffer(
             A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
@@ -205,6 +208,7 @@ def make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, u
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
             disable_state_update=dsu, emit_output=True,
             u_buffer=u_buf, kinv_buffer=kinv_buf, b_buffer=b_buf,
+            tile_v=_tv, ilp_rows=_ilp,
         )
     return call
 
