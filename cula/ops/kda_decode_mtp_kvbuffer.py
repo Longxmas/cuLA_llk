@@ -1241,3 +1241,529 @@ def kda_flush_kvbuffer(
     compiled = _get_compiled_flush_kvbuffer_kernel(N, T, HV, K, V, pool_size, bv, m, opt_level=opt_level)
     compiled(h0_source_flat, u_buffer, kinv_buffer, b_buffer, initial_state_indices, stream)
     return initial_state_source
+
+
+# ---------------------------------------------------------------------------
+# tp-kvbuffer: token-parallel chunkwise verify (structure B, UT-transform).
+# Same math as ws-kvbuffer but a fully token-parallel schedule so verify latency
+# stays ~flat in T (KVBuffer paper Fig.4 / Eq.9): Stage 1 token-parallel gating
+# (warp w owns tokens t = w, w+4, ...), Stage 2 K-parallel prefix-product scan
+# (128 threads x 1 channel), Stage 3 (t,i)-parallel A/P via one batched butterfly
+# per warp, Stage 3.5 warp0 builds W = L^{-1} diag(beta) (L = I + tril_strict
+# (beta_t A[t,i])) so the consumer triangular solve becomes a dependence-free
+# matmul u = W @ (v - S0 kdec). Only serial residues: T-step prefix product and
+# the T-row W build (~T^2/2 FFMA, one warp, overlaps consumer S0 loads).
+# ---------------------------------------------------------------------------
+@cute.kernel
+def kda_mtp_tp_kvbuffer_kernel(
+    h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    u_buf: cute.Tensor,     # [N, T, HV, V] fp32
+    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32
+    b_buf: cute.Tensor,     # [N, T, HV, K] fp32
+    vec_size: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    ilp_rows: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    emit_output: cutlass.Constexpr[bool],
+    write_ubuf: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    num_warps: cutlass.Constexpr[int] = 4
+
+    bidx, _, _ = cute.arch.block_idx()
+    i_v = bidx % num_v_tiles
+    tmp = bidx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+    r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
+
+    # SMEM. sKdec/sQdec double as staging for k_norm/q_scaled between Stage 1 and 2.
+    smem = cutlass.utils.SmemAllocator()
+    sKdec = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sQdec = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
+    sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)  # b_{T-1}[k]
+    sA = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)
+    sP = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)
+    sW = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)
+
+    r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_tmp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_h = cute.make_rmem_tensor(cute.make_layout((ilp_rows, vec_size), stride=(vec_size, 1)), cutlass.Float32)
+    # r_part: ilp_rows*T batched partials (Skdec, then reused as x = v - Skdec, then Sqdec).
+    r_part = cute.make_rmem_tensor(cute.make_layout((ilp_rows, T), stride=(T, 1)), cutlass.Float32)
+    r_u = cute.make_rmem_tensor(cute.make_layout((ilp_rows, T), stride=(T, 1)), cutlass.Float32)
+    # Stage-3 pair partials: ceil(T*T/4) per warp.
+    ppw: cutlass.Constexpr[int] = (T * T + num_warps - 1) // num_warps
+    r_red = cute.make_rmem_tensor(cute.make_layout((ppw,), stride=(1,)), cutlass.Float32)
+
+    if cache_idx >= 0:
+        k_start = lane_id * vec_size
+        rows_per_group: cutlass.Constexpr[int] = tile_v // num_warps
+        flat_state_idx = cache_idx * HV + i_hv
+
+        # ---- Stage 1: token-parallel gating/l2norm (warp w owns tokens w, w+4, ...) ----
+        for c in cutlass.range_constexpr(vec_size):
+            r_dtb[c] = cutlass.Float32(dt_bias[i_hv, k_start + c])
+        tokens_per_warp: cutlass.Constexpr[int] = (T + num_warps - 1) // num_warps
+        for tt in cutlass.range_constexpr(tokens_per_warp):
+            t_tok = tt * num_warps + warp_idx
+            if t_tok < T:
+                q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, t_tok, i_h, lane_id))
+                k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, t_tok, i_h, lane_id))
+                cute.autovec_copy(q_tile, r_qbf)
+                cute.autovec_copy(k_tile, r_kbf)
+                for c in cutlass.range_constexpr(vec_size):
+                    r_qf[c] = cutlass.Float32(r_qbf[c])
+                    r_kf[c] = cutlass.Float32(r_kbf[c])
+
+                if cutlass.const_expr(use_qk_l2norm):
+                    sum_q = cutlass.Float32(0.0)
+                    sum_k = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        sum_q += r_qf[c] * r_qf[c]
+                        sum_k += r_kf[c] * r_kf[c]
+                    for off in [16, 8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
+                        sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
+                    inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+                    inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_qf[c] = r_qf[c] * inv_q
+                        r_kf[c] = r_kf[c] * inv_k
+                else:
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_qf[c] = r_qf[c] * scale
+
+                # gate g_t per channel; stage k_norm/q_scaled (decay applied in Stage 2)
+                for c in cutlass.range_constexpr(vec_size):
+                    x = cutlass.Float32(a[i_n, t_tok, i_hv, k_start + c]) + r_dtb[c]
+                    beta_x = softplus_beta * x
+                    exp_bx = cute.exp(beta_x, fastmath=fast_math)
+                    sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+                    )
+                    use_sp = (
+                        cutlass.Float32(1.0)
+                        if beta_x <= softplus_threshold
+                        else cutlass.Float32(0.0)
+                    )
+                    sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                    sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+                    sKdec[t_tok, k_start + c] = r_kf[c]
+                    sQdec[t_tok, k_start + c] = r_qf[c]
+                if lane_id == 0:
+                    sBeta[t_tok] = cutlass.Float32(1.0) / (
+                        cutlass.Float32(1.0)
+                        + cute.exp(-cutlass.Float32(b[i_n, t_tok, i_hv]), fastmath=fast_math)
+                    )
+        cute.arch.barrier()
+
+        # ---- Stage 2: K-parallel prefix-product scan (thread = one channel) ----
+        kc = tidx  # requires K == 128 == block size
+        b_run_s = cutlass.Float32(1.0)
+        for i_t in cutlass.range_constexpr(T):
+            kn = sKdec[i_t, kc]
+            b_run_s = b_run_s * sG[i_t, kc]
+            kinv_v = kn / b_run_s
+            sKdec[i_t, kc] = kn * b_run_s
+            sKinv[i_t, kc] = kinv_v
+            sQdec[i_t, kc] = sQdec[i_t, kc] * b_run_s
+            if cutlass.const_expr(write_ubuf):
+                if i_v == 0:
+                    kinv_buf[i_n, i_t, i_hv, kc] = kinv_v
+                    b_buf[i_n, i_t, i_hv, kc] = b_run_s
+        sBlast[kc] = b_run_s
+        cute.arch.barrier()
+
+        # ---- Stage 3: (t,i)-parallel A/P, T^2 pairs round-robined over 4 warps,
+        #      ONE batched butterfly per warp. Pair p: p < T*(T-1)/2 -> A, else P. ----
+        for j in cutlass.range_constexpr(ppw):
+            r_red[j] = cutlass.Float32(0.0)
+        p_ctr = 0
+        for i_t in cutlass.range_constexpr(T):
+            for i_i in cutlass.range_constexpr(i_t):  # A[t,i], i<t
+                if warp_idx == p_ctr % num_warps:
+                    s = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        s += sKdec[i_t, k_start + c] * sKinv[i_i, k_start + c]
+                    r_red[p_ctr // num_warps] = s
+                p_ctr += 1
+        for i_t in cutlass.range_constexpr(T):
+            for i_i in cutlass.range_constexpr(i_t + 1):  # P[t,i], i<=t
+                if warp_idx == p_ctr % num_warps:
+                    s = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        s += sQdec[i_t, k_start + c] * sKinv[i_i, k_start + c]
+                    r_red[p_ctr // num_warps] = s
+                p_ctr += 1
+        for off in [16, 8, 4, 2, 1]:
+            for j in cutlass.range_constexpr(ppw):
+                r_red[j] = r_red[j] + cute.arch.shuffle_sync_bfly(r_red[j], offset=off, mask=-1, mask_and_clamp=31)
+        p_ctr = 0
+        for i_t in cutlass.range_constexpr(T):
+            for i_i in cutlass.range_constexpr(i_t):
+                if warp_idx == p_ctr % num_warps:
+                    if lane_id == 0:
+                        sA[i_t, i_i] = r_red[p_ctr // num_warps]
+                p_ctr += 1
+        for i_t in cutlass.range_constexpr(T):
+            for i_i in cutlass.range_constexpr(i_t + 1):
+                if warp_idx == p_ctr % num_warps:
+                    if lane_id == 0:
+                        sP[i_t, i_i] = r_red[p_ctr // num_warps]
+                p_ctr += 1
+        cute.arch.barrier()
+
+        # ---- Stage 3.5: warp0 builds W = L^{-1} diag(beta), lane j owns column j.
+        # Row recurrence W[t,j] = beta_t*[t==j] - beta_t * sum_{i<t} A[t,i] W[i,j];
+        # each lane only reads its own column -> no cross-lane sync needed. ----
+        if warp_idx == 0:
+            if lane_id < T:
+                for i_t in cutlass.range_constexpr(T):
+                    eq = cutlass.Float32(1.0) if lane_id == i_t else cutlass.Float32(0.0)
+                    acc_w = eq
+                    for i_i in cutlass.range_constexpr(i_t):
+                        acc_w -= sA[i_t, i_i] * sW[i_i, lane_id]
+                    sW[i_t, lane_id] = sBeta[i_t] * acc_w
+        cute.arch.barrier()
+
+        # ---- Stage 4: consumer (4 warp groups over V rows), zero serial deps. ----
+        n_row_groups: cutlass.Constexpr[int] = rows_per_group // ilp_rows
+        for rg in cutlass.range_constexpr(n_row_groups):
+            v_base = i_v * tile_v + warp_idx * rows_per_group + rg * ilp_rows
+            for r in cutlass.range_constexpr(ilp_rows):
+                h_tile = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_id)
+                )
+                cute.autovec_copy(h_tile, cute.slice_(r_h, (r, None)))
+            # all T Skdec_t for all ilp_rows rows in ONE batched butterfly
+            for r in cutlass.range_constexpr(ilp_rows):
+                for i_t in cutlass.range_constexpr(T):
+                    s = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        s += r_h[r, c] * sKdec[i_t, k_start + c]
+                    r_part[r, i_t] = s
+            for off in [16, 8, 4, 2, 1]:
+                for r in cutlass.range_constexpr(ilp_rows):
+                    for i_t in cutlass.range_constexpr(T):
+                        r_part[r, i_t] += cute.arch.shuffle_sync_bfly(r_part[r, i_t], offset=off, mask=-1, mask_and_clamp=31)
+            # x = v - Skdec (r_part reused), then u = W @ x (token-parallel, no dep chain)
+            for r in cutlass.range_constexpr(ilp_rows):
+                for i_t in cutlass.range_constexpr(T):
+                    r_part[r, i_t] = cutlass.Float32(v[i_n, i_t, i_hv, v_base + r]) - r_part[r, i_t]
+            for r in cutlass.range_constexpr(ilp_rows):
+                for i_t in cutlass.range_constexpr(T):
+                    acc = cutlass.Float32(0.0)
+                    for i_i in cutlass.range_constexpr(i_t + 1):
+                        acc += sW[i_t, i_i] * r_part[r, i_i]
+                    r_u[r, i_t] = acc
+            if cutlass.const_expr(write_ubuf):
+                if lane_id == 0:
+                    for r in cutlass.range_constexpr(ilp_rows):
+                        for i_t in cutlass.range_constexpr(T):
+                            u_buf[i_n, i_t, i_hv, v_base + r] = r_u[r, i_t]
+            # o_t = Sqdec_t + sum_{i<=t} P[t,i] u_i (Sqdec batched butterfly into r_part)
+            if cutlass.const_expr(emit_output):
+                for r in cutlass.range_constexpr(ilp_rows):
+                    for i_t in cutlass.range_constexpr(T):
+                        s = cutlass.Float32(0.0)
+                        for c in cutlass.range_constexpr(vec_size):
+                            s += r_h[r, c] * sQdec[i_t, k_start + c]
+                        r_part[r, i_t] = s
+                for off in [16, 8, 4, 2, 1]:
+                    for r in cutlass.range_constexpr(ilp_rows):
+                        for i_t in cutlass.range_constexpr(T):
+                            r_part[r, i_t] += cute.arch.shuffle_sync_bfly(r_part[r, i_t], offset=off, mask=-1, mask_and_clamp=31)
+                for r in cutlass.range_constexpr(ilp_rows):
+                    for i_t in cutlass.range_constexpr(T):
+                        ov = r_part[r, i_t]
+                        for i_i in cutlass.range_constexpr(i_t + 1):
+                            ov += sP[i_t, i_i] * r_u[r, i_i]
+                        if lane_id == 0:
+                            o[(i_n, i_t, i_hv, v_base + r)] = cutlass.BFloat16(ov)
+            # final state S_T[v,k] = b_{T-1}[k]*(S0[v,k] + sum_t u_t kinv_t[k])
+            if cutlass.const_expr(not disable_state_update):
+                for r in cutlass.range_constexpr(ilp_rows):
+                    for c in cutlass.range_constexpr(vec_size):
+                        acc = r_h[r, c]
+                        for i_t in cutlass.range_constexpr(T):
+                            acc += r_u[r, i_t] * sKinv[i_t, k_start + c]
+                        r_tmp[c] = sBlast[k_start + c] * acc
+                    h_out = cute.local_tile(
+                        h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_id)
+                    )
+                    cute.autovec_copy(r_tmp, h_out)
+
+
+@cute.jit
+def run_kda_mtp_tp_kvbuffer_kernel(
+    h0_source: cute.Tensor,
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    u_buf: cute.Tensor,
+    kinv_buf: cute.Tensor,
+    b_buf: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    ilp_rows: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    emit_output: cutlass.Constexpr[bool],
+    write_ubuf: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    """tp-kvbuffer launcher: grid = N*HV*(V//tile_v), block = 128 (4 warps)."""
+    n_indices = h0_indices.layout.shape[0]
+    num_v_tiles = cute.ceil_div(V, tile_v)
+    grid_size = n_indices * HV * num_v_tiles
+    smem_bytes = (
+        4 * 4 * T * (K + 8)  # sKdec/sKinv/sQdec/sG
+        + 4 * T  # sBeta
+        + 4 * K  # sBlast
+        + 3 * 4 * T * T  # sA/sP/sW
+        + 256  # alignment slack
+    )
+    kda_mtp_tp_kvbuffer_kernel(
+        h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
+        u_buf, kinv_buf, b_buf,
+        vec_size, num_v_tiles, tile_v, ilp_rows,
+        softplus_beta, softplus_threshold, scale,
+        HV, T, H, K, V,
+        use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
+    ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
+
+
+_compiled_mtp_tp_kvbuffer_kernels: dict[tuple, object] = {}
+
+
+def _get_compiled_mtp_tp_kvbuffer_kernel(
+    N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
+    disable_state_update, emit_output, write_ubuf,
+    softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
+):
+    key = (
+        N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
+        disable_state_update, emit_output, write_ubuf,
+        softplus_beta, softplus_threshold, opt_level, fast_math,
+    )
+    if key in _compiled_mtp_tp_kvbuffer_kernels:
+        return _compiled_mtp_tp_kvbuffer_kernels[key]
+
+    q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
+    v = torch.zeros(N, T, HV, V, dtype=torch.bfloat16, device="cuda")
+    a = torch.zeros(N, T, HV, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(N, T, HV, dtype=torch.bfloat16, device="cuda")
+    o = torch.zeros(N, T, HV, V, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
+    h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
+    h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+    u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
+    kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+
+    compiled_kernel = cute.compile(
+        run_kda_mtp_tp_kvbuffer_kernel,
+        from_dlpack(h0_source, assumed_align=16),
+        from_dlpack(A_log, assumed_align=16),
+        from_dlpack(a, assumed_align=16),
+        from_dlpack(dt_bias, assumed_align=16),
+        from_dlpack(q, assumed_align=16),
+        from_dlpack(k, assumed_align=16),
+        from_dlpack(v, assumed_align=16),
+        from_dlpack(b, assumed_align=16),
+        from_dlpack(o, assumed_align=16),
+        from_dlpack(h0_indices, assumed_align=16),
+        from_dlpack(u_buf, assumed_align=16),
+        from_dlpack(kinv_buf, assumed_align=16),
+        from_dlpack(b_buf, assumed_align=16),
+        vec_size=VEC_SIZE,
+        tile_v=tile_v,
+        ilp_rows=ilp_rows,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        HV=HV, T=T, H=H, K=K, V=V,
+        use_qk_l2norm=use_qk_l2norm,
+        disable_state_update=disable_state_update,
+        emit_output=emit_output,
+        write_ubuf=write_ubuf,
+        fast_math=fast_math,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        options=f"--enable-tvm-ffi --opt-level {opt_level}",
+    )
+    _compiled_mtp_tp_kvbuffer_kernels[key] = compiled_kernel
+    logger.info(
+        "CuTe DSL KDA MTP tp-KVBuffer kernel compiled: "
+        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, tile_v={tile_v}, ilp_rows={ilp_rows}, "
+        f"opt_level={opt_level}, fast_math={fast_math}"
+    )
+    return compiled_kernel
+
+
+def _select_tp_kvb_ilp_rows(tile_v, T):
+    """Largest ilp_rows in {4,2,1} dividing rows_per_group with ilp_rows*T <= 16 — the consumer
+    holds two (ilp_rows, T) fp32 register arrays (r_part + r_u), so cap their footprint."""
+    rows_per_group = tile_v // 4
+    for r in (4, 2, 1):
+        if rows_per_group % r == 0 and r * T <= 16:
+            return r
+    return 1
+
+
+def kda_decode_mtp_tp_kvbuffer(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    out: torch.Tensor | None = None,
+    disable_state_update: bool = True,
+    emit_output: bool = True,
+    u_buffer: torch.Tensor | None = None,
+    kinv_buffer: torch.Tensor | None = None,
+    b_buffer: torch.Tensor | None = None,
+    tile_v: int = -1,
+    ilp_rows: int = -1,
+    opt_level: int = 3,
+    fast_math: bool = True,
+) -> torch.Tensor:
+    """KDA MTP decode — tp-KVBuffer / token-parallel chunkwise (structure B). VERIFY stage.
+
+    Same math and signature as kda_decode_mtp_ws_kvbuffer but a fully token-parallel
+    schedule (see kernel docstring): verify latency targets ~T-independence (paper Fig.4).
+    Flush side reuses kda_flush_kvbuffer unchanged.
+    """
+    N, T, H, K = q.shape
+    HV = v.shape[2]
+    V = v.shape[3]
+    write_ubuf = u_buffer is not None
+
+    if scale is None:
+        scale = K**-0.5
+    else:
+        assert scale > 0, f"scale must be positive, got {scale}"
+
+    assert K == TILE_K, f"tp-kvbuffer requires K={TILE_K}, got {K}"
+    assert K == 128, f"tp-kvbuffer Stage-2 scan maps 128 threads to K channels; needs K=128, got {K}"
+    assert T <= 32, f"tp-kvbuffer W-build uses one lane per token column; needs T<=32, got {T}"
+
+    if tile_v <= 0:
+        tile_v = _select_ws_kvb_tile_v(V, N)
+    assert V % tile_v == 0, f"tp-kvbuffer requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
+    assert tile_v % 4 == 0, f"tp-kvbuffer requires tile_v % 4 == 0 (4 warps), got {tile_v}"
+    rows_per_group = tile_v // 4
+    if ilp_rows <= 0:
+        ilp_rows = _select_tp_kvb_ilp_rows(tile_v, T)
+    assert rows_per_group % ilp_rows == 0, (
+        f"tp-kvbuffer requires (tile_v/4) % ilp_rows == 0, got tile_v={tile_v}, ilp_rows={ilp_rows}"
+    )
+
+    h0_source, pool_size, _ = _normalize_state_source(
+        initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout="vk",
+    )
+
+    a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
+    if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
+        raise ValueError(f"Unexpected b shape for MTP dense: {tuple(b.shape)}; expected {(N, T, HV)}")
+
+    o = _prepare_output_tensor(q, out, (N, T, HV, V))
+
+    q = q if q.is_contiguous() else q.contiguous()
+    k = k if k.is_contiguous() else k.contiguous()
+    v = v if v.is_contiguous() else v.contiguous()
+    a = a if a.is_contiguous() else a.contiguous()
+    b = b if b.is_contiguous() else b.contiguous()
+
+    A_log = _normalize_A_log(A_log, HV)
+    dt_bias = _normalize_dt_bias(dt_bias, HV, K)
+    initial_state_indices = _normalize_state_indices(
+        initial_state_indices, N=N, pool_size=pool_size, device=q.device
+    )
+
+    if write_ubuf:
+        if tuple(u_buffer.shape) != (N, T, HV, V):
+            raise ValueError(f"u_buffer shape must be {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
+        if tuple(kinv_buffer.shape) != (N, T, HV, K) or tuple(b_buffer.shape) != (N, T, HV, K):
+            raise ValueError(f"kinv_buffer/b_buffer shape must be {(N, T, HV, K)}")
+        u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
+    else:
+        u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
+        kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
+        b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
+
+    stream = _get_cached_stream(q.device)
+
+    h0_source_flat = h0_source.view(pool_size * HV, V, K)
+    compiled_kernel = _get_compiled_mtp_tp_kvbuffer_kernel(
+        N, T, H, HV, K, V, pool_size, tile_v, ilp_rows,
+        scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
+        disable_state_update=disable_state_update, emit_output=emit_output,
+        write_ubuf=write_ubuf,
+        softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
+        opt_level=opt_level, fast_math=fast_math,
+    )
+    compiled_kernel(
+        h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
+        initial_state_indices, u_buf, kinv_buf, b_buf, stream,
+    )
+    return o
