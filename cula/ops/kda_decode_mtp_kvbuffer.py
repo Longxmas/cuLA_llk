@@ -128,13 +128,15 @@ def kda_mtp_kvbuffer_vk_kernel(
     qdec = cute.make_rmem_tensor(cute.make_layout((T * vec_size,), stride=(1,)), cutlass.Float32)
     r_beta = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)  # 每 token sigmoid 门(复制)
     r_u = cute.make_rmem_tensor(cute.make_layout((T * BV,), stride=(1,)), cutlass.Float32)  # 伪 value u_t[vv](复制)
-    r_bv = cute.make_rmem_tensor(cute.make_layout((BV,), stride=(1,)), cutlass.Float32)  # 当前 token 的 v 列
     b_run = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # 累积衰减 b_t(本 lane 通道)
     r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    a_row = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)  # A[t,i]/P[t,i] 行临时(复制)
+    # ILP batched butterfly:把固定 t 的所有 reduce-over-K（A/P 的 i 个 + Skdec/Sqdec 的 BV 个）
+    # 拼进一个宽度 i_t+BV 的 partial 数组,一趟 butterfly 全归约 → 依赖深度从 (i_t+BV)*5 降到 5。
+    # 前段 [0:i_t] = A[t,i]/P[t,i] partial;后段 [i_t:i_t+BV] = Skdec/Sqdec partial。
+    r_redB = cute.make_rmem_tensor(cute.make_layout((T + BV,), stride=(1,)), cutlass.Float32)
 
     # ===== state S0 载入(连续块 + float4,coalesced+向量化) =====
     if cache_idx >= 0:
@@ -220,28 +222,29 @@ def kda_mtp_kvbuffer_vk_kernel(
     # 循环后 b_run[c] = b_{T-1}[c]（末尾 state 更新用）。
 
     # ===== Phase B:前代求 u_t[vv]。u_t = beta_t*(v_t - S0@kdec_t - Σ_{i<t} A[t,i] u_i) =====
+    # ILP batched butterfly:固定 t 时,A[t,i](i<t)与 Skdec[vv](BV 个)的 reduce-over-K partial
+    # 全拼进 r_redB[0:i_t+BV],一趟 butterfly 归约;然后前代求 u(serial over t 仍保留)。
     for i_t in cutlass.range_constexpr(T):
-        # A[t,i] = <kdec_t, kinv_i>（i<t；reduce-over-K 全 warp all-reduce，每 lane 同值）
+        # partial:前段 A[t,i]=<kdec_t,kinv_i>(i<t),后段 Skdec[vv]=<r_h[vv],kdec_t>
         for i_i in cutlass.range_constexpr(i_t):
-            aij = cutlass.Float32(0.0)
+            s = cutlass.Float32(0.0)
             for c in cutlass.range_constexpr(vec_size):
-                aij += kdec[i_t * vec_size + c] * kinv[i_i * vec_size + c]
-            for off in [16, 8, 4, 2, 1]:
-                aij += cute.arch.shuffle_sync_bfly(aij, offset=off, mask=-1, mask_and_clamp=31)
-            a_row[i_i] = aij
-        # 当前 token 的 v 列
+                s += kdec[i_t * vec_size + c] * kinv[i_i * vec_size + c]
+            r_redB[i_i] = s
         for vv in cutlass.range_constexpr(BV):
-            r_bv[vv] = cutlass.Float32(v[i_n, i_t, i_hv, i_v * BV + vv])
-        # 每个 v 列:Skdec=S0@kdec_t（reduce-over-K）→ u
-        for vv in cutlass.range_constexpr(BV):
-            skd = cutlass.Float32(0.0)
+            s = cutlass.Float32(0.0)
             for c in cutlass.range_constexpr(vec_size):
-                skd += r_h[vv * vec_size + c] * kdec[i_t * vec_size + c]
-            for off in [16, 8, 4, 2, 1]:
-                skd += cute.arch.shuffle_sync_bfly(skd, offset=off, mask=-1, mask_and_clamp=31)
-            acc = r_bv[vv] - skd
+                s += r_h[vv * vec_size + c] * kdec[i_t * vec_size + c]
+            r_redB[i_t + vv] = s
+        # 一趟 batched butterfly:width=i_t+BV 个 partial 各自独立 → 5 round shuffle(ILP)
+        for off in [16, 8, 4, 2, 1]:
+            for j in cutlass.range_constexpr(i_t + BV):
+                r_redB[j] = r_redB[j] + cute.arch.shuffle_sync_bfly(r_redB[j], offset=off, mask=-1, mask_and_clamp=31)
+        # 前代:u_t[vv] = beta_t*(v_t[vv] - Skdec[vv] - Σ_{i<t} A[t,i]*u_i[vv])
+        for vv in cutlass.range_constexpr(BV):
+            acc = cutlass.Float32(v[i_n, i_t, i_hv, i_v * BV + vv]) - r_redB[i_t + vv]
             for i_i in cutlass.range_constexpr(i_t):
-                acc -= a_row[i_i] * r_u[i_i * BV + vv]
+                acc -= r_redB[i_i] * r_u[i_i * BV + vv]
             r_u[i_t * BV + vv] = r_beta[i_t] * acc
 
     # u-buffer:u_t[v] 是本 CTA 的 v 列(每 CTA 写自己那段);lane vv 写第 vv 列(连续 coalesced)。
@@ -253,24 +256,27 @@ def kda_mtp_kvbuffer_vk_kernel(
     # ===== Phase C:输出 o_t[vv] = S0@qdec_t + Σ_{i<=t} P[t,i] u_i =====
     # flush 模式(emit_output=False)只更新 state,跳过整段输出计算(P/o 都不需要)。
     if cutlass.const_expr(emit_output):
+        # ILP batched butterfly:固定 t 时,P[t,i](i<=t)与 Sqdec[vv]的 partial 拼进 r_redB[0:(i_t+1)+BV],
+        # 一趟归约。前段 [0:i_t+1]=P[t,i],后段 [i_t+1:i_t+1+BV]=Sqdec[vv]。
         for i_t in cutlass.range_constexpr(T):
-            # P[t,i] = <qdec_t, kinv_i>（i<=t）
             for i_i in cutlass.range_constexpr(i_t + 1):
-                pij = cutlass.Float32(0.0)
+                s = cutlass.Float32(0.0)
                 for c in cutlass.range_constexpr(vec_size):
-                    pij += qdec[i_t * vec_size + c] * kinv[i_i * vec_size + c]
-                for off in [16, 8, 4, 2, 1]:
-                    pij += cute.arch.shuffle_sync_bfly(pij, offset=off, mask=-1, mask_and_clamp=31)
-                a_row[i_i] = pij
+                    s += qdec[i_t * vec_size + c] * kinv[i_i * vec_size + c]
+                r_redB[i_i] = s
             for vv in cutlass.range_constexpr(BV):
-                sqd = cutlass.Float32(0.0)
+                s = cutlass.Float32(0.0)
                 for c in cutlass.range_constexpr(vec_size):
-                    sqd += r_h[vv * vec_size + c] * qdec[i_t * vec_size + c]
-                for off in [16, 8, 4, 2, 1]:
-                    sqd += cute.arch.shuffle_sync_bfly(sqd, offset=off, mask=-1, mask_and_clamp=31)
-                ov = sqd
+                    s += r_h[vv * vec_size + c] * qdec[i_t * vec_size + c]
+                r_redB[(i_t + 1) + vv] = s
+            for off in [16, 8, 4, 2, 1]:
+                for j in cutlass.range_constexpr((i_t + 1) + BV):
+                    r_redB[j] = r_redB[j] + cute.arch.shuffle_sync_bfly(r_redB[j], offset=off, mask=-1, mask_and_clamp=31)
+            # o_t[vv] = Sqdec[vv] + Σ_{i<=t} P[t,i]*u_i[vv]
+            for vv in cutlass.range_constexpr(BV):
+                ov = r_redB[(i_t + 1) + vv]
                 for i_i in cutlass.range_constexpr(i_t + 1):
-                    ov += a_row[i_i] * r_u[i_i * BV + vv]
+                    ov += r_redB[i_i] * r_u[i_i * BV + vv]
                 # all-reduce 后每 lane 同值 → 32 lane 同址幂等写
                 o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(ov)
 
@@ -604,6 +610,462 @@ def kda_decode_mtp_kvbuffer(
         stream,
     )
 
+    return o
+
+
+# ============================================================================
+# ws-kvbuffer:warp-spec chunkwise(对标生产 ws 的大批量场景)。
+#   - warp0 producer:逐 token 算 kdec/kinv/qdec[T,K]、累积 b_t、beta_t → SMEM;
+#     再用 SMEM 里的特征算 T×T 的 A[t,i]/P[t,i](reduce-over-K,warp0 持全 K)→ SMEM;
+#     b_{T-1}[k] 存 sBlast。可选写紧凑 u/kinv/b buffer(kinv/b 由 warp0 写)。
+#   - warps0-3 consumer:每组持 tile_v/4 个 V-row(group_idx*rows_per_group+row)。每行:
+#     Skdec_t=S0@kdec_t、Sqdec_t=S0@qdec_t(reduce-over-K,butterfly);三角前代求 u_t;
+#     o_t=Sqdec_t+Σ_{i<=t} P[t,i] u_i;末尾一次性 S_T=b_{T-1}*(S0+Σ u_t kinv_t) 回写。
+# 数学与 recurrent/vk-kvbuffer 完全一致;state pool 同 vk [pool,HV,V,K]。
+# ============================================================================
+@cute.kernel
+def kda_mtp_ws_kvbuffer_kernel(
+    h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    u_buf: cute.Tensor,     # [N, T, HV, V] fp32
+    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32
+    b_buf: cute.Tensor,     # [N, T, HV, K] fp32
+    vec_size: cutlass.Constexpr[int],
+    num_v_tiles: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    emit_output: cutlass.Constexpr[bool],
+    write_ubuf: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+
+    threads_per_group: cutlass.Constexpr[int] = K // vec_size  # 32 = full warp
+    num_groups: cutlass.Constexpr[int] = 4
+    lane_in_group = lane_id  # threads_per_group==32 → lane_in_group==lane
+    group_idx = warp_idx
+
+    bidx, _, _ = cute.arch.block_idx()
+    i_v = bidx % num_v_tiles
+    tmp = bidx // num_v_tiles
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+    r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
+
+    # ===== SMEM:warp0 producer → 所有 warp consumer 广播 =====
+    smem = cutlass.utils.SmemAllocator()
+    sKdec = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sQdec = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
+    sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T,)), 16)
+    sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)  # b_{T-1}[k]
+    sA = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # A[t,i] i<t
+    sP = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # P[t,i] i<=t
+
+    # ===== 寄存器(所有 warp 顶部声明) =====
+    r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    b_run = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_tmp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # SMEM 读写 float4 临时
+    r_h = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # consumer:一行 S0 的 K 通道
+    r_skdec = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)
+    r_u = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)
+
+    if cache_idx >= 0:
+        k_start = lane_in_group * vec_size
+        rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
+        flat_state_idx = cache_idx * HV + i_hv
+
+        # ===== warp0 producer =====
+        if warp_idx == 0:
+            for c in cutlass.range_constexpr(vec_size):
+                r_dtb[c] = cutlass.Float32(dt_bias[i_hv, k_start + c])
+                b_run[c] = cutlass.Float32(1.0)
+            for i_t in cutlass.range_constexpr(T):
+                q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group))
+                k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_in_group))
+                cute.autovec_copy(q_tile, r_qbf)
+                cute.autovec_copy(k_tile, r_kbf)
+                for c in cutlass.range_constexpr(vec_size):
+                    r_qf[c] = cutlass.Float32(r_qbf[c])
+                    r_kf[c] = cutlass.Float32(r_kbf[c])
+
+                if cutlass.const_expr(use_qk_l2norm):
+                    sum_q = cutlass.Float32(0.0)
+                    sum_k = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        sum_q += r_qf[c] * r_qf[c]
+                        sum_k += r_kf[c] * r_kf[c]
+                    for off in [16, 8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
+                        sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
+                    inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+                    inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_qf[c] = r_qf[c] * inv_q
+                        r_kf[c] = r_kf[c] * inv_k
+                else:
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_qf[c] = r_qf[c] * scale
+
+                for c in cutlass.range_constexpr(vec_size):
+                    x = cutlass.Float32(a[i_n, i_t, i_hv, k_start + c]) + r_dtb[c]
+                    beta_x = softplus_beta * x
+                    exp_bx = cute.exp(beta_x, fastmath=fast_math)
+                    sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+                    )
+                    use_sp = (
+                        cutlass.Float32(1.0)
+                        if beta_x <= softplus_threshold
+                        else cutlass.Float32(0.0)
+                    )
+                    sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                    g_c = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+                    b_run[c] = b_run[c] * g_c
+                    sKdec[i_t, k_start + c] = r_kf[c] * b_run[c]
+                    sKinv[i_t, k_start + c] = r_kf[c] / b_run[c]
+                    sQdec[i_t, k_start + c] = r_qf[c] * b_run[c]
+
+                sBeta[i_t] = cutlass.Float32(1.0) / (
+                    cutlass.Float32(1.0) + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
+                )
+
+                if cutlass.const_expr(write_ubuf):
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_tmp[c] = sKinv[i_t, k_start + c]
+                    kinv_out = cute.local_tile(kinv_buf, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_in_group))
+                    cute.autovec_copy(r_tmp, kinv_out)
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_tmp[c] = b_run[c]
+                    b_out = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_in_group))
+                    cute.autovec_copy(r_tmp, b_out)
+
+            for c in cutlass.range_constexpr(vec_size):
+                sBlast[k_start + c] = b_run[c]
+
+            # A[t,i]=<kdec_t,kinv_i> (i<t)、P[t,i]=<qdec_t,kinv_i> (i<=t) —— 从 SMEM 读本 lane 通道,butterfly。
+            for i_t in cutlass.range_constexpr(T):
+                for i_i in cutlass.range_constexpr(i_t):
+                    aij = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        aij += sKdec[i_t, k_start + c] * sKinv[i_i, k_start + c]
+                    for off in [16, 8, 4, 2, 1]:
+                        aij += cute.arch.shuffle_sync_bfly(aij, offset=off, mask=-1, mask_and_clamp=31)
+                    sA[i_t, i_i] = aij
+                for i_i in cutlass.range_constexpr(i_t + 1):
+                    pij = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        pij += sQdec[i_t, k_start + c] * sKinv[i_i, k_start + c]
+                    for off in [16, 8, 4, 2, 1]:
+                        pij += cute.arch.shuffle_sync_bfly(pij, offset=off, mask=-1, mask_and_clamp=31)
+                    sP[i_t, i_i] = pij
+
+        # 发布 warp0 的 SMEM 给所有 warp
+        cute.arch.barrier()
+
+        # ===== consumers:每组 rows_per_group 行 =====
+        for row in cutlass.range_constexpr(rows_per_group):
+            v_idx = i_v * tile_v + group_idx * rows_per_group + row
+            if v_idx < V:
+                # 载 S0 行(本 lane 的 4 个 K 通道)
+                h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx, lane_in_group))
+                cute.autovec_copy(h_tile, r_h)
+                # Skdec_t = S0@kdec_t (reduce-over-K)
+                for i_t in cutlass.range_constexpr(T):
+                    sk = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        sk += r_h[c] * sKdec[i_t, k_start + c]
+                    for off in [16, 8, 4, 2, 1]:
+                        sk += cute.arch.shuffle_sync_bfly(sk, offset=off, mask=-1, mask_and_clamp=31)
+                    r_skdec[i_t] = sk
+                # 三角前代:u_t = beta_t*(v_t - Skdec_t - Σ_{i<t} A[t,i] u_i)
+                for i_t in cutlass.range_constexpr(T):
+                    acc = cutlass.Float32(v[i_n, i_t, i_hv, v_idx]) - r_skdec[i_t]
+                    for i_i in cutlass.range_constexpr(i_t):
+                        acc -= sA[i_t, i_i] * r_u[i_i]
+                    r_u[i_t] = sBeta[i_t] * acc
+                # u-buffer:每行 u_t 复制在所有 lane,lane0 写一次
+                if cutlass.const_expr(write_ubuf):
+                    if lane_in_group == 0:
+                        for i_t in cutlass.range_constexpr(T):
+                            u_buf[i_n, i_t, i_hv, v_idx] = r_u[i_t]
+                # 输出 o_t = Sqdec_t + Σ_{i<=t} P[t,i] u_i
+                if cutlass.const_expr(emit_output):
+                    for i_t in cutlass.range_constexpr(T):
+                        sq = cutlass.Float32(0.0)
+                        for c in cutlass.range_constexpr(vec_size):
+                            sq += r_h[c] * sQdec[i_t, k_start + c]
+                        for off in [16, 8, 4, 2, 1]:
+                            sq += cute.arch.shuffle_sync_bfly(sq, offset=off, mask=-1, mask_and_clamp=31)
+                        ov = sq
+                        for i_i in cutlass.range_constexpr(i_t + 1):
+                            ov += sP[i_t, i_i] * r_u[i_i]
+                        if lane_in_group == 0:
+                            o[(i_n, i_t, i_hv, v_idx)] = cutlass.BFloat16(ov)
+                # 末态:S_T[v,k] = b_{T-1}[k]*(S0[v,k] + Σ_t u_t kinv_t[k]),一次性回写
+                if cutlass.const_expr(not disable_state_update):
+                    for c in cutlass.range_constexpr(vec_size):
+                        acc = r_h[c]
+                        for i_t in cutlass.range_constexpr(T):
+                            acc += r_u[i_t] * sKinv[i_t, k_start + c]
+                        r_tmp[c] = sBlast[k_start + c] * acc
+                    h_out = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_idx, lane_in_group))
+                    cute.autovec_copy(r_tmp, h_out)
+
+
+@cute.jit
+def run_kda_mtp_ws_kvbuffer_kernel(
+    h0_source: cute.Tensor,
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    u_buf: cute.Tensor,
+    kinv_buf: cute.Tensor,
+    b_buf: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    emit_output: cutlass.Constexpr[bool],
+    write_ubuf: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    """ws-kvbuffer launcher:grid = N*HV*(V//tile_v),block = 128(4 warp)。"""
+    n_indices = h0_indices.layout.shape[0]
+    num_v_tiles = cute.ceil_div(V, tile_v)
+    grid_size = n_indices * HV * num_v_tiles
+    smem_bytes = (
+        3 * 4 * T * (K + 8)  # sKdec/sKinv/sQdec
+        + 4 * T  # sBeta
+        + 4 * K  # sBlast
+        + 2 * 4 * T * T  # sA/sP
+        + 256  # 对齐余量
+    )
+    kda_mtp_ws_kvbuffer_kernel(
+        h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
+        u_buf, kinv_buf, b_buf,
+        vec_size, num_v_tiles, tile_v,
+        softplus_beta, softplus_threshold, scale,
+        HV, T, H, K, V,
+        use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
+    ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
+
+
+_compiled_mtp_ws_kvbuffer_kernels: dict[tuple, object] = {}
+
+
+def _get_compiled_mtp_ws_kvbuffer_kernel(
+    N, T, H, HV, K, V, pool_size, tile_v, scale, use_qk_l2norm,
+    disable_state_update, emit_output, write_ubuf,
+    softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
+):
+    key = (
+        N, T, H, HV, K, V, pool_size, tile_v, scale, use_qk_l2norm,
+        disable_state_update, emit_output, write_ubuf,
+        softplus_beta, softplus_threshold, opt_level, fast_math,
+    )
+    if key in _compiled_mtp_ws_kvbuffer_kernels:
+        return _compiled_mtp_ws_kvbuffer_kernels[key]
+
+    q = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros(N, T, H, K, dtype=torch.bfloat16, device="cuda")
+    v = torch.zeros(N, T, HV, V, dtype=torch.bfloat16, device="cuda")
+    a = torch.zeros(N, T, HV, K, dtype=torch.bfloat16, device="cuda")
+    b = torch.zeros(N, T, HV, dtype=torch.bfloat16, device="cuda")
+    o = torch.zeros(N, T, HV, V, dtype=torch.bfloat16, device="cuda")
+    A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
+    dt_bias = torch.zeros(HV, K, dtype=torch.float32, device="cuda")
+    h0_source = torch.zeros(pool_size * HV, V, K, dtype=torch.float32, device="cuda")
+    h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+    u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device="cuda")
+    kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+    b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
+
+    compiled_kernel = cute.compile(
+        run_kda_mtp_ws_kvbuffer_kernel,
+        from_dlpack(h0_source, assumed_align=16),
+        from_dlpack(A_log, assumed_align=16),
+        from_dlpack(a, assumed_align=16),
+        from_dlpack(dt_bias, assumed_align=16),
+        from_dlpack(q, assumed_align=16),
+        from_dlpack(k, assumed_align=16),
+        from_dlpack(v, assumed_align=16),
+        from_dlpack(b, assumed_align=16),
+        from_dlpack(o, assumed_align=16),
+        from_dlpack(h0_indices, assumed_align=16),
+        from_dlpack(u_buf, assumed_align=16),
+        from_dlpack(kinv_buf, assumed_align=16),
+        from_dlpack(b_buf, assumed_align=16),
+        vec_size=VEC_SIZE,
+        tile_v=tile_v,
+        softplus_beta=softplus_beta,
+        softplus_threshold=softplus_threshold,
+        scale=scale,
+        HV=HV, T=T, H=H, K=K, V=V,
+        use_qk_l2norm=use_qk_l2norm,
+        disable_state_update=disable_state_update,
+        emit_output=emit_output,
+        write_ubuf=write_ubuf,
+        fast_math=fast_math,
+        stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        options=f"--enable-tvm-ffi --opt-level {opt_level}",
+    )
+    _compiled_mtp_ws_kvbuffer_kernels[key] = compiled_kernel
+    logger.info(
+        "CuTe DSL KDA MTP ws-KVBuffer kernel compiled: "
+        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, tile_v={tile_v}, "
+        f"opt_level={opt_level}, fast_math={fast_math}"
+    )
+    return compiled_kernel
+
+
+def _select_ws_kvb_tile_v(V):
+    """简单启发:tile_v 取能整除 V 且 ≥ 32 的最大值(≤64),保证 rows_per_group≥1。"""
+    for tv in (64, 32, 16, 8):
+        if V % tv == 0:
+            return tv
+    return 8
+
+
+def kda_decode_mtp_ws_kvbuffer(
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None = None,
+    use_qk_l2norm_in_kernel: bool = True,
+    softplus_beta: float = 1.0,
+    softplus_threshold: float = 20.0,
+    out: torch.Tensor | None = None,
+    disable_state_update: bool = True,
+    emit_output: bool = True,
+    u_buffer: torch.Tensor | None = None,
+    kinv_buffer: torch.Tensor | None = None,
+    b_buffer: torch.Tensor | None = None,
+    tile_v: int = -1,
+    opt_level: int = 3,
+    fast_math: bool = True,
+) -> torch.Tensor:
+    """KDA MTP decode — ws-KVBuffer / warp-spec chunkwise(单 chunk = T)。**verify 阶段**。
+
+    与 ``kda_decode_mtp_kvbuffer`` 同义(verify→flush 两 kernel,flush 复用 ``kda_flush_kvbuffer``),
+    但用 4-warp warp-spec 实现 chunkwise,面向大批量(对标生产 ws)。签名与 vk-kvbuffer 一致(多 tile_v)。
+    """
+    N, T, H, K = q.shape
+    HV = v.shape[2]
+    V = v.shape[3]
+    write_ubuf = u_buffer is not None
+
+    if scale is None:
+        scale = K**-0.5
+    else:
+        assert scale > 0, f"scale must be positive, got {scale}"
+
+    assert K == TILE_K, f"ws-kvbuffer requires K={TILE_K}, got {K}"
+    assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
+        f"ws-kvbuffer 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
+    )
+
+    if tile_v <= 0:
+        tile_v = _select_ws_kvb_tile_v(V)
+    assert V % tile_v == 0, f"ws-kvbuffer requires V % tile_v == 0, got V={V}, tile_v={tile_v}"
+    assert tile_v % 4 == 0, f"ws-kvbuffer requires tile_v % 4 == 0 (4 warps), got {tile_v}"
+
+    h0_source, pool_size, _ = _normalize_state_source(
+        initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout="vk",
+    )
+
+    a = _normalize_mtp_a(a, N=N, T=T, HV=HV, K=K)
+    if b.dim() != 3 or tuple(b.shape) != (N, T, HV):
+        raise ValueError(f"Unexpected b shape for MTP dense: {tuple(b.shape)}; expected {(N, T, HV)}")
+
+    o = _prepare_output_tensor(q, out, (N, T, HV, V))
+
+    q = q if q.is_contiguous() else q.contiguous()
+    k = k if k.is_contiguous() else k.contiguous()
+    v = v if v.is_contiguous() else v.contiguous()
+    a = a if a.is_contiguous() else a.contiguous()
+    b = b if b.is_contiguous() else b.contiguous()
+
+    A_log = _normalize_A_log(A_log, HV)
+    dt_bias = _normalize_dt_bias(dt_bias, HV, K)
+    initial_state_indices = _normalize_state_indices(
+        initial_state_indices, N=N, pool_size=pool_size, device=q.device
+    )
+
+    if write_ubuf:
+        if tuple(u_buffer.shape) != (N, T, HV, V):
+            raise ValueError(f"u_buffer 形状须 {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
+        if tuple(kinv_buffer.shape) != (N, T, HV, K) or tuple(b_buffer.shape) != (N, T, HV, K):
+            raise ValueError(f"kinv_buffer/b_buffer 形状须 {(N, T, HV, K)}")
+        u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
+    else:
+        u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
+        kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
+        b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
+
+    stream = _get_cached_stream(q.device)
+
+    h0_source_flat = h0_source.view(pool_size * HV, V, K)
+    compiled_kernel = _get_compiled_mtp_ws_kvbuffer_kernel(
+        N, T, H, HV, K, V, pool_size, tile_v,
+        scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
+        disable_state_update=disable_state_update, emit_output=emit_output,
+        write_ubuf=write_ubuf,
+        softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
+        opt_level=opt_level, fast_math=fast_math,
+    )
+    compiled_kernel(
+        h0_source_flat, A_log, a, dt_bias, q, k, v, b, o,
+        initial_state_indices, u_buf, kinv_buf, b_buf, stream,
+    )
     return o
 
 
