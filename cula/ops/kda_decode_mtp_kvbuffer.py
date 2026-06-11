@@ -1,39 +1,21 @@
 """CuTe DSL KDA MTP decode — KVBuffer / chunkwise parallel-verification variant.
 
-Follow-up to issue 17. The production recurrent operators live in
-``kda_decode_mtp.py`` (vk / kv). This file implements the **KVBuffer** paper's
-*chunkwise parallel-verification* form (``KVBuffer: IO-aware Serving for Linear
-Attention``, §3.3) as a NEW operator, to be benchmarked against the recurrent
-ops. Design notes + math derivation: ``kvbuffer_dev/KVBUFFER_DESIGN.md`` (the
-single-chunk gated-delta-rule equivalence is verified to machine precision in
-``kvbuffer_dev/verify_chunkwise_kda.py``).
+KVBuffer paper's chunkwise verify form (§3.3) as a new operator vs the recurrent
+vk/kv ops in ``kda_decode_mtp.py``. The T draft tokens are treated as ONE chunk:
+per-token outputs come from the FIXED input state S0 plus a small T×T intra-chunk
+correction, and the state is updated once at the end — the S0-matvecs are
+independent across tokens (no length-T serial chain), the latency angle at small
+batch. Infra (grid N*HV*(V//BV), 1 warp/CTA, lane=K, float4 loads, butterfly
+reduce-over-K) mirrors the production vk kernel for apples-to-apples comparison.
 
-Instead of evolving the d×d state token-by-token (a length-T serial dependency
-chain), this kernel treats the T draft tokens as ONE chunk: it computes per-token
-outputs from the FIXED input state S0 plus a tiny T×T intra-chunk correction, and
-updates the state once at the end. The expensive S0-matvecs are independent
-across the T tokens (no serial chain), which is the latency angle vs the
-recurrent op at small batch.
-
-Layout / infra are mirrored from the production vk kernel
-(``kda_mtp_small_batch_vk_kernel``) so the comparison is apples-to-apples:
-grid = N*HV*(V//BV), 1 warp/CTA, lane=K (each lane owns vec_size=4 contiguous K
-channels across BV V-cols), float4 coalesced state load/store, butterfly
-shuffle reduce-over-K. Every reduce-over-K is a full-warp all-reduce, so A/P/
-Skdec/Sqdec/u/o are computed identically (replicated) on all 32 lanes; only the
-register state r_h and this lane's kdec/kinv/qdec channels are lane-private.
-
-Chunkwise math per chunk (state S0[v,k], decay-first; matches the recurrent op):
-    g_t[k]  = exp(-exp(A_log) * softplus(a_t[k] + dt_bias[k]))   # per channel
-    b_t[k]  = prod_{i<=t} g_i[k]                                 # cumulative decay
+Chunkwise math (state S0[v,k], decay-first; matches the recurrent op):
+    g_t[k]  = exp(-exp(A_log) * softplus(a_t[k] + dt_bias[k]))    # per channel
+    b_t[k]  = prod_{i<=t} g_i[k]                                  # cumulative decay
     kdec_t  = k_norm_t * b_t ; kinv_t = k_norm_t / b_t ; qdec_t = q_scaled_t * b_t
-    A[t,i]  = <kdec_t, kinv_i>  (i<t)      P[t,i] = <qdec_t, kinv_i>  (i<=t)
+    A[t,i]  = <kdec_t, kinv_i> (i<t)       P[t,i] = <qdec_t, kinv_i> (i<=t)
     u_t[v]  = beta_t * (v_t[v] - (S0 @ kdec_t)[v] - sum_{i<t} A[t,i] u_i[v])
     o_t[v]  = (S0 @ qdec_t)[v] + sum_{i<=t} P[t,i] u_i[v]
     S_T[v,k]= b_{T-1}[k] * (S0[v,k] + sum_i u_i[v] kinv_i[k])     # full accept
-
-Scope (v1): single chunk (T tokens), vk layout, full accept. Partial-accept
-rollback and a kv-layout variant are future work (see design doc).
 """
 
 import logging
@@ -62,14 +44,7 @@ from cula.ops.kda_decode_mtp import (
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# kvbuffer:lane=K + chunkwise(单 chunk = T 个 draft token)。布局/载入/回写与
-# 生产 vk kernel 完全一致;递推体替换为 chunkwise gated-delta-rule:
-#   - S0(r_h)全程不变,T 个 token 的输出都对 FIXED S0 做 matvec(无长度-T 串行链);
-#   - intra-chunk 用 T×T 的 A/P 修正(内联重算,不占寄存器)+ 前代求 u;
-#   - 末尾一次性把 state 更新为 S_T。
-# 数学与 recurrent vk/kv 完全一致(verify_chunkwise_kda.py 机器精度对齐)。
-# ============================================================================
+# vk-kvbuffer: lane=K, 1 warp/CTA, chunkwise gated-delta-rule (single chunk = T draft tokens).
 @cute.kernel
 def kda_mtp_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
@@ -82,9 +57,9 @@ def kda_mtp_kvbuffer_vk_kernel(
     b: cute.Tensor,
     o: cute.Tensor,
     h0_indices: cute.Tensor,
-    u_buf: cute.Tensor,     # [N, T, HV, V] fp32  伪 value u_t[v]（write_ubuf 时写）
-    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32  kinv_t[k]=k_norm_t/b_t
-    b_buf: cute.Tensor,     # [N, T, HV, K] fp32  累积衰减 b_t[k]
+    u_buf: cute.Tensor,     # [N, T, HV, V] fp32  pseudo-value u_t[v] (written when write_ubuf)
+    kinv_buf: cute.Tensor,  # [N, T, HV, K] fp32  kinv_t[k] = k_norm_t / b_t
+    b_buf: cute.Tensor,     # [N, T, HV, K] fp32  cumulative decay b_t[k]
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
@@ -99,11 +74,11 @@ def kda_mtp_kvbuffer_vk_kernel(
     use_qk_l2norm: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
     emit_output: cutlass.Constexpr[bool],
-    write_ubuf: cutlass.Constexpr[bool],  # 写紧凑 u/kinv/b 到 GMEM(供 flush rank-m 重建任意 S_m)
+    write_ubuf: cutlass.Constexpr[bool],  # write compact u/kinv/b to GMEM for flush rank-m rebuild
     fast_math: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    lane = tidx  # 1 warp = 32 lane
+    lane = tidx  # 1 warp = 32 lanes
 
     bidx, _, _ = cute.arch.block_idx()
     i_v = bidx % num_v_tiles
@@ -115,35 +90,32 @@ def kda_mtp_kvbuffer_vk_kernel(
     cache_idx = h0_indices[i_n]
     r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
 
-    # lane t 沿 K 连续块持 vec_size 个 K(K[4t:4t+4])× 全 BV 个 V 列;
-    # r_h[vv*vec_size+c] = S0[i_v*BV+vv, vec_size*lane+c](全程不变,末尾才覆盖为 S_T)。
+    # lane owns vec_size contiguous K channels (K[4*lane:4*lane+4]) across all BV V-cols;
+    # r_h[vv*vec_size+c] = S0[i_v*BV+vv, vec_size*lane+c] (held fixed, overwritten to S_T at the end).
     r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
-    r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # float4 临时缓冲
-    r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # dt_bias 循环外载一次
-
-    # 本 lane 的 4 个 K 通道、所有 T 个 token 的 decayed 特征图(lane-private):
-    #   kdec[t*vec+c]=k_norm_t*b_t ; kinv[t*vec+c]=k_norm_t/b_t ; qdec[t*vec+c]=q_scaled_t*b_t
+    r_h4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    # lane-private decayed feature maps over all T tokens: kdec=k_norm*b, kinv=k_norm/b, qdec=q_scaled*b.
     kdec = cute.make_rmem_tensor(cute.make_layout((T * vec_size,), stride=(1,)), cutlass.Float32)
     kinv = cute.make_rmem_tensor(cute.make_layout((T * vec_size,), stride=(1,)), cutlass.Float32)
     qdec = cute.make_rmem_tensor(cute.make_layout((T * vec_size,), stride=(1,)), cutlass.Float32)
-    r_beta = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)  # 每 token sigmoid 门(复制)
-    r_u = cute.make_rmem_tensor(cute.make_layout((T * BV,), stride=(1,)), cutlass.Float32)  # 伪 value u_t[vv](复制)
-    b_run = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # 累积衰减 b_t(本 lane 通道)
+    r_beta = cute.make_rmem_tensor(cute.make_layout((T,), stride=(1,)), cutlass.Float32)
+    r_u = cute.make_rmem_tensor(cute.make_layout((T * BV,), stride=(1,)), cutlass.Float32)
+    b_run = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    # 2-stage 软流水:current(无后缀)+ next(_n)双缓冲,prefetch t+1 的 q/k/a 与 token t 计算重叠。
+    # 2-stage pipeline: current (no suffix) + next (_n) double buffers prefetch t+1 q/k/a over token-t compute.
     r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_abf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_qbf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_abf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    # ILP batched butterfly:把固定 t 的所有 reduce-over-K（A/P 的 i 个 + Skdec/Sqdec 的 BV 个）
-    # 拼进一个宽度 i_t+BV 的 partial 数组,一趟 butterfly 全归约 → 依赖深度从 (i_t+BV)*5 降到 5。
-    # 前段 [0:i_t] = A[t,i]/P[t,i] partial;后段 [i_t:i_t+BV] = Skdec/Sqdec partial。
+    # ILP batched butterfly: pack a fixed t's reduce-over-K partials (i A/P + BV Skdec/Sqdec) into one
+    # width-(i_t+BV) array, reduce in a single pass -> dependency depth (i_t+BV)*5 down to 5.
     r_redB = cute.make_rmem_tensor(cute.make_layout((T + BV,), stride=(1,)), cutlass.Float32)
 
-    # ===== state S0 载入(连续块 + float4,coalesced+向量化) =====
+    # Load state S0 (contiguous float4, coalesced + vectorized).
     if cache_idx >= 0:
         flat_state_idx = cache_idx * HV + i_hv
         for vv in cutlass.range_constexpr(BV):
@@ -156,11 +128,11 @@ def kda_mtp_kvbuffer_vk_kernel(
         for j in cutlass.range_constexpr(BV * vec_size):
             r_h[j] = cutlass.Float32(0.0)
 
-    for c in cutlass.range_constexpr(vec_size):  # dt_bias 循环外载一次(连续块 K[4t:4t+4])
+    for c in cutlass.range_constexpr(vec_size):  # dt_bias loaded once outside the loop
         r_dtb[c] = cutlass.Float32(dt_bias[i_hv, vec_size * lane + c])
 
-    # ===== Phase A:逐 token 算 g_t→累积 b_t、l2norm/scale、kdec/kinv/qdec、beta_t =====
-    # 2-stage 软流水:preload token0,循环内先发 t+1 的 q/k/a load(与本 token compute 重叠),末尾换缓冲。
+    # Phase A: per token compute g_t -> cumulative b_t, l2norm/scale, kdec/kinv/qdec, beta_t.
+    # Pipeline: preload token 0, issue t+1 q/k/a loads early each iter (overlap compute), swap at the end.
     for c in cutlass.range_constexpr(vec_size):
         b_run[c] = cutlass.Float32(1.0)
     q_tile0 = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, 0, i_h, lane))
@@ -170,7 +142,7 @@ def kda_mtp_kvbuffer_vk_kernel(
     cute.autovec_copy(k_tile0, r_kbf)
     cute.autovec_copy(a_tile0, r_abf)
     for i_t in cutlass.range_constexpr(T):
-        # prefetch t+1 的 q/k/a 到 _n 缓冲(发射在 compute 前 → load 延迟被本 token 计算掩盖)
+        # prefetch t+1 q/k/a into the _n buffers (issued before compute -> load latency hidden)
         if cutlass.const_expr(i_t + 1 < T):
             q_tile_n = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
             k_tile_n = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t + 1, i_h, lane))
@@ -200,7 +172,7 @@ def kda_mtp_kvbuffer_vk_kernel(
             for c in cutlass.range_constexpr(vec_size):
                 r_qf[c] = r_qf[c] * scale
 
-        # g_t[c](per K 通道)→ 累积 b_run[c] *= g_t(a 从 prefetch 的 r_abf 读)
+        # per-channel gate g_t -> accumulate b_run *= g_t (a read from the prefetched r_abf)
         for c in cutlass.range_constexpr(vec_size):
             x = cutlass.Float32(r_abf[c]) + r_dtb[c]
             beta_x = softplus_beta * x
@@ -224,7 +196,7 @@ def kda_mtp_kvbuffer_vk_kernel(
             cutlass.Float32(1.0) + cute.exp(-cutlass.Float32(b[i_n, i_t, i_hv]), fastmath=fast_math)
         )
 
-        # u-buffer:kinv_t / b_t 与 v-tile 无关 → 仅 i_v==0 的 CTA 写一次(float4 连续块)。
+        # u-buffer: kinv_t / b_t are v-tile-independent -> only the i_v==0 CTA writes them (float4).
         if cutlass.const_expr(write_ubuf):
             if i_v == 0:
                 for c in cutlass.range_constexpr(vec_size):
@@ -236,19 +208,18 @@ def kda_mtp_kvbuffer_vk_kernel(
                 b_out = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane))
                 cute.autovec_copy(r_h4, b_out)
 
-        # 换缓冲:next → current(寄存器搬移,prefetch 的 t+1 成为下一轮 current)
+        # swap next -> current (register moves; the prefetched t+1 becomes next iter's current)
         if cutlass.const_expr(i_t + 1 < T):
             for c in cutlass.range_constexpr(vec_size):
                 r_qbf[c] = r_qbf_n[c]
                 r_kbf[c] = r_kbf_n[c]
                 r_abf[c] = r_abf_n[c]
-    # 循环后 b_run[c] = b_{T-1}[c]（末尾 state 更新用）。
+    # after the loop b_run[c] = b_{T-1}[c] (used by the final state update).
 
-    # ===== Phase B:前代求 u_t[vv]。u_t = beta_t*(v_t - S0@kdec_t - Σ_{i<t} A[t,i] u_i) =====
-    # ILP batched butterfly:固定 t 时,A[t,i](i<t)与 Skdec[vv](BV 个)的 reduce-over-K partial
-    # 全拼进 r_redB[0:i_t+BV],一趟 butterfly 归约;然后前代求 u(serial over t 仍保留)。
+    # Phase B: forward-subst u_t = beta_t*(v_t - S0@kdec_t - sum_{i<t} A[t,i] u_i).
+    # ILP batched butterfly: pack A[t,i] (i<t) + Skdec[vv] (BV) partials into r_redB[0:i_t+BV], reduce in one
+    # pass; then forward-subst for u (serial over t). r_redB front [0:i_t]=A, back [i_t:i_t+BV]=Skdec.
     for i_t in cutlass.range_constexpr(T):
-        # partial:前段 A[t,i]=<kdec_t,kinv_i>(i<t),后段 Skdec[vv]=<r_h[vv],kdec_t>
         for i_i in cutlass.range_constexpr(i_t):
             s = cutlass.Float32(0.0)
             for c in cutlass.range_constexpr(vec_size):
@@ -259,28 +230,24 @@ def kda_mtp_kvbuffer_vk_kernel(
             for c in cutlass.range_constexpr(vec_size):
                 s += r_h[vv * vec_size + c] * kdec[i_t * vec_size + c]
             r_redB[i_t + vv] = s
-        # 一趟 batched butterfly:width=i_t+BV 个 partial 各自独立 → 5 round shuffle(ILP)
         for off in [16, 8, 4, 2, 1]:
             for j in cutlass.range_constexpr(i_t + BV):
                 r_redB[j] = r_redB[j] + cute.arch.shuffle_sync_bfly(r_redB[j], offset=off, mask=-1, mask_and_clamp=31)
-        # 前代:u_t[vv] = beta_t*(v_t[vv] - Skdec[vv] - Σ_{i<t} A[t,i]*u_i[vv])
         for vv in cutlass.range_constexpr(BV):
             acc = cutlass.Float32(v[i_n, i_t, i_hv, i_v * BV + vv]) - r_redB[i_t + vv]
             for i_i in cutlass.range_constexpr(i_t):
                 acc -= r_redB[i_i] * r_u[i_i * BV + vv]
             r_u[i_t * BV + vv] = r_beta[i_t] * acc
 
-    # u-buffer:u_t[v] 是本 CTA 的 v 列(每 CTA 写自己那段);lane vv 写第 vv 列(连续 coalesced)。
+    # u-buffer: u_t[v] is this CTA's v-column slice; lane vv writes column vv (coalesced).
     if cutlass.const_expr(write_ubuf):
         if lane < BV:
             for i_t in cutlass.range_constexpr(T):
                 u_buf[i_n, i_t, i_hv, i_v * BV + lane] = r_u[i_t * BV + lane]
 
-    # ===== Phase C:输出 o_t[vv] = S0@qdec_t + Σ_{i<=t} P[t,i] u_i =====
-    # flush 模式(emit_output=False)只更新 state,跳过整段输出计算(P/o 都不需要)。
+    # Phase C: output o_t = S0@qdec_t + sum_{i<=t} P[t,i] u_i. Same batched butterfly: pack P[t,i] (i<=t) +
+    # Sqdec[vv] partials into r_redB[0:(i_t+1)+BV]. flush mode (emit_output=False) skips this entirely.
     if cutlass.const_expr(emit_output):
-        # ILP batched butterfly:固定 t 时,P[t,i](i<=t)与 Sqdec[vv]的 partial 拼进 r_redB[0:(i_t+1)+BV],
-        # 一趟归约。前段 [0:i_t+1]=P[t,i],后段 [i_t+1:i_t+1+BV]=Sqdec[vv]。
         for i_t in cutlass.range_constexpr(T):
             for i_i in cutlass.range_constexpr(i_t + 1):
                 s = cutlass.Float32(0.0)
@@ -295,16 +262,13 @@ def kda_mtp_kvbuffer_vk_kernel(
             for off in [16, 8, 4, 2, 1]:
                 for j in cutlass.range_constexpr((i_t + 1) + BV):
                     r_redB[j] = r_redB[j] + cute.arch.shuffle_sync_bfly(r_redB[j], offset=off, mask=-1, mask_and_clamp=31)
-            # o_t[vv] = Sqdec[vv] + Σ_{i<=t} P[t,i]*u_i[vv]
             for vv in cutlass.range_constexpr(BV):
                 ov = r_redB[(i_t + 1) + vv]
                 for i_i in cutlass.range_constexpr(i_t + 1):
                     ov += r_redB[i_i] * r_u[i_i * BV + vv]
-                # all-reduce 后每 lane 同值 → 32 lane 同址幂等写
-                o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(ov)
+                o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(ov)  # all-reduced -> idempotent
 
-    # ===== Phase D / epilogue:一次性更新 state 并回写 =====
-    # S_T[v,k] = b_{T-1}[k] * (S0[v,k] + Σ_t u_t[v] * kinv_t[k])
+    # Phase D: one-shot final state S_T[v,k] = b_{T-1}[k] * (S0[v,k] + sum_t u_t[v] * kinv_t[k]).
     if cache_idx >= 0:
         if cutlass.const_expr(not disable_state_update):
             flat_state_idx = cache_idx * HV + i_hv
@@ -351,7 +315,7 @@ def run_kda_mtp_kvbuffer_vk_kernel(
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    """lane=K kvbuffer launcher:grid = N*HV*(V//BV),block = 32(1 warp)。无 SMEM。"""
+    """vk-kvbuffer launcher: grid = N*HV*(V//BV), block = 32 (1 warp), no SMEM."""
     n_indices = h0_indices.layout.shape[0]
     num_v_tiles = cute.ceil_div(V, BV)
     grid_size = n_indices * HV * num_v_tiles
@@ -535,20 +499,18 @@ def kda_decode_mtp_kvbuffer(
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """KDA MTP decode — KVBuffer / chunkwise parallel-verification(单 chunk = T)。**verify 阶段**。
+    """KDA MTP decode — vk-KVBuffer / chunkwise parallel verification (single chunk = T). VERIFY stage.
 
-    spec-decode 统一走 verify→flush 两 kernel(m 在 verify 后才知道,见
-    SGLANG_VERIFY_ROLLBACK_FLOW.md):
-    - **verify**(本函数,默认): emit_output=True, disable_state_update=True，**不提交 state**;
-      传入 u_buffer/kinv_buffer/b_buffer 则把紧凑回滚数据 (u_t[v], kinv_t[k], b_t[k]) 写进
-      GMEM(2Td+Td,比 recurrent 的 T·d² 中间态小 ~43×),供 ``kda_flush_kvbuffer`` 任意 m 重建。
-    - **flush**: 见 ``kda_flush_kvbuffer`` —— 读 u_buffer 对前 m 个 token 做 rank-m 更新 → S_m。
-    - full-accept 快路径(可选): disable_state_update=False 时本 kernel 也能直接提交 S_T(末尾
-      Phase D),省掉 flush;但 m<T 必须走 flush。
+    Spec-decode runs as two kernels verify->flush (m is unknown until after verify):
+    - verify (this fn, default emit_output=True, disable_state_update=True): does NOT commit state;
+      if u_buffer/kinv_buffer/b_buffer are passed, writes the compact rollback factors (u_t[v],
+      kinv_t[k], b_t[k]) to GMEM (~43x smaller than the recurrent T*d^2 states) for kda_flush_kvbuffer.
+    - flush: see kda_flush_kvbuffer — rank-m rebuild of S_m from the first m tokens.
+    - full-accept fast path (optional): disable_state_update=False commits S_T directly (Phase D),
+      skipping flush; but m<T must go through flush.
 
-    q/k [N,T,H,K], v/a [N,T,HV,V/K], b [N,T,HV]。state pool = vk [pool,HV,V,K]。
-    u_buffer [N,T,HV,V] / kinv_buffer,b_buffer [N,T,HV,K] fp32(传 None = 不写)。
-    数学与 recurrent vk/kv 完全一致(verify_chunkwise_kda.py 机器精度对齐)。
+    q/k [N,T,H,K], v/a [N,T,HV,V/K], b [N,T,HV]. state pool = vk [pool,HV,V,K].
+    u_buffer [N,T,HV,V] / kinv_buffer, b_buffer [N,T,HV,K] fp32 (None = not written).
     """
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -562,13 +524,13 @@ def kda_decode_mtp_kvbuffer(
 
     assert K == TILE_K, f"KDA MTP (kvbuffer) requires K={TILE_K}, got {K}"
     assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
-        f"kvbuffer 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
+        f"kvbuffer assumes K//vec_size==32 (one warp), got K={K}, vec_size={VEC_SIZE}"
     )
 
-    if bv <= 0:  # auto:复用 vk 的 BV 启发式(小批降 BV 填 grid)
+    if bv <= 0:  # auto: reuse vk's BV heuristic (smaller BV at small batch to fill the grid)
         num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
         bv = _select_vk_bv(N * HV, V, num_sms)
-    assert bv in (8, 16, 32), f"kvbuffer bv 仅支持 8/16/32 或 <=0(auto),got {bv}"
+    assert bv in (8, 16, 32), f"kvbuffer bv must be 8/16/32 or <=0 (auto), got {bv}"
     assert V % bv == 0, f"kvbuffer requires V % bv == 0, got V={V}, bv={bv}"
 
     h0_source, pool_size, _ = _normalize_state_source(
@@ -595,11 +557,11 @@ def kda_decode_mtp_kvbuffer(
 
     if write_ubuf:
         if tuple(u_buffer.shape) != (N, T, HV, V):
-            raise ValueError(f"u_buffer 形状须 {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
+            raise ValueError(f"u_buffer shape must be {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
         if tuple(kinv_buffer.shape) != (N, T, HV, K) or tuple(b_buffer.shape) != (N, T, HV, K):
-            raise ValueError(f"kinv_buffer/b_buffer 形状须 {(N, T, HV, K)}")
+            raise ValueError(f"kinv_buffer/b_buffer shape must be {(N, T, HV, K)}")
         u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
-    else:  # 占位(kernel 内 write_ubuf=False 不触碰)
+    else:  # placeholders (kernel has write_ubuf=False, never touches them)
         u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
         kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
         b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device=q.device)
@@ -637,14 +599,11 @@ def kda_decode_mtp_kvbuffer(
 
 
 # ============================================================================
-# ws-kvbuffer:warp-spec chunkwise(对标生产 ws 的大批量场景)。
-#   - warp0 producer:逐 token 算 kdec/kinv/qdec[T,K]、累积 b_t、beta_t → SMEM;
-#     再用 SMEM 里的特征算 T×T 的 A[t,i]/P[t,i](reduce-over-K,warp0 持全 K)→ SMEM;
-#     b_{T-1}[k] 存 sBlast。可选写紧凑 u/kinv/b buffer(kinv/b 由 warp0 写)。
-#   - warps0-3 consumer:每组持 tile_v/4 个 V-row(group_idx*rows_per_group+row)。每行:
-#     Skdec_t=S0@kdec_t、Sqdec_t=S0@qdec_t(reduce-over-K,butterfly);三角前代求 u_t;
-#     o_t=Sqdec_t+Σ_{i<=t} P[t,i] u_i;末尾一次性 S_T=b_{T-1}*(S0+Σ u_t kinv_t) 回写。
-# 数学与 recurrent/vk-kvbuffer 完全一致;state pool 同 vk [pool,HV,V,K]。
+# ws-kvbuffer: 4-warp warp-spec chunkwise for the large-batch regime (vs production ws).
+#   - warp0 producer: per token compute kdec/kinv/qdec[T,K], cumulative b_t, beta_t -> SMEM; then the
+#     TxT A[t,i]/P[t,i] (reduce-over-K, warp0 holds full K) -> SMEM; sBlast = b_{T-1}[k].
+#   - 4 consumer warps: each owns tile_v/4 V-rows; per row Skdec/Sqdec (butterfly), forward-subst u_t,
+#     output o_t, one-shot S_T writeback. Same math as recurrent/vk-kvbuffer; state pool = vk.
 # ============================================================================
 @cute.kernel
 def kda_mtp_ws_kvbuffer_kernel(
@@ -700,7 +659,7 @@ def kda_mtp_ws_kvbuffer_kernel(
     cache_idx = h0_indices[i_n]
     r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
 
-    # ===== SMEM:warp0 producer → 所有 warp consumer 广播 =====
+    # SMEM: warp0 producer broadcasts to all consumer warps.
     smem = cutlass.utils.SmemAllocator()
     sKdec = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
     sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, K), stride=(K + 8, 1)), 16)
@@ -709,20 +668,20 @@ def kda_mtp_ws_kvbuffer_kernel(
     sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)  # b_{T-1}[k]
     sA = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # A[t,i] i<t
     sP = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # P[t,i] i<=t
-    # use_smem_v:把本 block 的 v-tile [T, tile_v] 协作预载进 SMEM(coalesced),
-    # 替代 consumer solve 里逐(行,token)的 v[] scalar GMEM 读。最后分配以免影响其他偏移。
+    # use_smem_v: cooperatively preload this block's v-tile [T, tile_v] into SMEM (coalesced),
+    # replacing the per-(row,token) v[] scalar GMEM loads in the consumer solve. Allocated last.
     if cutlass.const_expr(use_smem_v):
         sVdata = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
 
-    # ===== 寄存器(所有 warp 顶部声明) =====
+    # Registers (declared at the top for all warps).
     r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     r_dtb = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
     b_run = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
-    r_tmp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)  # SMEM 读写 float4 临时
-    # consumer:ilp_rows 行的 S0 K 通道一起持有(批量 butterfly),r_part = 各行 reduce 的 partial。
+    r_tmp = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    # consumer: hold ilp_rows rows of S0 K-channels together (batched butterfly); r_part = per-row partials.
     r_h = cute.make_rmem_tensor(cute.make_layout((ilp_rows, vec_size), stride=(vec_size, 1)), cutlass.Float32)
     r_u = cute.make_rmem_tensor(cute.make_layout((ilp_rows, T), stride=(T, 1)), cutlass.Float32)
     r_part = cute.make_rmem_tensor(cute.make_layout((ilp_rows,), stride=(1,)), cutlass.Float32)
@@ -732,7 +691,7 @@ def kda_mtp_ws_kvbuffer_kernel(
         rows_per_group: cutlass.Constexpr[int] = tile_v // num_groups
         flat_state_idx = cache_idx * HV + i_hv
 
-        # ===== warp0 producer =====
+        # warp0 producer
         if warp_idx == 0:
             for c in cutlass.range_constexpr(vec_size):
                 r_dtb[c] = cutlass.Float32(dt_bias[i_hv, k_start + c])
@@ -800,7 +759,7 @@ def kda_mtp_ws_kvbuffer_kernel(
             for c in cutlass.range_constexpr(vec_size):
                 sBlast[k_start + c] = b_run[c]
 
-            # A[t,i]=<kdec_t,kinv_i> (i<t)、P[t,i]=<qdec_t,kinv_i> (i<=t) —— 从 SMEM 读本 lane 通道,butterfly。
+            # A[t,i]=<kdec_t,kinv_i> (i<t), P[t,i]=<qdec_t,kinv_i> (i<=t) from SMEM, butterfly reduce.
             for i_t in cutlass.range_constexpr(T):
                 for i_i in cutlass.range_constexpr(i_t):
                     aij = cutlass.Float32(0.0)
@@ -817,29 +776,27 @@ def kda_mtp_ws_kvbuffer_kernel(
                         pij += cute.arch.shuffle_sync_bfly(pij, offset=off, mask=-1, mask_and_clamp=31)
                     sP[i_t, i_i] = pij
 
-        # use_smem_v:全 4 warp 协作把 v-tile [T, tile_v] coalesced 预载进 SMEM(barrier 前)。
-        # tile_v<=64<=128 → 每 token 一趟,thread tidx 写 tile-local col tidx(连续地址=coalesced)。
+        # use_smem_v: all 4 warps cooperatively preload v-tile [T, tile_v] into SMEM (before barrier).
+        # tile_v<=64<=128 -> one pass per token, thread tidx writes tile-local col tidx (coalesced).
         if cutlass.const_expr(use_smem_v):
             for i_t in cutlass.range_constexpr(T):
                 if tidx < tile_v:
                     sVdata[i_t, tidx] = cutlass.Float32(v[i_n, i_t, i_hv, i_v * tile_v + tidx])
 
-        # 发布 warp0 的 SMEM 给所有 warp
+        # publish warp0's SMEM to all warps
         cute.arch.barrier()
 
-        # ===== consumers:每组 rows_per_group 行,按 ilp_rows 批量处理 =====
-        # 把 ilp_rows 个 V-row 一起做:Skdec/Sqdec 的 K-reduce butterfly 在每个 offset
-        # 上交错发射(ilp_rows-way ILP 隐藏 shuffle 延迟),三角解/末态各行独立。
+        # consumers: each group's rows_per_group rows, processed ilp_rows at a time. The Skdec/Sqdec
+        # K-reduce butterflies for all ilp_rows rows are issued interleaved per offset (ILP); solve per row.
         n_row_groups: cutlass.Constexpr[int] = rows_per_group // ilp_rows
         for rg in cutlass.range_constexpr(n_row_groups):
             v_base = i_v * tile_v + group_idx * rows_per_group + rg * ilp_rows
-            # 载 ilp_rows 行 S0(本 lane 的 vec_size 个 K 通道)
             for r in cutlass.range_constexpr(ilp_rows):
                 h_tile = cute.local_tile(
                     h0_source, (1, 1, vec_size), (flat_state_idx, v_base + r, lane_in_group)
                 )
                 cute.autovec_copy(h_tile, cute.slice_(r_h, (r, None)))
-            # 三角前代:每 token 批量算 Skdec_t=S0@kdec_t,再各行 fwd-subst u_t
+            # forward-subst: per token batch-compute Skdec_t=S0@kdec_t, then per-row fwd-subst u_t.
             for i_t in cutlass.range_constexpr(T):
                 for r in cutlass.range_constexpr(ilp_rows):
                     sk = cutlass.Float32(0.0)
@@ -859,13 +816,13 @@ def kda_mtp_ws_kvbuffer_kernel(
                     for i_i in cutlass.range_constexpr(i_t):
                         acc -= sA[i_t, i_i] * r_u[r, i_i]
                     r_u[r, i_t] = sBeta[i_t] * acc
-            # u-buffer:每行 u_t 复制在所有 lane,lane0 写一次
+            # u-buffer: u_t replicated on all lanes, lane0 writes once.
             if cutlass.const_expr(write_ubuf):
                 if lane_in_group == 0:
                     for r in cutlass.range_constexpr(ilp_rows):
                         for i_t in cutlass.range_constexpr(T):
                             u_buf[i_n, i_t, i_hv, v_base + r] = r_u[r, i_t]
-            # 输出 o_t = Sqdec_t + Σ_{i<=t} P[t,i] u_i(Sqdec 也批量 butterfly)
+            # output o_t = Sqdec_t + sum_{i<=t} P[t,i] u_i (Sqdec also batched butterfly).
             if cutlass.const_expr(emit_output):
                 for i_t in cutlass.range_constexpr(T):
                     for r in cutlass.range_constexpr(ilp_rows):
@@ -882,7 +839,7 @@ def kda_mtp_ws_kvbuffer_kernel(
                             ov += sP[i_t, i_i] * r_u[r, i_i]
                         if lane_in_group == 0:
                             o[(i_n, i_t, i_hv, v_base + r)] = cutlass.BFloat16(ov)
-            # 末态:S_T[v,k] = b_{T-1}[k]*(S0[v,k] + Σ_t u_t kinv_t[k]),逐行回写
+            # final state S_T[v,k] = b_{T-1}[k]*(S0[v,k] + sum_t u_t kinv_t[k]), written per row.
             if cutlass.const_expr(not disable_state_update):
                 for r in cutlass.range_constexpr(ilp_rows):
                     for c in cutlass.range_constexpr(vec_size):
@@ -940,7 +897,7 @@ def run_kda_mtp_ws_kvbuffer_kernel(
         + 4 * K  # sBlast
         + 2 * 4 * T * T  # sA/sP
         + (4 * T * tile_v if use_smem_v else 0)  # sVdata
-        + 256  # 对齐余量
+        + 256  # alignment slack
     )
     kda_mtp_ws_kvbuffer_kernel(
         h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
@@ -1023,11 +980,9 @@ def _get_compiled_mtp_ws_kvbuffer_kernel(
 
 
 def _select_ws_kvb_tile_v(V, N):
-    """N-dependent tile_v(H200 sweep,H=HV=32 K=V=128 verify-chain spd_ws):
-      N<=4  → tile_v=32(block 少时优先并行/occupancy:N=4 spd 1.03→1.16);
-      N>=8  → tile_v=64(block 已够时优先 reuse,摊薄 producer 重复:N=8/16/32/64 spd
-              1.48/1.55/1.41/1.48 vs tile_v=32 的 1.33/1.38/1.20/1.28)。
-    取首个整除 V 的候选。"""
+    """N-dependent tile_v (H200 sweep, H=HV=32 K=V=128 verify-chain spd_ws): N<=4 -> 32 (few blocks,
+    favor occupancy; N=4 spd 1.03->1.16), N>=8 -> 64 (enough blocks, favor reuse / amortize producer).
+    Returns the first candidate that divides V."""
     order = (32, 64, 16, 8) if N <= 4 else (64, 32, 16, 8)
     for tv in order:
         if V % tv == 0:
@@ -1036,8 +991,8 @@ def _select_ws_kvb_tile_v(V, N):
 
 
 def _select_ws_kvb_ilp_rows(tile_v):
-    """ilp_rows 取能整除 rows_per_group(=tile_v/4)的最大值 ∈{4,2,1}。
-    批量 butterfly:更大的 ilp_rows = 更多 K-reduce shuffle 链交错 → 更强 ILP。"""
+    """Largest ilp_rows in {4,2,1} dividing rows_per_group (=tile_v/4). Larger ilp_rows interleaves
+    more K-reduce shuffle chains -> stronger ILP."""
     rows_per_group = tile_v // 4
     for r in (4, 2, 1):
         if rows_per_group % r == 0:
@@ -1071,10 +1026,11 @@ def kda_decode_mtp_ws_kvbuffer(
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """KDA MTP decode — ws-KVBuffer / warp-spec chunkwise(单 chunk = T)。**verify 阶段**。
+    """KDA MTP decode — ws-KVBuffer / warp-spec chunkwise (single chunk = T). VERIFY stage.
 
-    与 ``kda_decode_mtp_kvbuffer`` 同义(verify→flush 两 kernel,flush 复用 ``kda_flush_kvbuffer``),
-    但用 4-warp warp-spec 实现 chunkwise,面向大批量(对标生产 ws)。签名与 vk-kvbuffer 一致(多 tile_v)。
+    Same role as kda_decode_mtp_kvbuffer (verify->flush, flush reuses kda_flush_kvbuffer), but a 4-warp
+    warp-spec chunkwise impl for the large-batch regime (vs production ws). Signature mirrors vk-kvbuffer
+    plus tile_v / ilp_rows / use_smem_v tuning knobs.
     """
     N, T, H, K = q.shape
     HV = v.shape[2]
@@ -1088,7 +1044,7 @@ def kda_decode_mtp_ws_kvbuffer(
 
     assert K == TILE_K, f"ws-kvbuffer requires K={TILE_K}, got {K}"
     assert K % VEC_SIZE == 0 and K // VEC_SIZE == 32, (
-        f"ws-kvbuffer 假定 K//vec_size==32(一个 warp),got K={K}, vec_size={VEC_SIZE}"
+        f"ws-kvbuffer assumes K//vec_size==32 (one warp), got K={K}, vec_size={VEC_SIZE}"
     )
 
     if tile_v <= 0:
@@ -1101,9 +1057,8 @@ def kda_decode_mtp_ws_kvbuffer(
     assert rows_per_group % ilp_rows == 0, (
         f"ws-kvbuffer requires (tile_v/4) % ilp_rows == 0, got tile_v={tile_v}, ilp_rows={ilp_rows}"
     )
-    # use_smem_v auto = N<=16:预载 v-tile 进 SMEM 替代 solve 里逐行 GMEM scalar 读。
-    # H200 verify-chain sweep:N<=16 帮(N=16 spd_ws 1.52→1.58),N>=32 伤(额外 SMEM 挤 occupancy,
-    # 大 N 已 block 充足)。tile_v<=128 才有意义(预载一趟覆盖)。
+    # use_smem_v auto = N<=16 (H200 sweep): helps mid-batch (N=16 spd_ws 1.52->1.58), hurts large batch
+    # (N>=32: extra SMEM cuts occupancy where blocks already saturate). tile_v<=128 so one pass covers it.
     use_smem_v_b = (N <= 16 and tile_v <= 128) if use_smem_v < 0 else bool(use_smem_v)
 
     h0_source, pool_size, _ = _normalize_state_source(
@@ -1130,9 +1085,9 @@ def kda_decode_mtp_ws_kvbuffer(
 
     if write_ubuf:
         if tuple(u_buffer.shape) != (N, T, HV, V):
-            raise ValueError(f"u_buffer 形状须 {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
+            raise ValueError(f"u_buffer shape must be {(N, T, HV, V)}, got {tuple(u_buffer.shape)}")
         if tuple(kinv_buffer.shape) != (N, T, HV, K) or tuple(b_buffer.shape) != (N, T, HV, K):
-            raise ValueError(f"kinv_buffer/b_buffer 形状须 {(N, T, HV, K)}")
+            raise ValueError(f"kinv_buffer/b_buffer shape must be {(N, T, HV, K)}")
         u_buf, kinv_buf, b_buf = u_buffer, kinv_buffer, b_buffer
     else:
         u_buf = torch.zeros(N, T, HV, V, dtype=torch.float32, device=q.device)
@@ -1157,12 +1112,9 @@ def kda_decode_mtp_ws_kvbuffer(
     return o
 
 
-# ============================================================================
-# flush kernel:读 verify 写下的紧凑 u-buffer,对前 m 个被接受 token 做 rank-m 更新:
-#   S_m[v,k] = b_m[k] * (S0[v,k] + Σ_{i<m} u_i[v] * kinv_i[k])
-# 纯 Phase-D(无 gating/l2norm/reduce/solve;不重算 verify 已算过的东西)。
-# lane=K + vk,grid/布局与 verify 一致;m 为 constexpr(按接受长度缓存)。
-# ============================================================================
+# flush kernel: read the compact u-buffer from verify, rank-m update over the first m accepted tokens:
+#   S_m[v,k] = b_m[k] * (S0[v,k] + sum_{i<m} u_i[v] * kinv_i[k])
+# Pure Phase-D (no gating/l2norm/reduce/solve). lane=K + vk, grid/layout match verify; m is constexpr.
 @cute.kernel
 def kda_flush_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32
@@ -1173,7 +1125,7 @@ def kda_flush_kvbuffer_vk_kernel(
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     BV: cutlass.Constexpr[int],
-    m: cutlass.Constexpr[int],  # 接受长度(前 m 个 token)
+    m: cutlass.Constexpr[int],  # accept length (first m tokens)
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
@@ -1197,7 +1149,7 @@ def kda_flush_kvbuffer_vk_kernel(
         r_bm = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
         r_kinv = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
 
-        # 载 S0(本 lane 的 4 个 K 通道 × BV 个 v 列)
+        # load S0 (this lane's vec_size K channels x BV v-cols)
         for vv in cutlass.range_constexpr(BV):
             v_global = i_v * BV + vv
             h_tile = cute.local_tile(h0_source, (1, 1, vec_size), (flat_state_idx, v_global, lane))
@@ -1205,11 +1157,11 @@ def kda_flush_kvbuffer_vk_kernel(
             for c in cutlass.range_constexpr(vec_size):
                 r_h[vv * vec_size + c] = r_h4[c]
 
-        # b_m(token m-1 的累积衰减,本 lane 通道)
+        # b_m: cumulative decay at token m-1 (this lane's channels)
         bm_tile = cute.local_tile(b_buf, (1, 1, 1, vec_size), (i_n, m - 1, i_hv, lane))
         cute.autovec_copy(bm_tile, r_bm)
 
-        # 累加 Σ_{i<m} u_i[v] * kinv_i[k]
+        # accumulate sum_{i<m} u_i[v] * kinv_i[k]
         for i_i in cutlass.range_constexpr(m):
             kinv_tile = cute.local_tile(kinv_buf, (1, 1, 1, vec_size), (i_n, i_i, i_hv, lane))
             cute.autovec_copy(kinv_tile, r_kinv)
@@ -1218,7 +1170,7 @@ def kda_flush_kvbuffer_vk_kernel(
                 for c in cutlass.range_constexpr(vec_size):
                     r_h[vv * vec_size + c] += uval * r_kinv[c]
 
-        # S_m = b_m * (S0 + Σ ...) 并回写(float4 连续块)
+        # S_m = b_m * (S0 + sum ...), write back (contiguous float4)
         for vv in cutlass.range_constexpr(BV):
             v_global = i_v * BV + vv
             for c in cutlass.range_constexpr(vec_size):
@@ -1301,21 +1253,21 @@ def kda_flush_kvbuffer(
     bv: int = -1,
     opt_level: int = 3,
 ) -> torch.Tensor:
-    """KVBuffer **flush 阶段**:用 verify 写下的紧凑 u-buffer,对前 ``accept_len`` 个被接受
-    token 做 rank-m 更新 → S_m,原位写进 state pool。不重算 gating/solve。
+    """KVBuffer FLUSH stage: use the compact u-buffer from verify to rank-m update over the first
+    accept_len accepted tokens -> S_m, written in place into the state pool. No gating/solve recompute.
 
-    u_buffer [N,T,HV,V], kinv_buffer/b_buffer [N,T,HV,K] fp32(verify 产出)。
-    state pool = vk [pool,HV,V,K]。accept_len ∈ [1, T](链式;per-req 变长是后续工作)。
+    u_buffer [N,T,HV,V], kinv_buffer/b_buffer [N,T,HV,K] fp32 (verify outputs).
+    state pool = vk [pool,HV,V,K]. accept_len in [1, T] (chained; per-request lengths are future work).
     """
     N, T, HV, V = u_buffer.shape
     K = kinv_buffer.shape[3]
     m = int(accept_len)
-    assert 1 <= m <= T, f"accept_len 须 ∈ [1,{T}], got {m}"
+    assert 1 <= m <= T, f"accept_len must be in [1,{T}], got {m}"
 
     if bv <= 0:
         num_sms = torch.cuda.get_device_properties(initial_state_source.device).multi_processor_count
         bv = _select_vk_bv(N * HV, V, num_sms)
-    assert bv in (8, 16, 32) and V % bv == 0, f"flush bv 须 8/16/32 且整除 V, got bv={bv}, V={V}"
+    assert bv in (8, 16, 32) and V % bv == 0, f"flush bv must be 8/16/32 and divide V, got bv={bv}, V={V}"
 
     h0_source, pool_size, _ = _normalize_state_source(
         initial_state_source, N=N, HV=HV, K=K, V=V, device=initial_state_source.device, state_layout="vk",
