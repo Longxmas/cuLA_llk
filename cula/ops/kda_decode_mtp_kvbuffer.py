@@ -654,6 +654,7 @@ def kda_mtp_ws_kvbuffer_kernel(
     disable_state_update: cutlass.Constexpr[bool],
     emit_output: cutlass.Constexpr[bool],
     write_ubuf: cutlass.Constexpr[bool],
+    use_smem_v: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -685,6 +686,10 @@ def kda_mtp_ws_kvbuffer_kernel(
     sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)  # b_{T-1}[k]
     sA = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # A[t,i] i<t
     sP = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # P[t,i] i<=t
+    # use_smem_v:把本 block 的 v-tile [T, tile_v] 协作预载进 SMEM(coalesced),
+    # 替代 consumer solve 里逐(行,token)的 v[] scalar GMEM 读。最后分配以免影响其他偏移。
+    if cutlass.const_expr(use_smem_v):
+        sVdata = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
 
     # ===== 寄存器(所有 warp 顶部声明) =====
     r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
@@ -789,6 +794,13 @@ def kda_mtp_ws_kvbuffer_kernel(
                         pij += cute.arch.shuffle_sync_bfly(pij, offset=off, mask=-1, mask_and_clamp=31)
                     sP[i_t, i_i] = pij
 
+        # use_smem_v:全 4 warp 协作把 v-tile [T, tile_v] coalesced 预载进 SMEM(barrier 前)。
+        # tile_v<=64<=128 → 每 token 一趟,thread tidx 写 tile-local col tidx(连续地址=coalesced)。
+        if cutlass.const_expr(use_smem_v):
+            for i_t in cutlass.range_constexpr(T):
+                if tidx < tile_v:
+                    sVdata[i_t, tidx] = cutlass.Float32(v[i_n, i_t, i_hv, i_v * tile_v + tidx])
+
         # 发布 warp0 的 SMEM 给所有 warp
         cute.arch.barrier()
 
@@ -814,8 +826,13 @@ def kda_mtp_ws_kvbuffer_kernel(
                 for off in [16, 8, 4, 2, 1]:
                     for r in cutlass.range_constexpr(ilp_rows):
                         r_part[r] += cute.arch.shuffle_sync_bfly(r_part[r], offset=off, mask=-1, mask_and_clamp=31)
+                v_local_base = group_idx * rows_per_group + rg * ilp_rows  # tile-local col of v_base
                 for r in cutlass.range_constexpr(ilp_rows):
-                    acc = cutlass.Float32(v[i_n, i_t, i_hv, v_base + r]) - r_part[r]
+                    if cutlass.const_expr(use_smem_v):
+                        r_vt = sVdata[i_t, v_local_base + r]
+                    else:
+                        r_vt = cutlass.Float32(v[i_n, i_t, i_hv, v_base + r])
+                    acc = r_vt - r_part[r]
                     for i_i in cutlass.range_constexpr(i_t):
                         acc -= sA[i_t, i_i] * r_u[r, i_i]
                     r_u[r, i_t] = sBeta[i_t] * acc
@@ -886,6 +903,7 @@ def run_kda_mtp_ws_kvbuffer_kernel(
     disable_state_update: cutlass.Constexpr[bool],
     emit_output: cutlass.Constexpr[bool],
     write_ubuf: cutlass.Constexpr[bool],
+    use_smem_v: cutlass.Constexpr[bool],
     fast_math: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
@@ -898,6 +916,7 @@ def run_kda_mtp_ws_kvbuffer_kernel(
         + 4 * T  # sBeta
         + 4 * K  # sBlast
         + 2 * 4 * T * T  # sA/sP
+        + (4 * T * tile_v if use_smem_v else 0)  # sVdata
         + 256  # 对齐余量
     )
     kda_mtp_ws_kvbuffer_kernel(
@@ -906,7 +925,7 @@ def run_kda_mtp_ws_kvbuffer_kernel(
         vec_size, num_v_tiles, tile_v, ilp_rows,
         softplus_beta, softplus_threshold, scale,
         HV, T, H, K, V,
-        use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
+        use_qk_l2norm, disable_state_update, emit_output, write_ubuf, use_smem_v, fast_math,
     ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
 
 
@@ -915,12 +934,12 @@ _compiled_mtp_ws_kvbuffer_kernels: dict[tuple, object] = {}
 
 def _get_compiled_mtp_ws_kvbuffer_kernel(
     N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
-    disable_state_update, emit_output, write_ubuf,
+    disable_state_update, emit_output, write_ubuf, use_smem_v,
     softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
 ):
     key = (
         N, T, H, HV, K, V, pool_size, tile_v, ilp_rows, scale, use_qk_l2norm,
-        disable_state_update, emit_output, write_ubuf,
+        disable_state_update, emit_output, write_ubuf, use_smem_v,
         softplus_beta, softplus_threshold, opt_level, fast_math,
     )
     if key in _compiled_mtp_ws_kvbuffer_kernels:
@@ -966,6 +985,7 @@ def _get_compiled_mtp_ws_kvbuffer_kernel(
         disable_state_update=disable_state_update,
         emit_output=emit_output,
         write_ubuf=write_ubuf,
+        use_smem_v=use_smem_v,
         fast_math=fast_math,
         stream=cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         options=f"--enable-tvm-ffi --opt-level {opt_level}",
@@ -974,7 +994,7 @@ def _get_compiled_mtp_ws_kvbuffer_kernel(
     logger.info(
         "CuTe DSL KDA MTP ws-KVBuffer kernel compiled: "
         f"N={N}, T={T}, HV={HV}, K={K}, V={V}, tile_v={tile_v}, ilp_rows={ilp_rows}, "
-        f"opt_level={opt_level}, fast_math={fast_math}"
+        f"use_smem_v={use_smem_v}, opt_level={opt_level}, fast_math={fast_math}"
     )
     return compiled_kernel
 
@@ -1024,6 +1044,7 @@ def kda_decode_mtp_ws_kvbuffer(
     b_buffer: torch.Tensor | None = None,
     tile_v: int = -1,
     ilp_rows: int = -1,
+    use_smem_v: int = -1,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
@@ -1057,6 +1078,10 @@ def kda_decode_mtp_ws_kvbuffer(
     assert rows_per_group % ilp_rows == 0, (
         f"ws-kvbuffer requires (tile_v/4) % ilp_rows == 0, got tile_v={tile_v}, ilp_rows={ilp_rows}"
     )
+    # use_smem_v auto = N<=16:预载 v-tile 进 SMEM 替代 solve 里逐行 GMEM scalar 读。
+    # H200 verify-chain sweep:N<=16 帮(N=16 spd_ws 1.52→1.58),N>=32 伤(额外 SMEM 挤 occupancy,
+    # 大 N 已 block 充足)。tile_v<=128 才有意义(预载一趟覆盖)。
+    use_smem_v_b = (N <= 16 and tile_v <= 128) if use_smem_v < 0 else bool(use_smem_v)
 
     h0_source, pool_size, _ = _normalize_state_source(
         initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout="vk",
@@ -1098,7 +1123,7 @@ def kda_decode_mtp_ws_kvbuffer(
         N, T, H, HV, K, V, pool_size, tile_v, ilp_rows,
         scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
         disable_state_update=disable_state_update, emit_output=emit_output,
-        write_ubuf=write_ubuf,
+        write_ubuf=write_ubuf, use_smem_v=use_smem_v_b,
         softplus_beta=softplus_beta, softplus_threshold=softplus_threshold,
         opt_level=opt_level, fast_math=fast_math,
     )
