@@ -106,6 +106,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     b_buf: cute.Tensor,     # [N, T, HV, K] fp32
     vec_size: cutlass.Constexpr[int],
     BVBLK: cutlass.Constexpr[int],
+    VSPLIT: cutlass.Constexpr[int],
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -129,8 +130,10 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
 
     num_warps: cutlass.Constexpr[int] = 4
     bidx, _, _ = cute.arch.block_idx()
-    i_hv = bidx % HV
-    i_n = bidx // HV
+    i_vs = bidx % VSPLIT  # V slice of this CTA (producer P1-P4 redundant per slice, tiny)
+    tmp = bidx // VSPLIT
+    i_hv = tmp % HV
+    i_n = tmp // HV
     i_h = i_hv // (HV // H)
 
     cache_idx = h0_indices[i_n]
@@ -229,8 +232,9 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
             sKinv[i_t, kc] = kinv_v
             sQdec[i_t, kc] = sQdec[i_t, kc] * bcum
             if cutlass.const_expr(write_ubuf):
-                kinv_buf[i_n, i_t, i_hv, kc] = kinv_v
-                b_buf[i_n, i_t, i_hv, kc] = bcum
+                if i_vs == 0:  # kinv/b are V-independent; one slice writes
+                    kinv_buf[i_n, i_t, i_hv, kc] = kinv_v
+                    b_buf[i_n, i_t, i_hv, kc] = bcum
         sBlast[kc] = cute.exp(lb, fastmath=fast_math)
         cute.arch.barrier()
 
@@ -351,10 +355,10 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
             cute.arch.barrier()
 
         # ---- P5: V blocks — Skdec, x, u, o, state, all on tensor cores ----
-        num_v_blocks: cutlass.Constexpr[int] = V // BVBLK
+        num_v_blocks: cutlass.Constexpr[int] = V // BVBLK // VSPLIT
         n_tiles_blk: cutlass.Constexpr[int] = BVBLK // 8
         for vb in cutlass.range_constexpr(num_v_blocks):
-            v_base = vb * BVBLK
+            v_base = (i_vs * num_v_blocks + vb) * BVBLK
             # stage S0 block [BVBLK, K] cooperatively (float4)
             for j in cutlass.range_constexpr(BVBLK * K // (128 * vec_size)):
                 flat = j * 128 + tidx
@@ -534,6 +538,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
     b_buf: cute.Tensor,
     vec_size: cutlass.Constexpr[int],
     BVBLK: cutlass.Constexpr[int],
+    VSPLIT: cutlass.Constexpr[int],
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
@@ -551,7 +556,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
 ):
     """cute-gemm-kvbuffer launcher: grid = N*HV (one CTA per head), block = 128."""
     n_indices = h0_indices.layout.shape[0]
-    grid_size = n_indices * HV
+    grid_size = n_indices * HV * VSPLIT
     smem_bytes = (
         3 * 4 * BT * (K + 8)        # sKdec/sKinv/sQdec
         + 4 * BT + 4 * K            # sBeta + sBlast
@@ -563,7 +568,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_kernel(
     kda_mtp_gemm_kvbuffer_cute_kernel(
         h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
         u_buf, kinv_buf, b_buf,
-        vec_size, BVBLK,
+        vec_size, BVBLK, VSPLIT,
         softplus_beta, softplus_threshold, scale,
         HV, T, H, K, V,
         use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
@@ -574,12 +579,12 @@ _compiled_gemm_kvbuffer_cute_kernels: dict[tuple, object] = {}
 
 
 def _get_compiled_gemm_kvbuffer_cute_kernel(
-    N, T, H, HV, K, V, pool_size, bvblk, scale, use_qk_l2norm,
+    N, T, H, HV, K, V, pool_size, bvblk, vsplit, scale, use_qk_l2norm,
     disable_state_update, emit_output, write_ubuf,
     softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
 ):
     key = (
-        N, T, H, HV, K, V, pool_size, bvblk, scale, use_qk_l2norm,
+        N, T, H, HV, K, V, pool_size, bvblk, vsplit, scale, use_qk_l2norm,
         disable_state_update, emit_output, write_ubuf,
         softplus_beta, softplus_threshold, opt_level, fast_math,
     )
@@ -617,6 +622,7 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
         from_dlpack(b_buf, assumed_align=16),
         vec_size=VEC_SIZE,
         BVBLK=bvblk,
+        VSPLIT=vsplit,
         softplus_beta=softplus_beta,
         softplus_threshold=softplus_threshold,
         scale=scale,
@@ -632,7 +638,7 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
     _compiled_gemm_kvbuffer_cute_kernels[key] = compiled_kernel
     logger.info(
         "CuTe DSL KDA MTP gemm-KVBuffer (sm90 mma) kernel compiled: "
-        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, BVBLK={bvblk}, opt_level={opt_level}"
+        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, BVBLK={bvblk}, VSPLIT={vsplit}, opt_level={opt_level}"
     )
     return compiled_kernel
 
@@ -658,6 +664,7 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     kinv_buffer: torch.Tensor | None = None,
     b_buffer: torch.Tensor | None = None,
     bvblk: int = 32,
+    vsplit: int = -1,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
@@ -672,6 +679,13 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     assert K == TILE_K == 128, f"cute-gemm-kvbuffer requires K=128, got {K}"
     assert T <= BT, f"cute-gemm-kvbuffer pads tokens to BT={BT}, needs T<={BT}, got {T}"
     assert V % bvblk == 0 and bvblk % 16 == 0, f"bvblk must divide V and be 16-aligned, got {bvblk}"
+    if vsplit <= 0:
+        # auto: split V across CTAs until the grid reaches ~512 (fills H200's 132 SMs
+        # at small batch); producer redundancy per extra slice is negligible.
+        vsplit = 1
+        while vsplit < V // bvblk and N * HV * vsplit < 512:
+            vsplit *= 2
+    assert (V // bvblk) % vsplit == 0, f"vsplit must divide V//bvblk, got vsplit={vsplit}"
 
     h0_source, pool_size, _ = _normalize_state_source(
         initial_state_source, N=N, HV=HV, K=K, V=V, device=q.device, state_layout="vk",
@@ -705,7 +719,7 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     stream = _get_cached_stream(q.device)
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
     compiled_kernel = _get_compiled_gemm_kvbuffer_cute_kernel(
-        N, T, H, HV, K, V, pool_size, bvblk,
+        N, T, H, HV, K, V, pool_size, bvblk, vsplit,
         scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
         disable_state_update=disable_state_update, emit_output=emit_output,
         write_ubuf=write_ubuf,

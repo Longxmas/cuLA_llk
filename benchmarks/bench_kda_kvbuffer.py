@@ -268,9 +268,10 @@ def make_gkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ub
 
 
 def make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, ubufs=None):
-    """CuTe sm_90 tensor-core gemm-kvbuffer. env KDA_CGKVB_BVBLK (-1 = default 32)."""
+    """CuTe sm_90 tensor-core gemm-kvbuffer. env KDA_CGKVB_BVBLK / KDA_CGKVB_VSPLIT (-1 = auto)."""
     u_buf, kinv_buf, b_buf = (ubufs if ubufs is not None else (None, None, None))
     _bvblk = int(os.environ.get("KDA_CGKVB_BVBLK", "32"))
+    _vsplit = int(os.environ.get("KDA_CGKVB_VSPLIT", "-1"))
     def call():
         return kda_decode_mtp_gemm_kvbuffer_cute(
             A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
@@ -278,7 +279,7 @@ def make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, u
             use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0,
             disable_state_update=dsu, emit_output=True,
             u_buffer=u_buf, kinv_buffer=kinv_buf, b_buffer=b_buf,
-            bvblk=_bvblk,
+            bvblk=_bvblk, vsplit=_vsplit,
         )
     return call
 
