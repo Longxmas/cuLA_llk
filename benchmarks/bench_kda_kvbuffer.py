@@ -1,22 +1,15 @@
-"""KVBuffer (chunkwise) vs production recurrent vk/ws — apples-to-apples bench.
+"""KVBuffer (chunkwise) vs production recurrent vk/ws — fair spec-decode verify CHAIN.
 
-Goal: vk-kvbuffer beats production vk (kda_decode_mtp_small_batch variant='vk')
-and ws-kvbuffer beats production ws (kda_decode_mtp_ws), same inputs / timing
-harness (CUDA-graph capture+replay).
+Goal: vk-kvbuffer beats production vk (kda_decode_mtp_small_batch variant='vk') and
+ws-kvbuffer beats production ws (kda_decode_mtp_ws), same inputs + CUDA-graph timing.
 
-Two modes:
-  --verify 0 (default): pure-forward latency, compute only (no rollback I/O).
-  --verify 1: fair spec-decode verify CHAIN. REC = recurrent verify (writes T·d²
-    intermediate states) + commit; KVB = kvbuffer verify (emits output + writes a
-    compact u-buffer) + flush (rank-m rebuild of S_m). spd = REC / KVB.
+Chain: REC = recurrent verify (writes T·d² intermediate states) + commit; KVB =
+kvbuffer verify (emit output + write a compact u-buffer) + flush (rank-m rebuild of
+S_m). spd = REC / KVB. The commit uses the REAL sglang fused_mamba_state_scatter_with_mask
+(from KDA_SCATTER_FILE) so the recurrent rollback cost is official code, not a model.
 
-The commit step uses the REAL sglang kernel fused_mamba_state_scatter_with_mask
-(loaded from KDA_SCATTER_FILE, same importlib trick as the Triton baseline) so
-the recurrent rollback cost is measured with official code, not a model.
-
-Self-contained (inlines input/timing helpers) to survive renames of the
-production bench module. Triton recurrent baseline (numerical check only) from
-KDA_TRITON_FILE; scatter commit from KDA_SCATTER_FILE.
+Self-contained (inlines input/timing helpers). Triton recurrent baseline (numerical
+check only) from KDA_TRITON_FILE; scatter commit from KDA_SCATTER_FILE.
 """
 
 import argparse
@@ -107,14 +100,18 @@ def to_triton_varlen(q, k, v, a, b):
     return q_t, k_t, v_t, a_t, b_t, cu_seqlens
 
 
-def make_triton_call(qt, kt, vt, at, bt, cu_seqlens, A_log, dt_bias, state, indices, scale, dsu):
+def make_triton_call(qt, kt, vt, at, bt, cu_seqlens, A_log, dt_bias, state, indices, scale, dsu,
+                     inter_buf=None, inter_idx=None, cache_steps=None):
+    """Official sglang recurrent verify. In verify mode (inter_buf set) it writes the T·d²
+    intermediate_states_buffer, same rollback cost as our production vk_v/ws_v."""
     def call():
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log, a=at, dt_bias=dt_bias, softplus_beta=1.0, softplus_threshold=20.0,
             q=qt, k=kt, v=vt, b=bt, initial_state_source=state, initial_state_indices=indices,
             scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens, is_kda=True,
-            disable_state_update=dsu, intermediate_states_buffer=None, intermediate_state_indices=None,
-            cache_steps=None, retrieve_parent_token=None, lower_bound=None,
+            disable_state_update=dsu, intermediate_states_buffer=inter_buf,
+            intermediate_state_indices=inter_idx, cache_steps=cache_steps,
+            retrieve_parent_token=None, lower_bound=None,
         )
     return call
 
@@ -261,6 +258,48 @@ def _accept_len(T, accept, N=0):
     return max(1, min(int(accept), T))
 
 
+def _profile_one(args, DSU, device):
+    """Run ONE method's kernel in a loop so ncu can wrap it. Shape = (batch_sizes[0], Ts[0])."""
+    N, T = args.batch_sizes[0], args.Ts[0]
+    q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
+        N, T, args.H, args.HV, args.K, args.V, device)
+    scale = args.K ** -0.5
+    m = _accept_len(T, args.accept, N)
+    inter_buf = torch.empty(N, T, args.HV, args.V, args.K, dtype=torch.float32, device=device)
+    ubufs = (
+        torch.empty(N, T, args.HV, args.V, dtype=torch.float32, device=device),
+        torch.empty(N, T, args.HV, args.K, dtype=torch.float32, device=device),
+        torch.empty(N, T, args.HV, args.K, dtype=torch.float32, device=device),
+    )
+    p = args.profile
+    if p == "vk":
+        fn = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
+    elif p == "ws":
+        fn = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
+    elif p == "vkkvb":
+        fn = make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
+    elif p == "wskvb":
+        fn = make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
+    elif p == "triton":
+        qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
+        tri_idx = torch.arange(N, device=device, dtype=torch.int32)
+        fn = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias, state0.clone(),
+                              indices, scale, DSU, inter_buf, tri_idx, T)
+    elif p == "commit":
+        make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)()
+        fn = make_scatter_commit_call(state0.clone(), inter_buf, m, N, T, args.HV, args.V, args.K)
+    elif p == "flush":
+        make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
+        fn = make_flush_call(state0.clone(), indices, ubufs, m)
+    for _ in range(5):
+        fn()
+    torch.cuda.synchronize()
+    for _ in range(args.profile_iters):
+        fn()
+    torch.cuda.synchronize()
+    print(f"profiled {p} N={N} T={T} HV={args.HV} m={m} iters={args.profile_iters}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -270,17 +309,14 @@ def main():
     ap.add_argument("--HV", type=int, default=64)
     ap.add_argument("--K", type=int, default=128)
     ap.add_argument("--V", type=int, default=128)
-    ap.add_argument("--warmup", type=int, default=30)
     ap.add_argument("--rep", type=int, default=300)
+    ap.add_argument("--warmup", type=int, default=5, help="warmup iters before each timed segment")
     ap.add_argument("--graph-calls", type=int, default=4,
-                    help="ops per graph to amortize fixed overhead (needs idempotent dsu=1)")
+                    help="ops per CUDA graph to amortize fixed launch overhead at small batch "
+                         "(N<16; N>=16 uses 1). needs idempotent dsu=1.")
     ap.add_argument("--dsu", type=int, default=1, choices=[0, 1],
                     help="disable_state_update; 1=forward-only (idempotent, default), 0=write state")
     ap.add_argument("--vk-bv", type=int, default=-1, choices=[-1, 8, 16, 32])
-    ap.add_argument("--ws", type=int, default=1, choices=[0, 1], help="also bench ws / ws-kvbuffer")
-    ap.add_argument("--verify", type=int, default=0, choices=[0, 1],
-                    help="fair spec-decode verify-CHAIN mode (REC=verify+commit, KVB=verify+flush, "
-                         "spd=REC/KVB). 0=pure forward (compute only).")
     ap.add_argument("--accept", default="random",
                     help="chain accept length m: full(=T)/half/one/random/<int>; drives commit/flush.")
     ap.add_argument("--commit", default="scatter", choices=["scatter", "gather"],
@@ -289,16 +325,22 @@ def main():
                          "gather=strided copy (sensitivity). kvbuffer flush always counted.")
     ap.add_argument("--check", action="store_true", help="numerical check only, no timing")
     ap.add_argument("--atol", type=float, default=5e-2)
+    ap.add_argument("--profile", default="",
+                    choices=["", "vk", "ws", "vkkvb", "wskvb", "triton", "commit", "flush"],
+                    help="ncu profile mode: run one method's kernel in a loop (uses batch-sizes[0], Ts[0])")
+    ap.add_argument("--profile-iters", type=int, default=20, help="kernel launches in the profiled loop")
     args = ap.parse_args()
 
     global _VK_BV
     _VK_BV = args.vk_bv
     DSU = bool(args.dsu)
-    VERIFY = bool(args.verify)
     device = "cuda"
+    if args.profile:
+        _profile_one(args, DSU, device)
+        return
     print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"shape H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu={DSU} verify={VERIFY} "
-          f"graph_calls={args.graph_calls} ws={args.ws} wskvb_impl={_HAVE_WSKVB}")
+    print(f"shape H={args.H} HV={args.HV} K={args.K} V={args.V}  dsu={DSU} "
+          f"wskvb_impl={_HAVE_WSKVB}")
 
     # ---------------- numerical check (vs Triton recurrent) ----------------
     if not _HAVE_TRITON:
@@ -323,16 +365,14 @@ def main():
                                           state0.clone(), indices, scale, True)()
                 d_vk = (o_vk - o_tri).abs().max().item()
                 d_vkkvb = (o_vkkvb - o_tri).abs().max().item()
-                d_ws = float("nan")
+                o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias,
+                                    state0.clone(), indices, scale, True)()
+                d_ws = (o_ws - o_tri).abs().max().item()
                 d_wskvb = float("nan")
-                if args.ws:
-                    o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias,
-                                        state0.clone(), indices, scale, True)()
-                    d_ws = (o_ws - o_tri).abs().max().item()
-                    if _HAVE_WSKVB:
-                        o_wskvb = make_wskvb_call(q, k, v, a, b, A_log, dt_bias,
-                                                  state0.clone(), indices, scale, True)()
-                        d_wskvb = (o_wskvb - o_tri).abs().max().item()
+                if _HAVE_WSKVB:
+                    o_wskvb = make_wskvb_call(q, k, v, a, b, A_log, dt_bias,
+                                              state0.clone(), indices, scale, True)()
+                    d_wskvb = (o_wskvb - o_tri).abs().max().item()
                 cand = [x for x in (d_vk, d_vkkvb, d_ws, d_wskvb) if x == x]
                 flag = "OK" if max(cand) < args.atol else "DIFF!"
                 print(f"{N:>4} {T:>3} | {d_vk:>10.2e} | {d_vkkvb:>10.2e} | "
@@ -341,89 +381,35 @@ def main():
     if args.check:
         return
 
-    def us(x):
-        return f"{x * 1e3:.1f}" if x else "n/a"
-
-    if VERIFY:
-        _timing_verify_chain(args, DSU, device)
-        return
-
-    # ---------------- timing: pure forward (compute only) ----------------
-    print("\n=== latency (us, CUDA-graph) — pure forward (compute only) ===")
-    hdr = (f"{'N':>4} {'T':>3} | {'tg_vk':>8} {'tg_vkkvb':>9}")
-    if args.ws:
-        hdr += f" {'tg_ws':>8} {'tg_wskvb':>9}"
-    hdr += f" | {'vk/vkkvb':>9}"
-    if args.ws:
-        hdr += f" {'ws/wskvb':>9}"
-    print(hdr)
-    for N in args.batch_sizes:
-        for T in args.Ts:
-            q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
-                N, T, args.H, args.HV, args.K, args.V, device)
-            scale = args.K ** -0.5
-            gc = 1 if N >= 16 else args.graph_calls
-            tg = {}
-            fn_vk = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU)
-            fn_vkkvb = make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU)
-            warmup(fn_vk, 3); warmup(fn_vkkvb, 3)
-            tg["vk"] = t_graph_ms(fn_vk, 3, args.rep, gc)
-            tg["vkkvb"] = t_graph_ms(fn_vkkvb, 3, args.rep, gc)
-            if args.ws:
-                fn_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU)
-                warmup(fn_ws, 3)
-                tg["ws"] = t_graph_ms(fn_ws, 3, args.rep, gc)
-                if _HAVE_WSKVB:
-                    fn_wskvb = make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU)
-                    warmup(fn_wskvb, 3)
-                    tg["wskvb"] = t_graph_ms(fn_wskvb, 3, args.rep, gc)
-
-            def ratio(num, den):
-                a_, b_ = tg.get(num), tg.get(den)
-                return f"{a_ / b_:.2f}x" if (a_ and b_) else "n/a"
-
-            row = f"{N:>4} {T:>3} | {us(tg.get('vk')):>8} {us(tg.get('vkkvb')):>9}"
-            if args.ws:
-                row += f" {us(tg.get('ws')):>8} {us(tg.get('wskvb')):>9}"
-            row += f" | {ratio('vk', 'vkkvb'):>9}"  # >1 = kvbuffer faster than vk
-            if args.ws:
-                row += f" {ratio('ws', 'wskvb'):>9}"
-            print(row)
+    _timing_verify_chain(args, DSU, device)
 
 
 def _timing_verify_chain(args, DSU, device):
-    """Fair spec-decode verify CHAIN (each segment timed in its own CUDA graph, summed):
-    REC = recurrent verify (writes T·d² states) + commit; KVB = kvbuffer verify (emit +
-    write u-buffer) + flush (rank-m rebuild S_m). spd = REC / KVB. Accept length m = --accept."""
+    """Fair spec-decode verify CHAIN (each segment timed in its own CUDA graph, summed). All verify
+    kernels run dsu=1 + verify-mode: recurrent vk/ws/triton write the T·d² intermediate states,
+    kvbuffer writes its compact u-buffer. REC = recurrent verify + commit; KVB = kvbuffer verify +
+    flush. spd_vk/spd_ws = REC/KVB vs production vk/ws; spd_vkbf/spd_wsbf = official triton REC chain
+    / kvbuffer KVB chain. Prints chain totals + speedups first, per-segment breakdown after."""
     def us(x):
         return f"{x * 1e3:.1f}" if x else "n/a"
+
+    def rat(a_, b_):
+        return f"{a_ / b_:.2f}x" if (a_ and b_) else "n/a"
 
     if args.commit == "scatter" and not _HAVE_SCATTER:
         raise RuntimeError(
             f"commit=scatter needs the official sglang kernel; set KDA_SCATTER_FILE to "
             f"mamba_state_scatter_triton.py (load error: {_SCATTER_ERR})")
 
-    print(f"\n=== verify-CHAIN latency (us, CUDA-graph, kernel-only) — accept m={args.accept} "
-          f"commit={args.commit} ===")
-    if args.commit == "scatter":
-        print("  REC = verify (writes T·d² states) + commit (official sglang "
-              "fused_mamba_state_scatter_with_mask: coalesced N·d² gather→pool)")
-    else:
-        print("  REC = verify (writes T·d² states) + commit (strided gather copy, sensitivity)")
-    print("  KVB = kvbuffer verify (emit output + write compact u-buffer) + flush (rank-m rebuild S_m)")
-    hdr = (f"{'N':>4} {'T':>3} {'m':>3} | {'vk_v':>6} {'cmt':>5} {'REC_vk':>7} | "
-           f"{'kvb_v':>6} {'flush':>6} {'KVB_vk':>7} | {'spd_vk':>7}")
-    if args.ws:
-        hdr += f" || {'ws_v':>6} {'REC_ws':>7} {'wskvb_v':>7} {'KVB_ws':>7} | {'spd_ws':>7}"
-    print(hdr)
-    print("-" * len(hdr))
+    # ---- measure every segment for every (N, T) into `results` ----
+    results = []
     for N in args.batch_sizes:
         for T in args.Ts:
             q, k, v, a, b, A_log, dt_bias, state0, indices = make_dense_inputs(
                 N, T, args.H, args.HV, args.K, args.V, device)
             scale = args.K ** -0.5
             m = _accept_len(T, args.accept, N)
-            gc = 1  # segments timed separately (large buffers, no amortization)
+            gc = 1 if N >= 16 else args.graph_calls  # amortize launch overhead at small batch
             inter_buf = torch.empty(N, T, args.HV, args.V, args.K, dtype=torch.float32, device=device)
             ubufs = (
                 torch.empty(N, T, args.HV, args.V, dtype=torch.float32, device=device),
@@ -431,47 +417,64 @@ def _timing_verify_chain(args, DSU, device):
                 torch.empty(N, T, args.HV, args.K, dtype=torch.float32, device=device),
             )
             tg = {}
-            # vk REC: verify (fills inter_buf) + commit
-            fn_vk = make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
-            warmup(fn_vk, 3)
-            tg["vk_v"] = t_graph_ms(fn_vk, 3, args.rep, gc)
+
+            def time_seg(fn):
+                warmup(fn, args.warmup)
+                return t_graph_ms(fn, args.warmup, args.rep, gc)
+
+            # recurrent verify (dsu=1, writes T·d² states) + commit
+            tg["vk_v"] = time_seg(make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf))
             if args.commit == "scatter":
-                fn_cmt = make_scatter_commit_call(state0.clone(), inter_buf, m,
-                                                  N, T, args.HV, args.V, args.K)
+                fn_cmt = make_scatter_commit_call(state0.clone(), inter_buf, m, N, T, args.HV, args.V, args.K)
             else:
                 fn_cmt = make_gather_commit_call(state0.clone(), inter_buf, m)
-            warmup(fn_cmt, 3)
-            tg["cmt"] = t_graph_ms(fn_cmt, 3, args.rep, gc)
-            # vk KVB: verify (fills ubufs) + flush
-            fn_vkkvb = make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
-            warmup(fn_vkkvb, 3)
-            tg["kvb_v"] = t_graph_ms(fn_vkkvb, 3, args.rep, gc)
-            fn_flush = make_flush_call(state0.clone(), indices, ubufs, m)
-            warmup(fn_flush, 3)
-            tg["flush"] = t_graph_ms(fn_flush, 3, args.rep, gc)
+            tg["cmt"] = time_seg(fn_cmt)
+            tg["ws_v"] = time_seg(make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf))
+            # kvbuffer verify (dsu=1, writes u-buffer) + flush
+            tg["kvb_v"] = time_seg(make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
+            tg["flush"] = time_seg(make_flush_call(state0.clone(), indices, ubufs, m))
+            if _HAVE_WSKVB:
+                tg["wskvb_v"] = time_seg(make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
+            # official triton recurrent verify (dsu=1, writes T·d² states)
+            if _HAVE_TRITON:
+                qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
+                tri_inter = torch.empty(N, T, args.HV, args.V, args.K, dtype=torch.float32, device=device)
+                tri_idx = torch.arange(N, device=device, dtype=torch.int32)
+                tg["tri_v"] = time_seg(make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
+                                                        state0.clone(), indices, scale, DSU, tri_inter, tri_idx, T))
 
-            rec_vk = tg["vk_v"] + tg["cmt"]
-            kvb_vk = tg["kvb_v"] + tg["flush"]
-            spd_vk = f"{rec_vk / kvb_vk:.2f}x" if kvb_vk else "n/a"
-            row = (f"{N:>4} {T:>3} {m:>3} | {us(tg['vk_v']):>6} {us(tg['cmt']):>5} {us(rec_vk):>7} | "
-                   f"{us(tg['kvb_v']):>6} {us(tg['flush']):>6} {us(kvb_vk):>7} | {spd_vk:>7}")
+            r = {"N": N, "T": T, "m": m, "tg": tg}
+            r["REC_vk"] = tg["vk_v"] + tg["cmt"]
+            r["KVB_vk"] = tg["kvb_v"] + tg["flush"]
+            r["REC_ws"] = tg["ws_v"] + tg["cmt"]
+            r["KVB_ws"] = tg["wskvb_v"] + tg["flush"] if _HAVE_WSKVB else None
+            r["REC_tri"] = tg["tri_v"] + tg["cmt"] if _HAVE_TRITON else None
+            results.append(r)
 
-            if args.ws:
-                fn_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf)
-                warmup(fn_ws, 3)
-                tg["ws_v"] = t_graph_ms(fn_ws, 3, args.rep, gc)
-                rec_ws = tg["ws_v"] + tg["cmt"]
-                if _HAVE_WSKVB:
-                    fn_wskvb = make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)
-                    warmup(fn_wskvb, 3)
-                    tg["wskvb_v"] = t_graph_ms(fn_wskvb, 3, args.rep, gc)
-                    kvb_ws = tg["wskvb_v"] + tg["flush"]
-                    spd_ws = f"{rec_ws / kvb_ws:.2f}x" if kvb_ws else "n/a"
-                    wskvb_v_s, kvb_ws_s = us(tg["wskvb_v"]), us(kvb_ws)
-                else:
-                    spd_ws, wskvb_v_s, kvb_ws_s = "n/a", "n/a", "n/a"
-                row += f" || {us(tg['ws_v']):>6} {us(rec_ws):>7} {wskvb_v_s:>7} {kvb_ws_s:>7} | {spd_ws:>7}"
-            print(row)
+    # ---- table 1: chain totals + speedups ----
+    print(f"\n=== verify-CHAIN total latency (us) + speedup — accept m={args.accept} commit={args.commit} ===")
+    print("  REC_* = recurrent verify (writes T·d² states) + commit;  KVB_* = kvbuffer verify (u-buffer) + flush")
+    print("  spd_vk/spd_ws = REC_(vk/ws) / KVB_(vk/ws);  spd_vkbf/spd_wsbf = REC_tri (official triton) / KVB_(vk/ws)")
+    hdr = (f"{'N':>4} {'T':>3} {'m':>3} | {'REC_vk':>7} {'REC_ws':>7} {'REC_tri':>7} | {'KVB_vk':>7} {'KVB_ws':>7} | "
+           f"{'spd_vk':>7} {'spd_ws':>7} {'spd_vkbf':>8} {'spd_wsbf':>8}")
+    print(hdr)
+    print("-" * len(hdr))
+    for r in results:
+        print(f"{r['N']:>4} {r['T']:>3} {r['m']:>3} | {us(r['REC_vk']):>7} {us(r['REC_ws']):>7} {us(r['REC_tri']):>7} | "
+              f"{us(r['KVB_vk']):>7} {us(r['KVB_ws']):>7} | "
+              f"{rat(r['REC_vk'], r['KVB_vk']):>7} {rat(r['REC_ws'], r['KVB_ws']):>7} "
+              f"{rat(r['REC_tri'], r['KVB_vk']):>8} {rat(r['REC_tri'], r['KVB_ws']):>8}")
+
+    # ---- table 2: per-segment breakdown ----
+    print("\n=== per-segment breakdown (us) — verify kernels + shared commit/flush ===")
+    hdr2 = (f"{'N':>4} {'T':>3} | {'vk_v':>6} {'ws_v':>6} {'tri_v':>6} | {'kvb_v':>6} {'wskvb_v':>7} | "
+            f"{'cmt':>5} {'flush':>6}")
+    print(hdr2)
+    print("-" * len(hdr2))
+    for r in results:
+        tg = r["tg"]
+        print(f"{r['N']:>4} {r['T']:>3} | {us(tg.get('vk_v')):>6} {us(tg.get('ws_v')):>6} {us(tg.get('tri_v')):>6} | "
+              f"{us(tg.get('kvb_v')):>6} {us(tg.get('wskvb_v')):>7} | {us(tg.get('cmt')):>5} {us(tg.get('flush')):>6}")
 
 
 if __name__ == "__main__":

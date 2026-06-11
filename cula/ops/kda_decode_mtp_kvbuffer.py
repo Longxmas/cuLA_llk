@@ -1,11 +1,11 @@
 """CuTe DSL KDA MTP decode — KVBuffer / chunkwise parallel-verification variant.
 
-KVBuffer paper's chunkwise verify form (§3.3) as a new operator vs the recurrent
-vk/kv ops in ``kda_decode_mtp.py``. The T draft tokens are treated as ONE chunk:
-per-token outputs come from the FIXED input state S0 plus a small T×T intra-chunk
-correction, and the state is updated once at the end — the S0-matvecs are
-independent across tokens (no length-T serial chain), the latency angle at small
-batch. Infra (grid N*HV*(V//BV), 1 warp/CTA, lane=K, float4 loads, butterfly
+KVBuffer paper's chunkwise verify form (https://arxiv.org/abs/2605.19049) as a new
+operator vs the recurrent vk/kv ops in ``kda_decode_mtp.py``. The T draft tokens
+are treated as ONE chunk: per-token outputs come from the FIXED input state S0 plus a
+small T×T intra-chunk correction, and the state is updated once at the end — the
+S0-matvecs are independent across tokens (no length-T serial chain), the latency angle
+at small batch. Infra (grid N*HV*(V//BV), 1 warp/CTA, lane=K, float4 loads, butterfly
 reduce-over-K) mirrors the production vk kernel for apples-to-apples comparison.
 
 Chunkwise math (state S0[v,k], decay-first; matches the recurrent op):
@@ -44,7 +44,6 @@ from cula.ops.kda_decode_mtp import (
 logger = logging.getLogger(__name__)
 
 
-# vk-kvbuffer: lane=K, 1 warp/CTA, chunkwise gated-delta-rule (single chunk = T draft tokens).
 @cute.kernel
 def kda_mtp_kvbuffer_vk_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
@@ -111,8 +110,6 @@ def kda_mtp_kvbuffer_vk_kernel(
     r_qbf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_abf_n = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
-    # ILP batched butterfly: pack a fixed t's reduce-over-K partials (i A/P + BV Skdec/Sqdec) into one
-    # width-(i_t+BV) array, reduce in a single pass -> dependency depth (i_t+BV)*5 down to 5.
     r_redB = cute.make_rmem_tensor(cute.make_layout((T + BV,), stride=(1,)), cutlass.Float32)
 
     # Load state S0 (contiguous float4, coalesced + vectorized).
@@ -217,8 +214,6 @@ def kda_mtp_kvbuffer_vk_kernel(
     # after the loop b_run[c] = b_{T-1}[c] (used by the final state update).
 
     # Phase B: forward-subst u_t = beta_t*(v_t - S0@kdec_t - sum_{i<t} A[t,i] u_i).
-    # ILP batched butterfly: pack A[t,i] (i<t) + Skdec[vv] (BV) partials into r_redB[0:i_t+BV], reduce in one
-    # pass; then forward-subst for u (serial over t). r_redB front [0:i_t]=A, back [i_t:i_t+BV]=Skdec.
     for i_t in cutlass.range_constexpr(T):
         for i_i in cutlass.range_constexpr(i_t):
             s = cutlass.Float32(0.0)
@@ -245,8 +240,7 @@ def kda_mtp_kvbuffer_vk_kernel(
             for i_t in cutlass.range_constexpr(T):
                 u_buf[i_n, i_t, i_hv, i_v * BV + lane] = r_u[i_t * BV + lane]
 
-    # Phase C: output o_t = S0@qdec_t + sum_{i<=t} P[t,i] u_i. Same batched butterfly: pack P[t,i] (i<=t) +
-    # Sqdec[vv] partials into r_redB[0:(i_t+1)+BV]. flush mode (emit_output=False) skips this entirely.
+    # Phase C: output o_t = S0@qdec_t + sum_{i<=t} P[t,i] u_i.
     if cutlass.const_expr(emit_output):
         for i_t in cutlass.range_constexpr(T):
             for i_i in cutlass.range_constexpr(i_t + 1):
@@ -499,19 +493,6 @@ def kda_decode_mtp_kvbuffer(
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
-    """KDA MTP decode — vk-KVBuffer / chunkwise parallel verification (single chunk = T). VERIFY stage.
-
-    Spec-decode runs as two kernels verify->flush (m is unknown until after verify):
-    - verify (this fn, default emit_output=True, disable_state_update=True): does NOT commit state;
-      if u_buffer/kinv_buffer/b_buffer are passed, writes the compact rollback factors (u_t[v],
-      kinv_t[k], b_t[k]) to GMEM (~43x smaller than the recurrent T*d^2 states) for kda_flush_kvbuffer.
-    - flush: see kda_flush_kvbuffer — rank-m rebuild of S_m from the first m tokens.
-    - full-accept fast path (optional): disable_state_update=False commits S_T directly (Phase D),
-      skipping flush; but m<T must go through flush.
-
-    q/k [N,T,H,K], v/a [N,T,HV,V/K], b [N,T,HV]. state pool = vk [pool,HV,V,K].
-    u_buffer [N,T,HV,V] / kinv_buffer, b_buffer [N,T,HV,K] fp32 (None = not written).
-    """
     N, T, H, K = q.shape
     HV = v.shape[2]
     V = v.shape[3]
@@ -598,13 +579,6 @@ def kda_decode_mtp_kvbuffer(
     return o
 
 
-# ============================================================================
-# ws-kvbuffer: 4-warp warp-spec chunkwise for the large-batch regime (vs production ws).
-#   - warp0 producer: per token compute kdec/kinv/qdec[T,K], cumulative b_t, beta_t -> SMEM; then the
-#     TxT A[t,i]/P[t,i] (reduce-over-K, warp0 holds full K) -> SMEM; sBlast = b_{T-1}[k].
-#   - 4 consumer warps: each owns tile_v/4 V-rows; per row Skdec/Sqdec (butterfly), forward-subst u_t,
-#     output o_t, one-shot S_T writeback. Same math as recurrent/vk-kvbuffer; state pool = vk.
-# ============================================================================
 @cute.kernel
 def kda_mtp_ws_kvbuffer_kernel(
     h0_source: cute.Tensor,  # [pool*HV, V, K] fp32 (vk)
@@ -668,8 +642,6 @@ def kda_mtp_ws_kvbuffer_kernel(
     sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)  # b_{T-1}[k]
     sA = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # A[t,i] i<t
     sP = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, T), stride=(T, 1)), 16)  # P[t,i] i<=t
-    # use_smem_v: cooperatively preload this block's v-tile [T, tile_v] into SMEM (coalesced),
-    # replacing the per-(row,token) v[] scalar GMEM loads in the consumer solve. Allocated last.
     if cutlass.const_expr(use_smem_v):
         sVdata = smem.allocate_tensor(cutlass.Float32, cute.make_layout((T, tile_v), stride=(tile_v, 1)), 16)
 
@@ -776,8 +748,6 @@ def kda_mtp_ws_kvbuffer_kernel(
                         pij += cute.arch.shuffle_sync_bfly(pij, offset=off, mask=-1, mask_and_clamp=31)
                     sP[i_t, i_i] = pij
 
-        # use_smem_v: all 4 warps cooperatively preload v-tile [T, tile_v] into SMEM (before barrier).
-        # tile_v<=64<=128 -> one pass per token, thread tidx writes tile-local col tidx (coalesced).
         if cutlass.const_expr(use_smem_v):
             for i_t in cutlass.range_constexpr(T):
                 if tidx < tile_v:
@@ -786,8 +756,6 @@ def kda_mtp_ws_kvbuffer_kernel(
         # publish warp0's SMEM to all warps
         cute.arch.barrier()
 
-        # consumers: each group's rows_per_group rows, processed ilp_rows at a time. The Skdec/Sqdec
-        # K-reduce butterflies for all ilp_rows rows are issued interleaved per offset (ILP); solve per row.
         n_row_groups: cutlass.Constexpr[int] = rows_per_group // ilp_rows
         for rg in cutlass.range_constexpr(n_row_groups):
             v_base = i_v * tile_v + group_idx * rows_per_group + rg * ilp_rows
@@ -1057,8 +1025,6 @@ def kda_decode_mtp_ws_kvbuffer(
     assert rows_per_group % ilp_rows == 0, (
         f"ws-kvbuffer requires (tile_v/4) % ilp_rows == 0, got tile_v={tile_v}, ilp_rows={ilp_rows}"
     )
-    # use_smem_v auto = N<=16 (H200 sweep): helps mid-batch (N=16 spd_ws 1.52->1.58), hurts large batch
-    # (N>=32: extra SMEM cuts occupancy where blocks already saturate). tile_v<=128 so one pass covers it.
     use_smem_v_b = (N <= 16 and tile_v <= 128) if use_smem_v < 0 else bool(use_smem_v)
 
     h0_source, pool_size, _ = _normalize_state_source(
@@ -1253,12 +1219,6 @@ def kda_flush_kvbuffer(
     bv: int = -1,
     opt_level: int = 3,
 ) -> torch.Tensor:
-    """KVBuffer FLUSH stage: use the compact u-buffer from verify to rank-m update over the first
-    accept_len accepted tokens -> S_m, written in place into the state pool. No gating/solve recompute.
-
-    u_buffer [N,T,HV,V], kinv_buffer/b_buffer [N,T,HV,K] fp32 (verify outputs).
-    state pool = vk [pool,HV,V,K]. accept_len in [1, T] (chained; per-request lengths are future work).
-    """
     N, T, HV, V = u_buffer.shape
     K = kinv_buffer.shape[3]
     m = int(accept_len)
