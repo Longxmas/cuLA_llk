@@ -169,6 +169,11 @@ def t_graph_ms(fn, warmup_iters, rep, graph_calls=1):
 
 
 _VK_BV = -1
+_ONLY = set()  # empty = all variants
+
+
+def _want(name):
+    return not _ONLY or name in _ONLY
 
 
 def make_vk_call(q, k, v, a, b, A_log, dt_bias, state, indices, scale, dsu, inter_buf=None):
@@ -402,6 +407,10 @@ def main():
                     help="recurrent commit model: scatter=official sglang "
                          "fused_mamba_state_scatter_with_mask (coalesced N·d², default); "
                          "gather=strided copy (sensitivity). kvbuffer flush always counted.")
+    ap.add_argument("--only", nargs="+", default=[],
+                    choices=["vk", "ws", "tri", "vkkvb", "wskvb", "tpkvb", "gkvb", "cgkvb"],
+                    help="restrict check/timing to these verify variants (default: all). "
+                         "REC/spd columns show n/a for skipped baselines.")
     ap.add_argument("--check", action="store_true", help="numerical check only, no timing")
     ap.add_argument("--atol", type=float, default=5e-2)
     ap.add_argument("--profile", default="",
@@ -412,6 +421,8 @@ def main():
 
     global _VK_BV
     _VK_BV = args.vk_bv
+    global _ONLY
+    _ONLY = set(args.only)
     DSU = bool(args.dsu)
     device = "cuda"
     if args.profile:
@@ -439,37 +450,41 @@ def main():
                 o_tri = make_triton_call(qt, kt, vt, at, bt, cu, A_log, dt_bias,
                                          state0.clone(), indices, scale, True)()
                 o_tri = o_tri.reshape(N, T, args.HV, args.V)
-                o_vk = make_vk_call(q, k, v, a, b, A_log, dt_bias,
-                                    state0.clone(), indices, scale, True)()
-                o_vkkvb = make_vkkvb_call(q, k, v, a, b, A_log, dt_bias,
-                                          state0.clone(), indices, scale, True)()
-                d_vk = (o_vk - o_tri).abs().max().item()
-                d_vkkvb = (o_vkkvb - o_tri).abs().max().item()
-                o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias,
-                                    state0.clone(), indices, scale, True)()
-                d_ws = (o_ws - o_tri).abs().max().item()
+                d_vk = d_vkkvb = d_ws = float("nan")
+                if _want("vk"):
+                    o_vk = make_vk_call(q, k, v, a, b, A_log, dt_bias,
+                                        state0.clone(), indices, scale, True)()
+                    d_vk = (o_vk - o_tri).abs().max().item()
+                if _want("vkkvb"):
+                    o_vkkvb = make_vkkvb_call(q, k, v, a, b, A_log, dt_bias,
+                                              state0.clone(), indices, scale, True)()
+                    d_vkkvb = (o_vkkvb - o_tri).abs().max().item()
+                if _want("ws"):
+                    o_ws = make_ws_call(q, k, v, a, b, A_log, dt_bias,
+                                        state0.clone(), indices, scale, True)()
+                    d_ws = (o_ws - o_tri).abs().max().item()
                 d_wskvb = float("nan")
-                if _HAVE_WSKVB:
+                if _HAVE_WSKVB and _want("wskvb"):
                     o_wskvb = make_wskvb_call(q, k, v, a, b, A_log, dt_bias,
                                               state0.clone(), indices, scale, True)()
                     d_wskvb = (o_wskvb - o_tri).abs().max().item()
                 d_tpkvb = float("nan")
-                if _HAVE_TPKVB:
+                if _HAVE_TPKVB and _want("tpkvb"):
                     o_tpkvb = make_tpkvb_call(q, k, v, a, b, A_log, dt_bias,
                                               state0.clone(), indices, scale, True)()
                     d_tpkvb = (o_tpkvb - o_tri).abs().max().item()
                 d_gkvb = float("nan")
-                if _HAVE_GKVB:
+                if _HAVE_GKVB and _want("gkvb"):
                     o_gkvb = make_gkvb_call(q, k, v, a, b, A_log, dt_bias,
                                             state0.clone(), indices, scale, True)()
                     d_gkvb = (o_gkvb - o_tri).abs().max().item()
                 d_cgkvb = float("nan")
-                if _HAVE_CGKVB:
+                if _HAVE_CGKVB and _want("cgkvb"):
                     o_cgkvb = make_cgkvb_call(q, k, v, a, b, A_log, dt_bias,
                                               state0.clone(), indices, scale, True)()
                     d_cgkvb = (o_cgkvb - o_tri).abs().max().item()
                 cand = [x for x in (d_vk, d_vkkvb, d_ws, d_wskvb, d_tpkvb, d_gkvb, d_cgkvb) if x == x]
-                flag = "OK" if max(cand) < args.atol else "DIFF!"
+                flag = ("OK" if max(cand) < args.atol else "DIFF!") if cand else "n/a"
                 print(f"{N:>4} {T:>3} | {d_vk:>10.2e} | {d_vkkvb:>10.2e} | "
                       f"{d_ws:>10.2e} | {d_wskvb:>10.2e} | {d_tpkvb:>10.2e} | {d_gkvb:>10.2e} | "
                       f"{d_cgkvb:>10.2e} | {flag}")
@@ -519,26 +534,34 @@ def _timing_verify_chain(args, DSU, device):
                 return t_graph_ms(fn, args.warmup, args.rep, gc)
 
             # recurrent verify (dsu=1, writes T·d² states) + commit
-            tg["vk_v"] = time_seg(make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf))
-            if args.commit == "scatter":
-                fn_cmt = make_scatter_commit_call(state0.clone(), inter_buf, m, N, T, args.HV, args.V, args.K)
-            else:
-                fn_cmt = make_gather_commit_call(state0.clone(), inter_buf, m)
-            tg["cmt"] = time_seg(fn_cmt)
-            tg["ws_v"] = time_seg(make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf))
+            if _want("vk"):
+                tg["vk_v"] = time_seg(make_vk_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf))
+            if _want("vk") or _want("ws") or _want("tri"):
+                if args.commit == "scatter":
+                    fn_cmt = make_scatter_commit_call(state0.clone(), inter_buf, m, N, T, args.HV, args.V, args.K)
+                else:
+                    fn_cmt = make_gather_commit_call(state0.clone(), inter_buf, m)
+                tg["cmt"] = time_seg(fn_cmt)
+            if _want("ws"):
+                tg["ws_v"] = time_seg(make_ws_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, inter_buf))
             # kvbuffer verify (dsu=1, writes u-buffer) + flush
-            tg["kvb_v"] = time_seg(make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
-            tg["flush"] = time_seg(make_flush_call(state0.clone(), indices, ubufs, m))
-            if _HAVE_WSKVB:
+            if _want("vkkvb"):
+                tg["kvb_v"] = time_seg(make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
+            if _want("vkkvb") or _want("wskvb") or _want("tpkvb") or _want("gkvb") or _want("cgkvb"):
+                # flush needs a populated u-buffer: run one kvb verify first if vkkvb was skipped
+                if not _want("vkkvb"):
+                    make_vkkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs)()
+                tg["flush"] = time_seg(make_flush_call(state0.clone(), indices, ubufs, m))
+            if _HAVE_WSKVB and _want("wskvb"):
                 tg["wskvb_v"] = time_seg(make_wskvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
-            if _HAVE_TPKVB:
+            if _HAVE_TPKVB and _want("tpkvb"):
                 tg["tpkvb_v"] = time_seg(make_tpkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
-            if _HAVE_GKVB:
+            if _HAVE_GKVB and _want("gkvb"):
                 tg["gkvb_v"] = time_seg(make_gkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
-            if _HAVE_CGKVB:
+            if _HAVE_CGKVB and _want("cgkvb"):
                 tg["cgkvb_v"] = time_seg(make_cgkvb_call(q, k, v, a, b, A_log, dt_bias, state0.clone(), indices, scale, DSU, ubufs))
             # official triton recurrent verify (dsu=1, writes T·d² states)
-            if _HAVE_TRITON:
+            if _HAVE_TRITON and _want("tri"):
                 qt, kt, vt, at, bt, cu = to_triton_varlen(q, k, v, a, b)
                 tri_inter = torch.empty(N, T, args.HV, args.V, args.K, dtype=torch.float32, device=device)
                 tri_idx = torch.arange(N, device=device, dtype=torch.int32)
@@ -546,14 +569,18 @@ def _timing_verify_chain(args, DSU, device):
                                                         state0.clone(), indices, scale, DSU, tri_inter, tri_idx, T))
 
             r = {"N": N, "T": T, "m": m, "tg": tg}
-            r["REC_vk"] = tg["vk_v"] + tg["cmt"]
-            r["KVB_vk"] = tg["kvb_v"] + tg["flush"]
-            r["REC_ws"] = tg["ws_v"] + tg["cmt"]
-            r["KVB_ws"] = tg["wskvb_v"] + tg["flush"] if _HAVE_WSKVB else None
-            r["KVB_tp"] = tg["tpkvb_v"] + tg["flush"] if _HAVE_TPKVB else None
-            r["KVB_gk"] = tg["gkvb_v"] + tg["flush"] if _HAVE_GKVB else None
-            r["KVB_cg"] = tg["cgkvb_v"] + tg["flush"] if _HAVE_CGKVB else None
-            r["REC_tri"] = tg["tri_v"] + tg["cmt"] if _HAVE_TRITON else None
+
+            def _sum(av, bv):
+                return tg[av] + tg[bv] if (av in tg and bv in tg) else None
+
+            r["REC_vk"] = _sum("vk_v", "cmt")
+            r["KVB_vk"] = _sum("kvb_v", "flush")
+            r["REC_ws"] = _sum("ws_v", "cmt")
+            r["KVB_ws"] = _sum("wskvb_v", "flush")
+            r["KVB_tp"] = _sum("tpkvb_v", "flush")
+            r["KVB_gk"] = _sum("gkvb_v", "flush")
+            r["KVB_cg"] = _sum("cgkvb_v", "flush")
+            r["REC_tri"] = _sum("tri_v", "cmt")
             results.append(r)
 
     # ---- table 1: chain totals + speedups ----
