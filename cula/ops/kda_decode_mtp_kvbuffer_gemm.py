@@ -47,6 +47,7 @@ def _kda_mtp_kvbuffer_gemm_kernel(
     USE_L2NORM: tl.constexpr, DSU: tl.constexpr,
     EMIT: tl.constexpr, WRITE_UBUF: tl.constexpr,
     SP_BETA: tl.constexpr, SP_THR: tl.constexpr,
+    SMALL_DOT_PREC: tl.constexpr,
 ):
     pid = tl.program_id(0)
     i_n = pid // HV
@@ -89,18 +90,18 @@ def _kda_mtp_kvbuffer_gemm_kernel(
     blast = tl.sum(tl.where(t[:, None] == T - 1, bcum, 0.0), 0)  # b_{T-1}[k]
 
     # ---- T x T intra-chunk matrices + log-depth triangular inverse ----
-    Amat = tl.dot(kdec, tl.trans(kinv))
-    Pmat = tl.dot(qdec, tl.trans(kinv))
+    Amat = tl.dot(kdec, tl.trans(kinv), input_precision=SMALL_DOT_PREC)
+    Pmat = tl.dot(qdec, tl.trans(kinv), input_precision=SMALL_DOT_PREC)
     Pmat = tl.where(r >= c, Pmat, 0.0)
     eye = tl.where(r == c, 1.0, 0.0)
     L = tl.where(r > c, -beta[:, None] * Amat, 0.0)
     inv = eye + L  # (I - L)^{-1} = (I+L)(I+L^2)(I+L^4)(I+L^8), L nilpotent (BT=16)
-    Lp = tl.dot(L, L)
-    inv = inv + tl.dot(inv, Lp)
-    Lp = tl.dot(Lp, Lp)
-    inv = inv + tl.dot(inv, Lp)
-    Lp = tl.dot(Lp, Lp)
-    inv = inv + tl.dot(inv, Lp)
+    Lp = tl.dot(L, L, input_precision=SMALL_DOT_PREC)
+    inv = inv + tl.dot(inv, Lp, input_precision=SMALL_DOT_PREC)
+    Lp = tl.dot(Lp, Lp, input_precision=SMALL_DOT_PREC)
+    inv = inv + tl.dot(inv, Lp, input_precision=SMALL_DOT_PREC)
+    Lp = tl.dot(Lp, Lp, input_precision=SMALL_DOT_PREC)
+    inv = inv + tl.dot(inv, Lp, input_precision=SMALL_DOT_PREC)
 
     if WRITE_UBUF:
         tl.store(kinv_ptr + ((i_n * T + t[:, None]) * HV + i_hv) * K + kk[None, :],
@@ -120,9 +121,9 @@ def _kda_mtp_kvbuffer_gemm_kernel(
         vt = tl.load(v_ptr + ((i_n * T + t[:, None]) * HV + i_hv) * V + vr[None, :],
                      mask=tmask[:, None], other=0.0).to(tl.float32)
         Skdec = tl.dot(kdec, S0t)  # [BT, BV]
-        u = tl.dot(inv, beta[:, None] * (vt - Skdec))
+        u = tl.dot(inv, beta[:, None] * (vt - Skdec), input_precision=SMALL_DOT_PREC)
         if EMIT:
-            ot = tl.dot(qdec, S0t) + tl.dot(Pmat, u)
+            ot = tl.dot(qdec, S0t) + tl.dot(Pmat, u, input_precision=SMALL_DOT_PREC)
             tl.store(o_ptr + ((i_n * T + t[:, None]) * HV + i_hv) * V + vr[None, :],
                      ot.to(o_ptr.dtype.element_ty), mask=tmask[:, None])
         if WRITE_UBUF:
@@ -155,6 +156,7 @@ def kda_decode_mtp_gemm_kvbuffer(
     b_buffer: torch.Tensor | None = None,
     bv: int = 64,
     num_warps: int = 4,
+    small_dot_ieee: bool = True,
     num_stages: int = 2,
 ) -> torch.Tensor:
     """GEMM/tensor-core kvbuffer VERIFY (Triton). Drop-in for the other kvbuffer verify ops."""
@@ -202,6 +204,7 @@ def kda_decode_mtp_gemm_kvbuffer(
         DSU=disable_state_update,
         EMIT=emit_output, WRITE_UBUF=write_ubuf,
         SP_BETA=softplus_beta, SP_THR=softplus_threshold,
+        SMALL_DOT_PREC=("ieee" if small_dot_ieee else "tf32"),
         num_warps=num_warps, num_stages=num_stages,
     )
     return o
