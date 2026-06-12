@@ -2498,9 +2498,9 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
 # SECOND matrix — pad waste becomes a ~2x instruction saving:
 #   P3: [kdec; qdec] @ kinv^T   -> A (top) and P (bottom) in one GEMM chain
 #   P4: [Lp; inv] @ Lp          -> Lp^2 and inv*Lp in ONE mma; nilpotency index 8
-#                                  -> only 2 doubling steps; then Pinv = P @ inv
-#   P5: [kdec; qdec] @ S0^T     -> Skdec + Sqdec together;
-#       [inv; Pinv] @ (beta*x)  -> u and P@u together (o = Sqdec + bottom half)
+#                                  -> only 2 doubling steps
+#   P5: [kdec; qdec] @ S0^T     -> Skdec + Sqdec together; u = inv @ (beta*x) on
+#       tensor cores; o-combine P@u in exact fp32 from SMEM (16 FMA/lane)
 # Requires BVBLK=32 (4 n-tiles = 1 per warp, keeps barriers warp-uniform).
 # ---------------------------------------------------------------------------
 BT8 = 8
@@ -2569,7 +2569,6 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
     sP8 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
     sInv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
     sLp = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
-    sPinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
     sX = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BVBLK), stride=(BVBLK + 1, 1)), 16)
     sU = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BVBLK), stride=(BVBLK + 1, 1)), 16)
     sS0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BVBLK, K), stride=(K + 8, 1)), 16)
@@ -2734,11 +2733,6 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
                 sLp[ri4, ci4] = sPart[ri4, ci4]
                 sInv[ri4, ci4] = sInv[ri4, ci4] + sPart[BT8 + ri4, ci4]
             cute.arch.barrier()
-        if tidx < BT8 * BT8:  # Pinv = P @ inv
-            acc4 = cutlass.Float32(0.0)
-            for l4 in cutlass.range_constexpr(BT8):
-                acc4 += sP8[ri4, l4] * sInv[l4, ci4]
-            sPinv[ri4, ci4] = acc4
         cute.arch.barrier()
 
         # ---- P5: V blocks. BVBLK=32 -> 4 n-tiles, exactly one per warp (uniform barriers) ----
@@ -2780,15 +2774,15 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
             sX[gid, nb5 + 2 * tig + 1] = sBeta[gid] * (vv1 - e1)
             cute.arch.barrier()
 
-            # GEMM2: [inv; Pinv] @ x -> u (rows 0..7) + P@u (rows 8..15), single k-slab
+            # GEMM2: inv @ x -> u (rows 8..15 unused), single k-slab
             f0 = cutlass.Float32(0.0)
             f1 = cutlass.Float32(0.0)
             f2 = cutlass.Float32(0.0)
             f3 = cutlass.Float32(0.0)
             a0 = sInv[gid, tig]
-            a1 = sPinv[gid, tig]
+            a1 = cutlass.Float32(0.0)
             a2 = sInv[gid, tig + 4]
-            a3 = sPinv[gid, tig + 4]
+            a3 = cutlass.Float32(0.0)
             b0 = sX[tig, nb5 + gid]
             b1 = sX[tig + 4, nb5 + gid]
             f0, f1, f2, f3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, f0, f1, f2, f3)
@@ -2798,11 +2792,18 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
                 if gid < T:
                     u_buf[i_n, gid, i_hv, v_base + nb5 + 2 * tig] = f0
                     u_buf[i_n, gid, i_hv, v_base + nb5 + 2 * tig + 1] = f1
+            cute.arch.barrier()
+            # o = Sqdec + P@u combined in exact fp32 from sU (16 FMA/lane — removes the
+            # extra tf32 hop that the stacked [inv;Pinv]@x route put on the output path)
             if cutlass.const_expr(emit_output):
                 if gid < T:
-                    o[(i_n, gid, i_hv, v_base + nb5 + 2 * tig)] = cutlass.BFloat16(e2 + f2)
-                    o[(i_n, gid, i_hv, v_base + nb5 + 2 * tig + 1)] = cutlass.BFloat16(e3 + f3)
-            cute.arch.barrier()
+                    ov0 = e2
+                    ov1 = e3
+                    for l5 in cutlass.range_constexpr(BT8):
+                        ov0 += sP8[gid, l5] * sU[l5, nb5 + 2 * tig]
+                        ov1 += sP8[gid, l5] * sU[l5, nb5 + 2 * tig + 1]
+                    o[(i_n, gid, i_hv, v_base + nb5 + 2 * tig)] = cutlass.BFloat16(ov0)
+                    o[(i_n, gid, i_hv, v_base + nb5 + 2 * tig + 1)] = cutlass.BFloat16(ov1)
 
             # state: S_T = b_last * (S0 + u^T @ kinv), M = v rows, single k-slab
             if cutlass.const_expr(not disable_state_update):
@@ -2883,7 +2884,7 @@ def run_kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
         + 2 * 4 * BT8 * (K + 8)     # sKinv + sG
         + 4 * BT8 + 4 * K           # sBeta + sBlast
         + 4 * 64 * 12               # sPart
-        + 5 * 4 * BT8 * (BT8 + 1)   # sL/sP8/sInv/sLp/sPinv
+        + 4 * 4 * BT8 * (BT8 + 1)   # sL/sP8/sInv/sLp
         + 2 * 4 * BT8 * (BVBLK + 1) # sX/sU
         + 4 * BVBLK * (K + 8)       # sS0
         + 512
