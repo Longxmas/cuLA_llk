@@ -2707,7 +2707,8 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
             ri = tidx // BT8
             ci = tidx % BT8
             one = cutlass.Float32(1.0) if ri == ci else cutlass.Float32(0.0)
-            sInv[ri, ci] = one + sL[ri, ci]
+            sInv[ri, ci] = one  # inv starts at I: each doubling step does inv += inv@Lp_old
+                # (with Lp_old = Ls^(2^step)), so I+Ls is produced by step 0
             sLp[ri, ci] = sL[ri, ci]
         cute.arch.barrier()
 
@@ -2717,7 +2718,7 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
         # tf32 here measured ~5e-3 vs ~2.4e-4). sPart doubles as scratch. ----
         ri4 = tidx // BT8
         ci4 = tidx % BT8
-        for step in cutlass.range_constexpr(2):
+        for step in cutlass.range_constexpr(3):  # 3 steps: (I+Ls)(I+Ls^2)(I+Ls^4), nilpotency 8
             if tidx < 2 * BT8 * BT8:  # rows 0..7 -> Lp@Lp, rows 8..15 -> inv@Lp
                 rr4 = ri4 % BT8
                 acc4 = cutlass.Float32(0.0)
