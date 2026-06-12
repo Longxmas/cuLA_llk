@@ -2332,12 +2332,12 @@ _compiled_gemm_kvbuffer_cute_kernels: dict[tuple, object] = {}
 
 
 def _get_compiled_gemm_kvbuffer_cute_kernel(
-    N, T, H, HV, K, V, pool_size, bvblk, vsplit, scale, use_qk_l2norm,
+    N, T, H, HV, K, V, pool_size, bvblk, vsplit, bt8, scale, use_qk_l2norm,
     disable_state_update, emit_output, write_ubuf,
     softplus_beta, softplus_threshold, opt_level=3, fast_math=True,
 ):
     key = (
-        N, T, H, HV, K, V, pool_size, bvblk, vsplit, scale, use_qk_l2norm,
+        N, T, H, HV, K, V, pool_size, bvblk, vsplit, bt8, scale, use_qk_l2norm,
         disable_state_update, emit_output, write_ubuf,
         softplus_beta, softplus_threshold, opt_level, fast_math,
     )
@@ -2358,8 +2358,9 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
     kinv_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
     b_buf = torch.zeros(N, T, HV, K, dtype=torch.float32, device="cuda")
 
+    run_fn = run_kda_mtp_gemm_kvbuffer_cute_bt8_kernel if bt8 else run_kda_mtp_gemm_kvbuffer_cute_kernel
     compiled_kernel = cute.compile(
-        run_kda_mtp_gemm_kvbuffer_cute_kernel,
+        run_fn,
         from_dlpack(h0_source, assumed_align=16),
         from_dlpack(A_log, assumed_align=16),
         from_dlpack(a, assumed_align=16),
@@ -2391,7 +2392,7 @@ def _get_compiled_gemm_kvbuffer_cute_kernel(
     _compiled_gemm_kvbuffer_cute_kernels[key] = compiled_kernel
     logger.info(
         "CuTe DSL KDA MTP gemm-KVBuffer (sm90 mma) kernel compiled: "
-        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, BVBLK={bvblk}, VSPLIT={vsplit}, opt_level={opt_level}"
+        f"N={N}, T={T}, HV={HV}, K={K}, V={V}, BVBLK={bvblk}, VSPLIT={vsplit}, bt8={bt8}, opt_level={opt_level}"
     )
     return compiled_kernel
 
@@ -2418,6 +2419,7 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     b_buffer: torch.Tensor | None = None,
     bvblk: int = 32,
     vsplit: int = -1,
+    bt: int = -1,
     opt_level: int = 3,
     fast_math: bool = True,
 ) -> torch.Tensor:
@@ -2431,6 +2433,10 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
         scale = K**-0.5
     assert K == TILE_K == 128, f"cute-gemm-kvbuffer requires K=128, got {K}"
     assert T <= BT, f"cute-gemm-kvbuffer pads tokens to BT={BT}, needs T<={BT}, got {T}"
+    bt8 = (T <= 8) if bt < 0 else (bt == 8)
+    if bt8:
+        assert T <= 8, f"bt=8 path needs T<=8, got {T}"
+        assert bvblk == 32, f"bt=8 path requires bvblk=32 (one n-tile per warp), got {bvblk}"
     assert V % bvblk == 0 and bvblk % 16 == 0, f"bvblk must divide V and be 16-aligned, got {bvblk}"
     if vsplit <= 0:
         # auto: split V across CTAs until the grid reaches ~512 (fills H200's 132 SMs
@@ -2472,7 +2478,7 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
     stream = _get_cached_stream(q.device)
     h0_source_flat = h0_source.view(pool_size * HV, V, K)
     compiled_kernel = _get_compiled_gemm_kvbuffer_cute_kernel(
-        N, T, H, HV, K, V, pool_size, bvblk, vsplit,
+        N, T, H, HV, K, V, pool_size, bvblk, vsplit, bt8,
         scale=scale, use_qk_l2norm=use_qk_l2norm_in_kernel,
         disable_state_update=disable_state_update, emit_output=emit_output,
         write_ubuf=write_ubuf,
@@ -2484,3 +2490,419 @@ def kda_decode_mtp_gemm_kvbuffer_cute(
         initial_state_indices, u_buf, kinv_buf, b_buf, stream,
     )
     return o
+
+
+# ---------------------------------------------------------------------------
+# BT=8 stacked variant of the cute-gemm kernel (T <= 8). mma.sync m16n8k8 has a
+# hard M=16, so instead of padding tokens to 16 the spare 8 M-rows carry a
+# SECOND matrix — pad waste becomes a ~2x instruction saving:
+#   P3: [kdec; qdec] @ kinv^T   -> A (top) and P (bottom) in one GEMM chain
+#   P4: [Lp; inv] @ Lp          -> Lp^2 and inv*Lp in ONE mma; nilpotency index 8
+#                                  -> only 2 doubling steps; then Pinv = P @ inv
+#   P5: [kdec; qdec] @ S0^T     -> Skdec + Sqdec together;
+#       [inv; Pinv] @ (beta*x)  -> u and P@u together (o = Sqdec + bottom half)
+# Requires BVBLK=32 (4 n-tiles = 1 per warp, keeps barriers warp-uniform).
+# ---------------------------------------------------------------------------
+BT8 = 8
+
+
+@cute.kernel
+def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
+    h0_source: cute.Tensor,
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    u_buf: cute.Tensor,
+    kinv_buf: cute.Tensor,
+    b_buf: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    BVBLK: cutlass.Constexpr[int],
+    VSPLIT: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    emit_output: cutlass.Constexpr[bool],
+    write_ubuf: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    lane_id = tidx % 32
+    warp_idx = cute.arch.warp_idx()
+    warp_idx = cute.arch.make_warp_uniform(warp_idx)
+    gid = lane_id // 4
+    tig = lane_id % 4
+
+    num_warps: cutlass.Constexpr[int] = 4
+    bidx, _, _ = cute.arch.block_idx()
+    i_vs = bidx % VSPLIT
+    tmp = bidx // VSPLIT
+    i_hv = tmp % HV
+    i_n = tmp // HV
+    i_h = i_hv // (HV // H)
+
+    cache_idx = h0_indices[i_n]
+    r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
+
+    smem = cutlass.utils.SmemAllocator()
+    # stacked feature maps: rows 0..7 = kdec(tokens, pad-zeroed), rows 8..15 = qdec
+    sKQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((2 * BT8, K), stride=(K + 8, 1)), 16)
+    sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, K), stride=(K + 8, 1)), 16)
+    sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, K), stride=(K + 8, 1)), 16)
+    sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8,)), 16)
+    sBlast = smem.allocate_tensor(cutlass.Float32, cute.make_layout((K,)), 16)
+    # P3 cross-warp partial tiles: row = warp*16 + stacked-row
+    sPart = smem.allocate_tensor(cutlass.Float32, cute.make_layout((4 * 16, 12), stride=(12, 1)), 16)
+    sL = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
+    sP8 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
+    sInv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
+    sLp = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
+    sPinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BT8), stride=(BT8 + 1, 1)), 16)
+    sX = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BVBLK), stride=(BVBLK + 1, 1)), 16)
+    sU = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT8, BVBLK), stride=(BVBLK + 1, 1)), 16)
+    sS0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BVBLK, K), stride=(K + 8, 1)), 16)
+
+    r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
+    r_qf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_kf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+    r_s4 = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32)
+
+    if cache_idx >= 0:
+        k_start = lane_id * vec_size
+        flat_state_idx = cache_idx * HV + i_hv
+
+        # ---- P1: token-parallel l2norm + staging (k_norm -> sKQ top, q_scaled -> bottom) ----
+        tokens_per_warp: cutlass.Constexpr[int] = (T + num_warps - 1) // num_warps
+        for tt in cutlass.range_constexpr(tokens_per_warp):
+            t_tok = tt * num_warps + warp_idx
+            if t_tok < T:
+                q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, t_tok, i_h, lane_id))
+                k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, t_tok, i_h, lane_id))
+                cute.autovec_copy(q_tile, r_qbf)
+                cute.autovec_copy(k_tile, r_kbf)
+                for c in cutlass.range_constexpr(vec_size):
+                    r_qf[c] = cutlass.Float32(r_qbf[c])
+                    r_kf[c] = cutlass.Float32(r_kbf[c])
+                if cutlass.const_expr(use_qk_l2norm):
+                    sum_q = cutlass.Float32(0.0)
+                    sum_k = cutlass.Float32(0.0)
+                    for c in cutlass.range_constexpr(vec_size):
+                        sum_q += r_qf[c] * r_qf[c]
+                        sum_k += r_kf[c] * r_kf[c]
+                    for off in [16, 8, 4, 2, 1]:
+                        sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
+                        sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
+                    inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
+                    inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_qf[c] = r_qf[c] * inv_q
+                        r_kf[c] = r_kf[c] * inv_k
+                else:
+                    for c in cutlass.range_constexpr(vec_size):
+                        r_qf[c] = r_qf[c] * scale
+                # gate g_t per channel into sG (decay applied in P2)
+                for c in cutlass.range_constexpr(vec_size):
+                    x = cutlass.Float32(a[i_n, t_tok, i_hv, k_start + c]) + cutlass.Float32(
+                        dt_bias[i_hv, k_start + c]
+                    )
+                    beta_x = softplus_beta * x
+                    exp_bx = cute.exp(beta_x, fastmath=fast_math)
+                    sp_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + exp_bx, fastmath=fast_math
+                    )
+                    use_sp = (
+                        cutlass.Float32(1.0)
+                        if beta_x <= softplus_threshold
+                        else cutlass.Float32(0.0)
+                    )
+                    sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
+                    sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)
+                    sKQ[t_tok, k_start + c] = r_kf[c]
+                    sKQ[BT8 + t_tok, k_start + c] = r_qf[c]
+                if lane_id == 0:
+                    sBeta[t_tok] = cutlass.Float32(1.0) / (
+                        cutlass.Float32(1.0)
+                        + cute.exp(-cutlass.Float32(b[i_n, t_tok, i_hv]), fastmath=fast_math)
+                    )
+        for rp in cutlass.range_constexpr(BT8 - T):
+            sKQ[T + rp, tidx] = cutlass.Float32(0.0)
+            sKQ[BT8 + T + rp, tidx] = cutlass.Float32(0.0)
+            sKinv[T + rp, tidx] = cutlass.Float32(0.0)
+        if tidx >= T:
+            if tidx < BT8:
+                sBeta[tidx] = cutlass.Float32(0.0)
+        cute.arch.barrier()
+
+        # ---- P2: K-parallel logspace scan (thread = channel kc) ----
+        kc = tidx  # requires K == 128 == block size
+        lb = cutlass.Float32(0.0)
+        for i_t in cutlass.range_constexpr(T):
+            lb = lb + cute.log(sG[i_t, kc], fastmath=fast_math)
+            bcum = cute.exp(lb, fastmath=fast_math)
+            binv = cute.exp(-lb, fastmath=fast_math)
+            kn = sKQ[i_t, kc]
+            kinv_v = kn * binv
+            sKQ[i_t, kc] = kn * bcum
+            sKQ[BT8 + i_t, kc] = sKQ[BT8 + i_t, kc] * bcum
+            sKinv[i_t, kc] = kinv_v
+            if cutlass.const_expr(write_ubuf):
+                if i_vs == 0:
+                    kinv_buf[i_n, i_t, i_hv, kc] = kinv_v
+                    b_buf[i_n, i_t, i_hv, kc] = bcum
+        sBlast[kc] = cute.exp(lb, fastmath=fast_math)
+        cute.arch.barrier()
+
+        # ---- P3: stacked [kdec; qdec] @ kinv^T — 16 k-slabs, 4 per warp, partials in SMEM ----
+        c0 = cutlass.Float32(0.0)
+        c1 = cutlass.Float32(0.0)
+        c2 = cutlass.Float32(0.0)
+        c3 = cutlass.Float32(0.0)
+        for ks in cutlass.range_constexpr(K // 8 // num_warps):
+            kb = (warp_idx * (K // 8 // num_warps) + ks) * 8
+            a0 = sKQ[gid, kb + tig]
+            a1 = sKQ[gid + 8, kb + tig]
+            a2 = sKQ[gid, kb + tig + 4]
+            a3 = sKQ[gid + 8, kb + tig + 4]
+            b0 = sKinv[gid, kb + tig]
+            b1 = sKinv[gid, kb + tig + 4]
+            c0, c1, c2, c3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3)
+        for fi in cutlass.range_constexpr(4):
+            row = gid + (fi // 2) * 8
+            col = 2 * tig + (fi % 2)
+            cv = c0
+            if cutlass.const_expr(fi == 1):
+                cv = c1
+            if cutlass.const_expr(fi == 2):
+                cv = c2
+            if cutlass.const_expr(fi == 3):
+                cv = c3
+            sPart[warp_idx * 16 + row, col] = cv
+        cute.arch.barrier()
+        # reduce 4 partials; top half -> L (strict lower, -beta), bottom -> P (lower)
+        rr3 = tidx // 8
+        cc3 = tidx % 8
+        psum = (
+            sPart[rr3, cc3] + sPart[16 + rr3, cc3] + sPart[32 + rr3, cc3] + sPart[48 + rr3, cc3]
+        )
+        if rr3 < BT8:
+            keep = cutlass.Float32(1.0) if rr3 > cc3 else cutlass.Float32(0.0)
+            sL[rr3, cc3] = -sBeta[rr3] * psum * keep
+        else:
+            tr3 = rr3 - BT8
+            keep = cutlass.Float32(1.0) if tr3 >= cc3 else cutlass.Float32(0.0)
+            sP8[tr3, cc3] = psum * keep
+        cute.arch.barrier()
+        if tidx < BT8 * BT8:
+            ri = tidx // BT8
+            ci = tidx % BT8
+            one = cutlass.Float32(1.0) if ri == ci else cutlass.Float32(0.0)
+            sInv[ri, ci] = one + sL[ri, ci]
+            sLp[ri, ci] = sL[ri, ci]
+        cute.arch.barrier()
+
+        # ---- P4: 2 doubling steps, each ONE stacked mma [Lp; inv] @ Lp (warp0) ----
+        for step in cutlass.range_constexpr(2):
+            d0 = cutlass.Float32(0.0)
+            d1 = cutlass.Float32(0.0)
+            d2 = cutlass.Float32(0.0)
+            d3 = cutlass.Float32(0.0)
+            if warp_idx == 0:
+                a0 = sLp[gid, tig]
+                a1 = sInv[gid, tig]
+                a2 = sLp[gid, tig + 4]
+                a3 = sInv[gid, tig + 4]
+                b0 = sLp[tig, gid]
+                b1 = sLp[tig + 4, gid]
+                d0, d1, d2, d3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, d0, d1, d2, d3)
+            cute.arch.barrier()
+            if warp_idx == 0:
+                sLp[gid, 2 * tig] = d0
+                sLp[gid, 2 * tig + 1] = d1
+                sInv[gid, 2 * tig] = sInv[gid, 2 * tig] + d2
+                sInv[gid, 2 * tig + 1] = sInv[gid, 2 * tig + 1] + d3
+            cute.arch.barrier()
+        # Pinv = P @ inv (warp0; M rows 8..15 unused -> zero A frags)
+        d0 = cutlass.Float32(0.0)
+        d1 = cutlass.Float32(0.0)
+        d2 = cutlass.Float32(0.0)
+        d3 = cutlass.Float32(0.0)
+        if warp_idx == 0:
+            a0 = sP8[gid, tig]
+            a1 = cutlass.Float32(0.0)
+            a2 = sP8[gid, tig + 4]
+            a3 = cutlass.Float32(0.0)
+            b0 = sInv[tig, gid]
+            b1 = sInv[tig + 4, gid]
+            d0, d1, d2, d3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, d0, d1, d2, d3)
+            sPinv[gid, 2 * tig] = d0
+            sPinv[gid, 2 * tig + 1] = d1
+        cute.arch.barrier()
+
+        # ---- P5: V blocks. BVBLK=32 -> 4 n-tiles, exactly one per warp (uniform barriers) ----
+        num_v_blocks: cutlass.Constexpr[int] = V // BVBLK // VSPLIT
+        for vb in cutlass.range_constexpr(num_v_blocks):
+            v_base = (i_vs * num_v_blocks + vb) * BVBLK
+            for j in cutlass.range_constexpr(BVBLK * K // (128 * vec_size)):
+                flat = j * 128 + tidx
+                s_row = flat // (K // vec_size)
+                s_col4 = flat % (K // vec_size)
+                h_tile = cute.local_tile(
+                    h0_source, (1, 1, vec_size), (flat_state_idx, v_base + s_row, s_col4)
+                )
+                cute.autovec_copy(h_tile, r_s4)
+                for cc4 in cutlass.range_constexpr(vec_size):
+                    sS0[s_row, s_col4 * vec_size + cc4] = r_s4[cc4]
+            cute.arch.barrier()
+
+            nb5 = warp_idx * 8  # one n-tile per warp
+            # GEMM1: [kdec; qdec] @ S0^T -> Skdec (rows 0..7) + Sqdec (rows 8..15)
+            e0 = cutlass.Float32(0.0)
+            e1 = cutlass.Float32(0.0)
+            e2 = cutlass.Float32(0.0)
+            e3 = cutlass.Float32(0.0)
+            for ks in cutlass.range_constexpr(K // 8):
+                kb = ks * 8
+                a0 = sKQ[gid, kb + tig]
+                a1 = sKQ[gid + 8, kb + tig]
+                a2 = sKQ[gid, kb + tig + 4]
+                a3 = sKQ[gid + 8, kb + tig + 4]
+                b0 = sS0[nb5 + gid, kb + tig]
+                b1 = sS0[nb5 + gid, kb + tig + 4]
+                e0, e1, e2, e3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, e0, e1, e2, e3)
+            # x = beta * (v - Skdec) from the top half; Sqdec (e2/e3) stays in registers
+            vmask = cutlass.Float32(1.0) if gid < T else cutlass.Float32(0.0)
+            vv0 = cutlass.Float32(v[i_n, gid % T, i_hv, v_base + nb5 + 2 * tig]) * vmask
+            vv1 = cutlass.Float32(v[i_n, gid % T, i_hv, v_base + nb5 + 2 * tig + 1]) * vmask
+            sX[gid, nb5 + 2 * tig] = sBeta[gid] * (vv0 - e0)
+            sX[gid, nb5 + 2 * tig + 1] = sBeta[gid] * (vv1 - e1)
+            cute.arch.barrier()
+
+            # GEMM2: [inv; Pinv] @ x -> u (rows 0..7) + P@u (rows 8..15), single k-slab
+            f0 = cutlass.Float32(0.0)
+            f1 = cutlass.Float32(0.0)
+            f2 = cutlass.Float32(0.0)
+            f3 = cutlass.Float32(0.0)
+            a0 = sInv[gid, tig]
+            a1 = sPinv[gid, tig]
+            a2 = sInv[gid, tig + 4]
+            a3 = sPinv[gid, tig + 4]
+            b0 = sX[tig, nb5 + gid]
+            b1 = sX[tig + 4, nb5 + gid]
+            f0, f1, f2, f3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, f0, f1, f2, f3)
+            sU[gid, nb5 + 2 * tig] = f0
+            sU[gid, nb5 + 2 * tig + 1] = f1
+            if cutlass.const_expr(write_ubuf):
+                if gid < T:
+                    u_buf[i_n, gid, i_hv, v_base + nb5 + 2 * tig] = f0
+                    u_buf[i_n, gid, i_hv, v_base + nb5 + 2 * tig + 1] = f1
+            if cutlass.const_expr(emit_output):
+                if gid < T:
+                    o[(i_n, gid, i_hv, v_base + nb5 + 2 * tig)] = cutlass.BFloat16(e2 + f2)
+                    o[(i_n, gid, i_hv, v_base + nb5 + 2 * tig + 1)] = cutlass.BFloat16(e3 + f3)
+            cute.arch.barrier()
+
+            # state: S_T = b_last * (S0 + u^T @ kinv), M = v rows, single k-slab
+            if cutlass.const_expr(not disable_state_update):
+                m_tiles: cutlass.Constexpr[int] = BVBLK // 16
+                pairs: cutlass.Constexpr[int] = m_tiles * (K // 8)
+                for pp in cutlass.range_constexpr((pairs + num_warps - 1) // num_warps):
+                    pidx = pp * num_warps + warp_idx
+                    if pidx < pairs:
+                        m_t = pidx % m_tiles
+                        n_t = pidx // m_tiles
+                        mb = m_t * 16
+                        nb6 = n_t * 8
+                        g0 = cutlass.Float32(0.0)
+                        g1 = cutlass.Float32(0.0)
+                        g2 = cutlass.Float32(0.0)
+                        g3 = cutlass.Float32(0.0)
+                        a0 = sU[tig, mb + gid]
+                        a1 = sU[tig, mb + gid + 8]
+                        a2 = sU[tig + 4, mb + gid]
+                        a3 = sU[tig + 4, mb + gid + 8]
+                        b0 = sKinv[tig, nb6 + gid]
+                        b1 = sKinv[tig + 4, nb6 + gid]
+                        g0, g1, g2, g3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, g0, g1, g2, g3)
+                        for fi in cutlass.range_constexpr(4):
+                            vrow = mb + gid + (fi // 2) * 8
+                            kcol = nb6 + 2 * tig + (fi % 2)
+                            gv = g0
+                            if cutlass.const_expr(fi == 1):
+                                gv = g1
+                            if cutlass.const_expr(fi == 2):
+                                gv = g2
+                            if cutlass.const_expr(fi == 3):
+                                gv = g3
+                            h0_source[(flat_state_idx, v_base + vrow, kcol)] = (
+                                sBlast[kcol] * (sS0[vrow, kcol] + gv)
+                            )
+            cute.arch.barrier()
+
+
+@cute.jit
+def run_kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
+    h0_source: cute.Tensor,
+    A_log: cute.Tensor,
+    a: cute.Tensor,
+    dt_bias: cute.Tensor,
+    q: cute.Tensor,
+    k: cute.Tensor,
+    v: cute.Tensor,
+    b: cute.Tensor,
+    o: cute.Tensor,
+    h0_indices: cute.Tensor,
+    u_buf: cute.Tensor,
+    kinv_buf: cute.Tensor,
+    b_buf: cute.Tensor,
+    vec_size: cutlass.Constexpr[int],
+    BVBLK: cutlass.Constexpr[int],
+    VSPLIT: cutlass.Constexpr[int],
+    softplus_beta: cutlass.Constexpr[float],
+    softplus_threshold: cutlass.Constexpr[float],
+    scale: cutlass.Constexpr[float],
+    HV: cutlass.Constexpr[int],
+    T: cutlass.Constexpr[int],
+    H: cutlass.Constexpr[int],
+    K: cutlass.Constexpr[int],
+    V: cutlass.Constexpr[int],
+    use_qk_l2norm: cutlass.Constexpr[bool],
+    disable_state_update: cutlass.Constexpr[bool],
+    emit_output: cutlass.Constexpr[bool],
+    write_ubuf: cutlass.Constexpr[bool],
+    fast_math: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    """BT=8 stacked cute-gemm launcher: grid = N*HV*VSPLIT, block = 128."""
+    n_indices = h0_indices.layout.shape[0]
+    grid_size = n_indices * HV * VSPLIT
+    smem_bytes = (
+        2 * 4 * BT8 * (K + 8)       # sKQ (stacked)
+        + 2 * 4 * BT8 * (K + 8)     # sKinv + sG
+        + 4 * BT8 + 4 * K           # sBeta + sBlast
+        + 4 * 64 * 12               # sPart
+        + 5 * 4 * BT8 * (BT8 + 1)   # sL/sP8/sInv/sLp/sPinv
+        + 2 * 4 * BT8 * (BVBLK + 1) # sX/sU
+        + 4 * BVBLK * (K + 8)       # sS0
+        + 512
+    )
+    kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
+        h0_source, A_log, a, dt_bias, q, k, v, b, o, h0_indices,
+        u_buf, kinv_buf, b_buf,
+        vec_size, BVBLK, VSPLIT,
+        softplus_beta, softplus_threshold, scale,
+        HV, T, H, K, V,
+        use_qk_l2norm, disable_state_update, emit_output, write_ubuf, fast_math,
+    ).launch(grid=(grid_size, 1, 1), block=[128, 1, 1], smem=smem_bytes, stream=stream)
