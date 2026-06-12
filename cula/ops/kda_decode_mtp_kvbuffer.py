@@ -2628,7 +2628,7 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
                         else cutlass.Float32(0.0)
                     )
                     sp_x = use_sp * sp_val + (cutlass.Float32(1.0) - use_sp) * x
-                    sG[t_tok, k_start + c] = -r_exp_A * sp_x  # log g_t (logspace, no exp/log roundtrip)
+                    sG[t_tok, k_start + c] = cute.exp(-r_exp_A * sp_x, fastmath=fast_math)  # g_t directly (exact prefix product in P2)
                     sKQ[t_tok, k_start + c] = r_kf[c]
                     sKQ[BT8 + t_tok, k_start + c] = r_qf[c]
                 if lane_id == 0:
@@ -2645,13 +2645,12 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
                 sBeta[tidx] = cutlass.Float32(0.0)
         cute.arch.barrier()
 
-        # ---- P2: K-parallel logspace scan (thread = channel kc) ----
+        # ---- P2: K-parallel prefix-product scan (thread = channel kc) ----
         kc = tidx  # requires K == 128 == block size
-        lb = cutlass.Float32(0.0)
+        bcum = cutlass.Float32(1.0)
         for i_t in cutlass.range_constexpr(T):
-            lb = lb + sG[i_t, kc]
-            bcum = cute.exp(lb, fastmath=fast_math)
-            binv = cute.exp(-lb, fastmath=fast_math)
+            bcum = bcum * sG[i_t, kc]
+            binv = cutlass.Float32(1.0) / bcum
             kn = sKQ[i_t, kc]
             kinv_v = kn * binv
             sKQ[i_t, kc] = kn * bcum
@@ -2661,7 +2660,7 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
                 if i_vs == 0:
                     kinv_buf[i_n, i_t, i_hv, kc] = kinv_v
                     b_buf[i_n, i_t, i_hv, kc] = bcum
-        sBlast[kc] = cute.exp(lb, fastmath=fast_math)
+        sBlast[kc] = bcum
         cute.arch.barrier()
 
         # ---- P3: stacked [kdec; qdec] @ kinv^T — 16 k-slabs, 4 per warp, partials in SMEM ----
