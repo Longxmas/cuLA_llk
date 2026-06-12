@@ -2774,18 +2774,14 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
             sX[gid, nb5 + 2 * tig + 1] = sBeta[gid] * (vv1 - e1)
             cute.arch.barrier()
 
-            # GEMM2: inv @ x -> u (rows 8..15 unused), single k-slab
+            # u = inv @ x in exact fp32 (8x8 apply = 16 FMA/lane; an mma here only adds
+            # tf32 truncation of x — the whole small-matrix path is now exact, only the
+            # big S0 GEMMs stay tf32, matching the BT16 path's effective precision)
             f0 = cutlass.Float32(0.0)
             f1 = cutlass.Float32(0.0)
-            f2 = cutlass.Float32(0.0)
-            f3 = cutlass.Float32(0.0)
-            a0 = sInv[gid, tig]
-            a1 = cutlass.Float32(0.0)
-            a2 = sInv[gid, tig + 4]
-            a3 = cutlass.Float32(0.0)
-            b0 = sX[tig, nb5 + gid]
-            b1 = sX[tig + 4, nb5 + gid]
-            f0, f1, f2, f3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, f0, f1, f2, f3)
+            for l5 in cutlass.range_constexpr(BT8):
+                f0 += sInv[gid, l5] * sX[l5, nb5 + 2 * tig]
+                f1 += sInv[gid, l5] * sX[l5, nb5 + 2 * tig + 1]
             sU[gid, nb5 + 2 * tig] = f0
             sU[gid, nb5 + 2 * tig + 1] = f1
             if cutlass.const_expr(write_ubuf):
