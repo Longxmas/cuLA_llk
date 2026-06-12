@@ -2713,42 +2713,32 @@ def kda_mtp_gemm_kvbuffer_cute_bt8_kernel(
             sLp[ri, ci] = sL[ri, ci]
         cute.arch.barrier()
 
-        # ---- P4: 2 doubling steps, each ONE stacked mma [Lp; inv] @ Lp (warp0) ----
+        # ---- P4: doubling chain + Pinv on the 8x8 mats in PLAIN fp32 (64 threads,
+        # one (r,c) entry each, ~8 FMA per product — negligible cost, and it avoids
+        # compounding tf32 truncation through the solve (kept Δ at the BT16 level;
+        # tf32 here measured ~5e-3 vs ~2.4e-4). sPart doubles as scratch. ----
+        ri4 = tidx // BT8
+        ci4 = tidx % BT8
         for step in cutlass.range_constexpr(2):
-            d0 = cutlass.Float32(0.0)
-            d1 = cutlass.Float32(0.0)
-            d2 = cutlass.Float32(0.0)
-            d3 = cutlass.Float32(0.0)
-            if warp_idx == 0:
-                a0 = sLp[gid, tig]
-                a1 = sInv[gid, tig]
-                a2 = sLp[gid, tig + 4]
-                a3 = sInv[gid, tig + 4]
-                b0 = sLp[tig, gid]
-                b1 = sLp[tig + 4, gid]
-                d0, d1, d2, d3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, d0, d1, d2, d3)
+            if tidx < 2 * BT8 * BT8:  # rows 0..7 -> Lp@Lp, rows 8..15 -> inv@Lp
+                rr4 = ri4 % BT8
+                acc4 = cutlass.Float32(0.0)
+                for l4 in cutlass.range_constexpr(BT8):
+                    if ri4 < BT8:
+                        acc4 += sLp[rr4, l4] * sLp[l4, ci4]
+                    else:
+                        acc4 += sInv[rr4, l4] * sLp[l4, ci4]
+                sPart[ri4, ci4] = acc4
             cute.arch.barrier()
-            if warp_idx == 0:
-                sLp[gid, 2 * tig] = d0
-                sLp[gid, 2 * tig + 1] = d1
-                sInv[gid, 2 * tig] = sInv[gid, 2 * tig] + d2
-                sInv[gid, 2 * tig + 1] = sInv[gid, 2 * tig + 1] + d3
+            if tidx < BT8 * BT8:
+                sLp[ri4, ci4] = sPart[ri4, ci4]
+                sInv[ri4, ci4] = sInv[ri4, ci4] + sPart[BT8 + ri4, ci4]
             cute.arch.barrier()
-        # Pinv = P @ inv (warp0; M rows 8..15 unused -> zero A frags)
-        d0 = cutlass.Float32(0.0)
-        d1 = cutlass.Float32(0.0)
-        d2 = cutlass.Float32(0.0)
-        d3 = cutlass.Float32(0.0)
-        if warp_idx == 0:
-            a0 = sP8[gid, tig]
-            a1 = cutlass.Float32(0.0)
-            a2 = sP8[gid, tig + 4]
-            a3 = cutlass.Float32(0.0)
-            b0 = sInv[tig, gid]
-            b1 = sInv[tig + 4, gid]
-            d0, d1, d2, d3 = _mma_m16n8k8_tf32(a0, a1, a2, a3, b0, b1, d0, d1, d2, d3)
-            sPinv[gid, 2 * tig] = d0
-            sPinv[gid, 2 * tig + 1] = d1
+        if tidx < BT8 * BT8:  # Pinv = P @ inv
+            acc4 = cutlass.Float32(0.0)
+            for l4 in cutlass.range_constexpr(BT8):
+                acc4 += sP8[ri4, l4] * sInv[l4, ci4]
+            sPinv[ri4, ci4] = acc4
         cute.arch.barrier()
 
         # ---- P5: V blocks. BVBLK=32 -> 4 n-tiles, exactly one per warp (uniform barriers) ----
