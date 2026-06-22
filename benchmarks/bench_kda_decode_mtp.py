@@ -377,13 +377,13 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 2, 4, 8])
     ap.add_argument("--Ts", type=int, nargs="+", default=[2, 3, 4, 6, 8])
-    ap.add_argument("--H", type=int, default=16)
-    ap.add_argument("--HV", type=int, default=64)
+    ap.add_argument("--H", type=int, default=32)
+    ap.add_argument("--HV", type=int, default=32)
     ap.add_argument("--K", type=int, default=128)
     ap.add_argument("--V", type=int, default=128)
     ap.add_argument("--rep", type=int, default=300)
     ap.add_argument("--warmup", type=int, default=5, help="warmup iters before each timed segment")
-    ap.add_argument("--graph-calls", type=int, default=4,
+    ap.add_argument("--graph-calls", type=int, default=20,
                     help="ops per CUDA graph to amortize fixed launch overhead at small batch "
                          "(N<16; N>=16 uses 1). needs idempotent dsu=1.")
     ap.add_argument("--dsu", type=int, default=1, choices=[0, 1],
