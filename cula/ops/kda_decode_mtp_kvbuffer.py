@@ -1029,7 +1029,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
 
     smem = cutlass.utils.SmemAllocator()
     # stacked feature maps: rows 0..7 = kdec(tokens, pad-zeroed), rows 8..15 = qdec
-    sKQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((2 * BT, K), stride=(K + 8, 1)), 16)
+    sKQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout((2 * BT, K), stride=(K + 4, 1)), 16)
     sKinv = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, K), stride=(K + 8, 1)), 16)
     sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, K), stride=(K + 8, 1)), 16)
     sBeta = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT,)), 16)
@@ -1042,7 +1042,7 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
     sLp = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, BT), stride=(BT + 1, 1)), 16)
     sX = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, BV), stride=(BV + 1, 1)), 16)
     sU = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BT, BV), stride=(BV + 1, 1)), 16)
-    sS0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BV, K), stride=(K + 8, 1)), 16)
+    sS0 = smem.allocate_tensor(cutlass.Float32, cute.make_layout((BV, K), stride=(K + 4, 1)), 16)
 
     r_qbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
     r_kbf = cute.make_rmem_tensor(cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16)
@@ -1201,7 +1201,6 @@ def kda_mtp_gemm_kvbuffer_cute_kernel(
                 sLp[ri, ci] = sPart[ri, ci]
                 sInv[ri, ci] = sInv[ri, ci] + sPart[BT + ri, ci]
             cute.arch.barrier()
-        cute.arch.barrier()
 
         # ---- P5 consumer. V tiled 3 ways (outer->inner):
         #   num_v_tiles  : V split across CTAs (grid=N*HV*num_v_tiles)
