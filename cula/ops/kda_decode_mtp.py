@@ -2157,9 +2157,12 @@ def kda_decode_mtp(
         return kda_decode_mtp_recurrent(**common, variant="kv", k_split=-1)  # k_split auto
     T = q.shape[1]
     work_units = q.shape[0] * v.shape[2]  # N * HV
-    # T <= 4: single-warp vk wins everywhere. T > 4: vk still wins except in the large
-    # batch x large HV regime (N*HV >= _WS_WORK_UNIT_THRESHOLD) where the single-warp
-    # kernel hits the DRAM-bandwidth wall (~0.42x); route only that regime to recurrent_ws.
-    if T <= 4 or work_units < _WS_WORK_UNIT_THRESHOLD:
+    # Route the large batch x large HV regime (N*HV >= _WS_WORK_UNIT_THRESHOLD) to warp-spec.
+    # T > 4: single-warp vk hits the DRAM-bandwidth wall there. T == 4: contiguous vk and ws
+    # tie, but under the production dyn-stride (K-contiguous strided q/k/v) path vk loses its
+    # vectorized-load fast path (measured ~+25% vs contiguous at N=128/HV=16, dropping below
+    # triton and ws) while ws stages through SMEM (cp.async) and is ~stride-insensitive (~+4%).
+    # T < 4 keeps single-warp vk (large-batch crossover there is unmeasured).
+    if T < 4 or work_units < _WS_WORK_UNIT_THRESHOLD:
         return kda_decode_mtp_recurrent(**common, variant="vk", bv=-1)  # bv auto
     return kda_decode_mtp_recurrent_ws(**common, state_layout="vk")
