@@ -24,7 +24,9 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
+from cutlass.cutlass_dsl import T as _T
 
+from cula.ops._mlir_compat import llvm as _llvm
 from cula.ops.kda.decode.cute import (
     NUM_THREADS,
     TILE_K,
@@ -43,6 +45,95 @@ logger = logging.getLogger(__name__)
 VEC_SIZE_MTP = 4
 
 _compiled_mtp_recurrent_ws_kernels: dict[tuple, object] = {}
+
+
+# SGLang's fused Triton recurrent reference fixes these FP32 operations at the
+# PTX level. Keeping the same local instruction sequence here prevents an
+# algebraically equivalent CuTe expression from being reassociated into a
+# different rounding path. These are deliberately local to MTP: they are not
+# a generic math API and make the reference contract visible at the call site.
+@cutlass.dsl_user_op
+def _triton_f32_mul(a, b, *, loc=None, ip=None):
+    result = _llvm.inline_asm(
+        _T.f32(),
+        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+        "mul.f32 $0, $1, $2;",
+        "=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Float32(result)
+
+
+@cutlass.dsl_user_op
+def _triton_f32_fma(a, b, c, *, loc=None, ip=None):
+    result = _llvm.inline_asm(
+        _T.f32(),
+        [
+            a.ir_value(loc=loc, ip=ip),
+            b.ir_value(loc=loc, ip=ip),
+            c.ir_value(loc=loc, ip=ip),
+        ],
+        "fma.rn.f32 $0, $1, $2, $3;",
+        "=f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Float32(result)
+
+
+@cutlass.dsl_user_op
+def _triton_f32_sqrt(a, *, loc=None, ip=None):
+    result = _llvm.inline_asm(
+        _T.f32(),
+        [a.ir_value(loc=loc, ip=ip)],
+        "sqrt.approx.ftz.f32 $0, $1;",
+        "=f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Float32(result)
+
+
+@cutlass.dsl_user_op
+def _triton_f32_div(a, b, *, loc=None, ip=None):
+    result = _llvm.inline_asm(
+        _T.f32(),
+        [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
+        "div.full.f32 $0, $1, $2;",
+        "=f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Float32(result)
+
+
+@cutlass.dsl_user_op
+def _triton_f32_ex2(a, *, loc=None, ip=None):
+    result = _llvm.inline_asm(
+        _T.f32(),
+        [a.ir_value(loc=loc, ip=ip)],
+        "ex2.approx.f32 $0, $1;",
+        "=f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Float32(result)
 
 
 def _normalize_mtp_a(a: torch.Tensor, *, N: int, T: int, HV: int, K: int) -> torch.Tensor:
@@ -96,14 +187,6 @@ def _select_mtp_config(
 
 def _select_mtp_tile_v(N: int, HV: int, V: int, T: int) -> int:
     return _select_mtp_config(N, HV, V, T)[0]
-
-
-@cute.jit
-def fma_pair(a1, a2, b1, b2, c1, c2):
-    # FMA two pairs: (a1*b1+c1, a2*b2+c2).
-    result1 = a1 * b1 + c1
-    result2 = a2 * b2 + c2
-    return result1, result2
 
 
 @cute.kernel
@@ -162,9 +245,9 @@ def kda_verify_kernel_mtp_recurrent_ws(
 
     cache_idx = h0_indices[i_n]
 
-    # exp(A_log) is per-head, shared across all K channels — hoist once.
+    # Match Triton's exp2-based A path once per value head.
     r_A_log = cutlass.Float32(A_log[i_hv])
-    r_exp_A = cute.exp(r_A_log, fastmath=fast_math)
+    r_exp_A = _triton_f32_ex2(_triton_f32_mul(r_A_log, cutlass.Float32(1.4426950408889634)))
 
     # SMEM broadcast buffers (warp 0 -> all warps). sG is [T, K] (per-channel);
     smem = cutlass.utils.SmemAllocator()
@@ -198,9 +281,16 @@ def kda_verify_kernel_mtp_recurrent_ws(
         for i_t in cutlass.range_constexpr(T):
             x = cutlass.Float32(a[i_n, i_t, i_hv, g_ch]) + cutlass.Float32(dt_bias[i_hv, g_ch])
             if cutlass.const_expr(use_lower_bound):
-                # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
-                sigmoid_ax = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_exp_A * x, fastmath=fast_math))
-                sG[(i_t, g_ch)] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
+                # Preserve Triton's FMA -> exp2 -> reciprocal -> exp2 chain.
+                neg_ax = _triton_f32_fma(cutlass.Float32(0.0) - r_exp_A, x, cutlass.Float32(0.0))
+                exp_neg_ax = _triton_f32_ex2(_triton_f32_mul(neg_ax, cutlass.Float32(1.4426950408889634)))
+                sigmoid_ax = _triton_f32_div(cutlass.Float32(1.0), cutlass.Float32(1.0) + exp_neg_ax)
+                sG[(i_t, g_ch)] = _triton_f32_ex2(
+                    _triton_f32_mul(
+                        _triton_f32_mul(cutlass.Float32(lower_bound), sigmoid_ax),
+                        cutlass.Float32(1.4426950408889634),
+                    )
+                )
             else:
                 beta_x = softplus_beta * x
                 softplus_x = x
@@ -224,32 +314,45 @@ def kda_verify_kernel_mtp_recurrent_ws(
                     r_k[i] = cutlass.Float32(r_k_bf16[i])
 
                 if cutlass.const_expr(use_qk_l2norm):
-                    sum_q = 0.0
-                    sum_k = 0.0
-                    for i in cutlass.range_constexpr(vec_size):
-                        sum_q += r_q[i] * r_q[i]
-                        sum_k += r_k[i] * r_k[i]
-                    # Full-warp reduction (32 lanes x vec_size=4 = all 128 K).
+                    # Keep Triton's local fragment order before the same warp tree.
+                    sum_q = _triton_f32_mul(r_q[1], r_q[1])
+                    sum_k = _triton_f32_mul(r_k[1], r_k[1])
+                    sum_q = _triton_f32_fma(r_q[0], r_q[0], sum_q)
+                    sum_k = _triton_f32_fma(r_k[0], r_k[0], sum_k)
+                    sum_q = _triton_f32_fma(r_q[2], r_q[2], sum_q)
+                    sum_k = _triton_f32_fma(r_k[2], r_k[2], sum_k)
+                    sum_q = _triton_f32_fma(r_q[3], r_q[3], sum_q)
+                    sum_k = _triton_f32_fma(r_k[3], r_k[3], sum_k)
                     for offset in [16, 8, 4, 2, 1]:
                         sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=offset, mask=-1, mask_and_clamp=31)
                         sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=offset, mask=-1, mask_and_clamp=31)
-                    inv_norm_q_scaled = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
-                    inv_norm_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                    norm_q = _triton_f32_sqrt(sum_q + cutlass.Float32(1e-6))
+                    norm_k = _triton_f32_sqrt(sum_k + cutlass.Float32(1e-6))
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = r_q[i] * inv_norm_q_scaled
-                        r_k[i] = r_k[i] * inv_norm_k
+                        r_q[i] = _triton_f32_div(r_q[i], norm_q)
+                        r_k[i] = _triton_f32_div(r_k[i], norm_k)
+                    for i in cutlass.range_constexpr(vec_size):
+                        r_q[i] = _triton_f32_mul(r_q[i], cutlass.Float32(scale))
                 else:
                     for i in cutlass.range_constexpr(vec_size):
-                        r_q[i] = r_q[i] * scale
+                        r_q[i] = _triton_f32_mul(r_q[i], cutlass.Float32(scale))
 
                 # vec_size=4 -> warp 0's 32 lanes cover all 128 K channels.
                 for i in cutlass.range_constexpr(vec_size):
                     sQ[(i_t, k_start + i)] = r_q[i]
                     sK[(i_t, k_start + i)] = r_k[i]
 
-                # Update gate beta is a per-(head, token) scalar (warp-uniform).
-                r_b = cutlass.Float32(b[i_n, i_t, i_hv])
-                r_beta = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_b, fastmath=fast_math))
+                # One producer lane computes the Triton-matched scalar beta.
+                r_beta = cutlass.Float32(0.0)
+                if lane_in_group == 0:
+                    r_b = cutlass.Float32(b[i_n, i_t, i_hv])
+                    r_beta = _triton_f32_div(
+                        cutlass.Float32(1.0),
+                        cutlass.Float32(1.0)
+                        + _triton_f32_ex2(
+                            _triton_f32_mul(cutlass.Float32(0.0) - r_b, cutlass.Float32(1.4426950408889634))
+                        ),
+                    )
                 sBeta[i_t] = r_beta
 
                 # Preload the v-tile into SMEM: warp 0 covers tile-local cols 0..31,
@@ -355,17 +458,19 @@ def kda_verify_kernel_mtp_recurrent_ws(
                         cute.autovec_copy(sG_tile, r_g)
                         r_beta = sBeta[i_t]
 
-                        # Step 1: per-channel decay (KDA: r_g[i], not a scalar).
+                        # Preserve the row-pair schedule while matching Triton's
+                        # local FMA reduction chain.
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] = r_h[0, i] * r_g[i]
-                            r_h[1, i] = r_h[1, i] * r_g[i]
-
-                        # Step 2: s = (decayed S) @ k_norm  (reduce over K).
-                        sum_hk_a = 0.0
-                        sum_hk_b = 0.0
-                        for i in cutlass.range_constexpr(vec_size):
-                            sum_hk_a += r_h[0, i] * r_k[i]
-                            sum_hk_b += r_h[1, i] * r_k[i]
+                            r_h[0, i] = _triton_f32_mul(r_h[0, i], r_g[i])
+                            r_h[1, i] = _triton_f32_mul(r_h[1, i], r_g[i])
+                        sum_hk_a = _triton_f32_mul(r_h[0, 1], r_k[1])
+                        sum_hk_b = _triton_f32_mul(r_h[1, 1], r_k[1])
+                        sum_hk_a = _triton_f32_fma(r_h[0, 0], r_k[0], sum_hk_a)
+                        sum_hk_b = _triton_f32_fma(r_h[1, 0], r_k[0], sum_hk_b)
+                        sum_hk_a = _triton_f32_fma(r_h[0, 2], r_k[2], sum_hk_a)
+                        sum_hk_b = _triton_f32_fma(r_h[1, 2], r_k[2], sum_hk_b)
+                        sum_hk_a = _triton_f32_fma(r_h[0, 3], r_k[3], sum_hk_a)
+                        sum_hk_b = _triton_f32_fma(r_h[1, 3], r_k[3], sum_hk_b)
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hk_a += cute.arch.shuffle_sync_bfly(sum_hk_a, offset=offset, mask=-1, mask_and_clamp=31)
                             sum_hk_b += cute.arch.shuffle_sync_bfly(sum_hk_b, offset=offset, mask=-1, mask_and_clamp=31)
@@ -378,13 +483,13 @@ def kda_verify_kernel_mtp_recurrent_ws(
                         else:
                             r_v_a = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_a])
                             r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
-                        v_new_a = (r_v_a - sum_hk_a) * r_beta
-                        v_new_b = (r_v_b - sum_hk_b) * r_beta
+                        v_new_a = _triton_f32_mul(cutlass.Float32(r_v_a) - sum_hk_a, r_beta)
+                        v_new_b = _triton_f32_mul(cutlass.Float32(r_v_b) - sum_hk_b, r_beta)
 
-                        # Step 4: rank-1 update with raw k (decay already applied).
+                        # Step 4: exact rank-1 FMA update.
                         for i in cutlass.range_constexpr(vec_size):
-                            r_h[0, i] += r_k[i] * v_new_a
-                            r_h[1, i] += r_k[i] * v_new_b
+                            r_h[0, i] = _triton_f32_fma(r_k[i], v_new_a, r_h[0, i])
+                            r_h[1, i] = _triton_f32_fma(r_k[i], v_new_b, r_h[1, i])
 
                         # Stage D: snapshot post-token state, sequence-indexed
                         # (flat_idx = i_n*T*HV + i_t*HV + i_hv), race-free before step 5.
@@ -403,12 +508,15 @@ def kda_verify_kernel_mtp_recurrent_ws(
                             )
                             cute.autovec_copy(cute.slice_(r_h, (1, None)), inter_b)
 
-                        # Step 5: o = S_new @ q_scaled  (reduce over K).
-                        sum_hq_a = 0.0
-                        sum_hq_b = 0.0
-                        for i in cutlass.range_constexpr(vec_size):
-                            sum_hq_a += r_h[0, i] * r_q[i]
-                            sum_hq_b += r_h[1, i] * r_q[i]
+                        # Step 5: same local FMA/reduction order as Triton.
+                        sum_hq_a = _triton_f32_mul(r_h[0, 1], r_q[1])
+                        sum_hq_b = _triton_f32_mul(r_h[1, 1], r_q[1])
+                        sum_hq_a = _triton_f32_fma(r_h[0, 0], r_q[0], sum_hq_a)
+                        sum_hq_b = _triton_f32_fma(r_h[1, 0], r_q[0], sum_hq_b)
+                        sum_hq_a = _triton_f32_fma(r_h[0, 2], r_q[2], sum_hq_a)
+                        sum_hq_b = _triton_f32_fma(r_h[1, 2], r_q[2], sum_hq_b)
+                        sum_hq_a = _triton_f32_fma(r_h[0, 3], r_q[3], sum_hq_a)
+                        sum_hq_b = _triton_f32_fma(r_h[1, 3], r_q[3], sum_hq_b)
                         for offset in [16, 8, 4, 2, 1]:
                             sum_hq_a += cute.arch.shuffle_sync_bfly(sum_hq_a, offset=offset, mask=-1, mask_and_clamp=31)
                             sum_hq_b += cute.arch.shuffle_sync_bfly(sum_hq_b, offset=offset, mask=-1, mask_and_clamp=31)
@@ -440,9 +548,6 @@ def kda_verify_kernel_mtp_recurrent_ws(
                         cute.autovec_copy(cute.slice_(r_h, (1, None)), h_tile_out_b)
 
         # ============ Recurrence: ilp_rows == 4 (process 4 V-rows together) ===
-        # Steps 1+2 fused (decay then h@k) and 4+5 fused (rank-1 then h@q), with
-        # double accumulators (halve the K-reduce FFMA chain) + packed F32x2 FMA on
-        # SM100. Per-channel decay r_g[i]/r_g[i+1] loaded from sG.
         elif cutlass.const_expr(ilp_rows == 4):
             quarter_rows: cutlass.Constexpr[int] = rows_per_group // 4
 
@@ -489,64 +594,21 @@ def kda_verify_kernel_mtp_recurrent_ws(
                         cute.autovec_copy(sG_tile, r_g)
                         r_beta = sBeta[i_t]
 
-                        # Steps 1+2 fused: per-channel decay then h@k.
-                        sum_hk_a = cutlass.Float32(0.0)
-                        sum_hk_a2 = cutlass.Float32(0.0)
-                        sum_hk_b = cutlass.Float32(0.0)
-                        sum_hk_b2 = cutlass.Float32(0.0)
-                        sum_hk_c = cutlass.Float32(0.0)
-                        sum_hk_c2 = cutlass.Float32(0.0)
-                        sum_hk_d = cutlass.Float32(0.0)
-                        sum_hk_d2 = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(0, vec_size, 2):
-                            # Step 1: per-channel decay (KDA: r_g[i]/r_g[i+1]).
-                            r_h[0, i] = r_h[0, i] * r_g[i]
-                            r_h[0, i + 1] = r_h[0, i + 1] * r_g[i + 1]
-                            r_h[1, i] = r_h[1, i] * r_g[i]
-                            r_h[1, i + 1] = r_h[1, i + 1] * r_g[i + 1]
-                            r_h[2, i] = r_h[2, i] * r_g[i]
-                            r_h[2, i + 1] = r_h[2, i + 1] * r_g[i + 1]
-                            r_h[3, i] = r_h[3, i] * r_g[i]
-                            r_h[3, i + 1] = r_h[3, i + 1] * r_g[i + 1]
-                            # Step 2: h@k, two channels per step (packed on SM100).
-                            if cutlass.const_expr(use_packed_fma):
-                                sum_hk_a, sum_hk_a2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[0, i], r_h[0, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_a, sum_hk_a2),
-                                )
-                                sum_hk_b, sum_hk_b2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[1, i], r_h[1, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_b, sum_hk_b2),
-                                )
-                                sum_hk_c, sum_hk_c2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[2, i], r_h[2, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_c, sum_hk_c2),
-                                )
-                                sum_hk_d, sum_hk_d2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[3, i], r_h[3, i + 1]),
-                                    src_b=(r_k[i], r_k[i + 1]),
-                                    src_c=(sum_hk_d, sum_hk_d2),
-                                )
-                            else:
-                                sum_hk_a, sum_hk_a2 = fma_pair(
-                                    r_h[0, i], r_h[0, i + 1], r_k[i], r_k[i + 1], sum_hk_a, sum_hk_a2
-                                )
-                                sum_hk_b, sum_hk_b2 = fma_pair(
-                                    r_h[1, i], r_h[1, i + 1], r_k[i], r_k[i + 1], sum_hk_b, sum_hk_b2
-                                )
-                                sum_hk_c, sum_hk_c2 = fma_pair(
-                                    r_h[2, i], r_h[2, i + 1], r_k[i], r_k[i + 1], sum_hk_c, sum_hk_c2
-                                )
-                                sum_hk_d, sum_hk_d2 = fma_pair(
-                                    r_h[3, i], r_h[3, i + 1], r_k[i], r_k[i + 1], sum_hk_d, sum_hk_d2
-                                )
-                        sum_hk_a = sum_hk_a + sum_hk_a2
-                        sum_hk_b = sum_hk_b + sum_hk_b2
-                        sum_hk_c = sum_hk_c + sum_hk_c2
-                        sum_hk_d = sum_hk_d + sum_hk_d2
+                        # Keep four-row ILP, but use the reference local order.
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_h[0, i] = _triton_f32_mul(r_h[0, i], r_g[i])
+                            r_h[1, i] = _triton_f32_mul(r_h[1, i], r_g[i])
+                            r_h[2, i] = _triton_f32_mul(r_h[2, i], r_g[i])
+                            r_h[3, i] = _triton_f32_mul(r_h[3, i], r_g[i])
+                        sum_hk_a = _triton_f32_mul(r_h[0, 1], r_k[1])
+                        sum_hk_b = _triton_f32_mul(r_h[1, 1], r_k[1])
+                        sum_hk_c = _triton_f32_mul(r_h[2, 1], r_k[1])
+                        sum_hk_d = _triton_f32_mul(r_h[3, 1], r_k[1])
+                        for i in [0, 2, 3]:
+                            sum_hk_a = _triton_f32_fma(r_h[0, i], r_k[i], sum_hk_a)
+                            sum_hk_b = _triton_f32_fma(r_h[1, i], r_k[i], sum_hk_b)
+                            sum_hk_c = _triton_f32_fma(r_h[2, i], r_k[i], sum_hk_c)
+                            sum_hk_d = _triton_f32_fma(r_h[3, i], r_k[i], sum_hk_d)
 
                         # Full-warp reduction for all 4 h@k dot products.
                         for offset in [16, 8, 4, 2, 1]:
@@ -567,92 +629,26 @@ def kda_verify_kernel_mtp_recurrent_ws(
                             r_v_b = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_b])
                             r_v_c = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_c])
                             r_v_d = cutlass.Float32(v[i_n, i_t, i_hv, v_idx_d])
-                        v_new_a = (r_v_a - sum_hk_a) * r_beta
-                        v_new_b = (r_v_b - sum_hk_b) * r_beta
-                        v_new_c = (r_v_c - sum_hk_c) * r_beta
-                        v_new_d = (r_v_d - sum_hk_d) * r_beta
+                        v_new_a = _triton_f32_mul(cutlass.Float32(r_v_a) - sum_hk_a, r_beta)
+                        v_new_b = _triton_f32_mul(cutlass.Float32(r_v_b) - sum_hk_b, r_beta)
+                        v_new_c = _triton_f32_mul(cutlass.Float32(r_v_c) - sum_hk_c, r_beta)
+                        v_new_d = _triton_f32_mul(cutlass.Float32(r_v_d) - sum_hk_d, r_beta)
 
-                        # Steps 4+5 FUSED: rank-1 update with raw k (step 4) then
-                        # h@q (step 5), per row. Double accumulators again.
-                        sum_hq_a = cutlass.Float32(0.0)
-                        sum_hq_a2 = cutlass.Float32(0.0)
-                        sum_hq_b = cutlass.Float32(0.0)
-                        sum_hq_b2 = cutlass.Float32(0.0)
-                        sum_hq_c = cutlass.Float32(0.0)
-                        sum_hq_c2 = cutlass.Float32(0.0)
-                        sum_hq_d = cutlass.Float32(0.0)
-                        sum_hq_d2 = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(0, vec_size, 2):
-                            if cutlass.const_expr(use_packed_fma):
-                                r_h[0, i], r_h[0, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_a, v_new_a),
-                                    src_c=(r_h[0, i], r_h[0, i + 1]),
-                                )
-                                r_h[1, i], r_h[1, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_b, v_new_b),
-                                    src_c=(r_h[1, i], r_h[1, i + 1]),
-                                )
-                                r_h[2, i], r_h[2, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_c, v_new_c),
-                                    src_c=(r_h[2, i], r_h[2, i + 1]),
-                                )
-                                r_h[3, i], r_h[3, i + 1] = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_k[i], r_k[i + 1]),
-                                    src_b=(v_new_d, v_new_d),
-                                    src_c=(r_h[3, i], r_h[3, i + 1]),
-                                )
-                                sum_hq_a, sum_hq_a2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[0, i], r_h[0, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_a, sum_hq_a2),
-                                )
-                                sum_hq_b, sum_hq_b2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[1, i], r_h[1, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_b, sum_hq_b2),
-                                )
-                                sum_hq_c, sum_hq_c2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[2, i], r_h[2, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_c, sum_hq_c2),
-                                )
-                                sum_hq_d, sum_hq_d2 = cute.arch.fma_packed_f32x2(
-                                    src_a=(r_h[3, i], r_h[3, i + 1]),
-                                    src_b=(r_q[i], r_q[i + 1]),
-                                    src_c=(sum_hq_d, sum_hq_d2),
-                                )
-                            else:
-                                r_h[0, i], r_h[0, i + 1] = fma_pair(
-                                    r_k[i], r_k[i + 1], v_new_a, v_new_a, r_h[0, i], r_h[0, i + 1]
-                                )
-                                r_h[1, i], r_h[1, i + 1] = fma_pair(
-                                    r_k[i], r_k[i + 1], v_new_b, v_new_b, r_h[1, i], r_h[1, i + 1]
-                                )
-                                r_h[2, i], r_h[2, i + 1] = fma_pair(
-                                    r_k[i], r_k[i + 1], v_new_c, v_new_c, r_h[2, i], r_h[2, i + 1]
-                                )
-                                r_h[3, i], r_h[3, i + 1] = fma_pair(
-                                    r_k[i], r_k[i + 1], v_new_d, v_new_d, r_h[3, i], r_h[3, i + 1]
-                                )
-                                sum_hq_a, sum_hq_a2 = fma_pair(
-                                    r_h[0, i], r_h[0, i + 1], r_q[i], r_q[i + 1], sum_hq_a, sum_hq_a2
-                                )
-                                sum_hq_b, sum_hq_b2 = fma_pair(
-                                    r_h[1, i], r_h[1, i + 1], r_q[i], r_q[i + 1], sum_hq_b, sum_hq_b2
-                                )
-                                sum_hq_c, sum_hq_c2 = fma_pair(
-                                    r_h[2, i], r_h[2, i + 1], r_q[i], r_q[i + 1], sum_hq_c, sum_hq_c2
-                                )
-                                sum_hq_d, sum_hq_d2 = fma_pair(
-                                    r_h[3, i], r_h[3, i + 1], r_q[i], r_q[i + 1], sum_hq_d, sum_hq_d2
-                                )
-                        sum_hq_a = sum_hq_a + sum_hq_a2
-                        sum_hq_b = sum_hq_b + sum_hq_b2
-                        sum_hq_c = sum_hq_c + sum_hq_c2
-                        sum_hq_d = sum_hq_d + sum_hq_d2
+                        # Exact rank-1 FMA update followed by the reference dot order.
+                        for i in cutlass.range_constexpr(vec_size):
+                            r_h[0, i] = _triton_f32_fma(r_k[i], v_new_a, r_h[0, i])
+                            r_h[1, i] = _triton_f32_fma(r_k[i], v_new_b, r_h[1, i])
+                            r_h[2, i] = _triton_f32_fma(r_k[i], v_new_c, r_h[2, i])
+                            r_h[3, i] = _triton_f32_fma(r_k[i], v_new_d, r_h[3, i])
+                        sum_hq_a = _triton_f32_mul(r_h[0, 1], r_q[1])
+                        sum_hq_b = _triton_f32_mul(r_h[1, 1], r_q[1])
+                        sum_hq_c = _triton_f32_mul(r_h[2, 1], r_q[1])
+                        sum_hq_d = _triton_f32_mul(r_h[3, 1], r_q[1])
+                        for i in [0, 2, 3]:
+                            sum_hq_a = _triton_f32_fma(r_h[0, i], r_q[i], sum_hq_a)
+                            sum_hq_b = _triton_f32_fma(r_h[1, i], r_q[i], sum_hq_b)
+                            sum_hq_c = _triton_f32_fma(r_h[2, i], r_q[i], sum_hq_c)
+                            sum_hq_d = _triton_f32_fma(r_h[3, i], r_q[i], sum_hq_d)
 
                         # Full-warp reduction for all 4 h@q dot products.
                         for offset in [16, 8, 4, 2, 1]:
@@ -1739,7 +1735,9 @@ def kda_mtp_recurrent_vk_kernel(
     i_h = i_hv // (HV // H)
 
     cache_idx = h0_indices[i_n]
-    r_exp_A = cute.exp(cutlass.Float32(A_log[i_hv]), fastmath=fast_math)
+    r_exp_A = _triton_f32_ex2(
+        _triton_f32_mul(cutlass.Float32(A_log[i_hv]), cutlass.Float32(1.4426950408889634))
+    )
 
     # lane t holds vec_size contiguous K (K[4t:4t+4]) x all BV V-cols; r_h[vv*vec_size+c]=state[i_v*BV+vv, vec_size*lane+c].
     r_h = cute.make_rmem_tensor(cute.make_layout((BV * vec_size,), stride=(1,)), cutlass.Float32)
@@ -1823,57 +1821,83 @@ def kda_mtp_recurrent_vk_kernel(
                         )
 
             if cutlass.const_expr(use_qk_l2norm):
-                sum_q = cutlass.Float32(0.0)
-                sum_k = cutlass.Float32(0.0)
-                for c in cutlass.range_constexpr(vec_size):
-                    sum_q += r_q[c] * r_q[c]
-                    sum_k += r_k[c] * r_k[c]
+                # Use the same local fragment order and scalar path as Triton.
+                sum_q = _triton_f32_mul(r_q[1], r_q[1])
+                sum_k = _triton_f32_mul(r_k[1], r_k[1])
+                sum_q = _triton_f32_fma(r_q[0], r_q[0], sum_q)
+                sum_k = _triton_f32_fma(r_k[0], r_k[0], sum_k)
+                sum_q = _triton_f32_fma(r_q[2], r_q[2], sum_q)
+                sum_k = _triton_f32_fma(r_k[2], r_k[2], sum_k)
+                sum_q = _triton_f32_fma(r_q[3], r_q[3], sum_q)
+                sum_k = _triton_f32_fma(r_k[3], r_k[3], sum_k)
                 for off in [16, 8, 4, 2, 1]:
                     sum_q += cute.arch.shuffle_sync_bfly(sum_q, offset=off, mask=-1, mask_and_clamp=31)
                     sum_k += cute.arch.shuffle_sync_bfly(sum_k, offset=off, mask=-1, mask_and_clamp=31)
-                inv_q = cute.rsqrt(sum_q + 1e-6, fastmath=fast_math) * scale
-                inv_k = cute.rsqrt(sum_k + 1e-6, fastmath=fast_math)
+                norm_q = _triton_f32_sqrt(sum_q + cutlass.Float32(1e-6))
+                norm_k = _triton_f32_sqrt(sum_k + cutlass.Float32(1e-6))
                 for c in cutlass.range_constexpr(vec_size):
-                    r_q[c] = r_q[c] * inv_q
-                    r_k[c] = r_k[c] * inv_k
+                    r_q[c] = _triton_f32_div(r_q[c], norm_q)
+                    r_k[c] = _triton_f32_div(r_k[c], norm_k)
+                for c in cutlass.range_constexpr(vec_size):
+                    r_q[c] = _triton_f32_mul(r_q[c], cutlass.Float32(scale))
             else:
                 for c in cutlass.range_constexpr(vec_size):
-                    r_q[c] = r_q[c] * scale
+                    r_q[c] = _triton_f32_mul(r_q[c], cutlass.Float32(scale))
 
             # gate stage 2: finalize per-channel decay r_g
             if cutlass.const_expr(use_lower_bound):
-                # safe gate: g = lower_bound * sigmoid(exp(A_log) * x)
+                # Match Triton's FMA -> exp2 -> reciprocal -> exp2 sequence.
                 for c in cutlass.range_constexpr(vec_size):
-                    sigmoid_ax = cutlass.Float32(1.0) / (
-                        cutlass.Float32(1.0) + cute.exp(-r_exp_A * r_gx[c], fastmath=fast_math)
+                    neg_ax = _triton_f32_fma(cutlass.Float32(0.0) - r_exp_A, r_gx[c], cutlass.Float32(0.0))
+                    exp_neg_ax = _triton_f32_ex2(
+                        _triton_f32_mul(neg_ax, cutlass.Float32(1.4426950408889634))
                     )
-                    r_g[c] = cute.exp(lower_bound * sigmoid_ax, fastmath=fast_math)
+                    sigmoid_ax = _triton_f32_div(cutlass.Float32(1.0), cutlass.Float32(1.0) + exp_neg_ax)
+                    r_g[c] = _triton_f32_ex2(
+                        _triton_f32_mul(
+                            _triton_f32_mul(cutlass.Float32(lower_bound), sigmoid_ax),
+                            cutlass.Float32(1.4426950408889634),
+                        )
+                    )
             else:
                 for c in cutlass.range_constexpr(vec_size):
                     r_g[c] = cute.exp(-r_exp_A * r_gsp[c], fastmath=fast_math)
 
-            r_beta = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.exp(-r_bbf[cur][0], fastmath=fast_math))
+            r_beta = cutlass.Float32(0.0)
+            if lane == 0:
+                r_beta = _triton_f32_div(
+                    cutlass.Float32(1.0),
+                    cutlass.Float32(1.0)
+                    + _triton_f32_ex2(
+                        _triton_f32_mul(cutlass.Float32(0.0) - r_bbf[cur][0], cutlass.Float32(1.4426950408889634))
+                    ),
+                )
+            r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
-            # ===== recurrence (fused: decay+h@k in one pass / update+h@q in one pass) =====
+            # ===== recurrence: instruction/order-compatible with Triton =====
             for vv in cutlass.range_constexpr(BV):
-                sv = cutlass.Float32(0.0)
                 for c in cutlass.range_constexpr(vec_size):
-                    r_h[vv * vec_size + c] = r_h[vv * vec_size + c] * r_g[c]  # decay: h *= exp(g) (per K)
-                    sv += r_h[vv * vec_size + c] * r_k[c]  # s = sum_k h*k_norm
+                    r_h[vv * vec_size + c] = _triton_f32_mul(r_h[vv * vec_size + c], r_g[c])
+                sv = _triton_f32_mul(r_h[vv * vec_size + 1], r_k[1])
+                sv = _triton_f32_fma(r_h[vv * vec_size + 0], r_k[0], sv)
+                sv = _triton_f32_fma(r_h[vv * vec_size + 2], r_k[2], sv)
+                sv = _triton_f32_fma(r_h[vv * vec_size + 3], r_k[3], sv)
                 r_red[vv] = sv
             for off in [16, 8, 4, 2, 1]:
                 for vv in cutlass.range_constexpr(BV):
-                    r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
+                    r_red[vv] += cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
             for vv in cutlass.range_constexpr(BV):
-                v_new = (cutlass.Float32(r_vbf[cur][vv]) - r_red[vv]) * r_beta  # v_new = beta*(v - s)
-                ovv = cutlass.Float32(0.0)
+                v_new = _triton_f32_mul(cutlass.Float32(r_vbf[cur][vv]) - r_red[vv], r_beta)
                 for c in cutlass.range_constexpr(vec_size):
-                    r_h[vv * vec_size + c] = r_h[vv * vec_size + c] + r_k[c] * v_new  # rank-1 update: h += k*v_new
-                    ovv += r_h[vv * vec_size + c] * r_q[c]  # o = sum_k h*q_scaled (partial)
+                    r_h[vv * vec_size + c] = _triton_f32_fma(r_k[c], v_new, r_h[vv * vec_size + c])
+                ovv = _triton_f32_mul(r_h[vv * vec_size + 1], r_q[1])
+                ovv = _triton_f32_fma(r_h[vv * vec_size + 0], r_q[0], ovv)
+                ovv = _triton_f32_fma(r_h[vv * vec_size + 2], r_q[2], ovv)
+                ovv = _triton_f32_fma(r_h[vv * vec_size + 3], r_q[3], ovv)
                 r_red[vv] = ovv
             for off in [16, 8, 4, 2, 1]:
                 for vv in cutlass.range_constexpr(BV):
-                    r_red[vv] = r_red[vv] + cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
+                    r_red[vv] += cute.arch.shuffle_sync_bfly(r_red[vv], offset=off, mask=-1, mask_and_clamp=31)
             for vv in cutlass.range_constexpr(BV):
                 o[(i_n, i_t, i_hv, i_v * BV + vv)] = cutlass.BFloat16(r_red[vv])
             if cutlass.const_expr(cache_intermediate_states):  # Stage-D snapshot: post-token-t state
